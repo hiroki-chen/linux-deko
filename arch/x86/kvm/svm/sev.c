@@ -4965,6 +4965,7 @@ static void sev_snp_init_vmcb(struct vcpu_svm *svm)
 
 static void sev_es_init_vmcb(struct vcpu_svm *svm)
 {
+	struct kvm_sev_info *sev = to_kvm_sev_info(svm->vcpu.kvm);
 	struct vmcb *vmcb = svm->vmcb01.ptr;
 	struct kvm_vcpu *vcpu = &svm->vcpu;
 
@@ -4979,6 +4980,16 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm)
 	 */
 	if (vmpl_vmsa(svm) && !vmpl_has_guest_vmsa(svm))
 		svm->vmcb->control.vmsa_pa = __pa(vmpl_vmsa(svm));
+
+	if (cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES)) {
+		pr_info("SEV-ES guest using feature: Allowed SEV features");
+
+		/* Allow the guest to use the features indicated */
+		svm->vmcb->control.allowed_sev_features = sev->vmsa_features[0];
+
+		pr_info("SEV-ES guest allowed features: %#llx\n",
+			svm->vmcb->control.allowed_sev_features);
+	}
 
 	/* Can't intercept CR register access, HV can't modify CR registers */
 	svm_clr_intercept(svm, INTERCEPT_CR0_READ);
