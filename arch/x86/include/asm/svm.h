@@ -479,6 +479,15 @@ struct sev_es_save_area {
 	u8 fpreg_x87[80];
 	u8 fpreg_xmm[256];
 	u8 fpreg_ymm[256];
+
+	u8 reserved_0x670[344];
+	u8 reserved_0x7c8[312];
+
+	/* For guest intercept controls. */
+	u32 intercept_vecs[8];
+	u64 intercept_msr_vecs[4];
+
+	u8 reserved_0x940[1728];
 } __packed;
 
 struct ghcb_save_area {
@@ -578,7 +587,7 @@ struct hvdb {
 
 #define EXPECTED_VMCB_SAVE_AREA_SIZE		744
 #define EXPECTED_GHCB_SAVE_AREA_SIZE		1032
-#define EXPECTED_SEV_ES_SAVE_AREA_SIZE		1648
+#define EXPECTED_SEV_ES_SAVE_AREA_SIZE		4096
 #define EXPECTED_VMCB_CONTROL_AREA_SIZE		1024
 #define EXPECTED_GHCB_SIZE			PAGE_SIZE
 
@@ -739,5 +748,29 @@ DEFINE_GHCB_ACCESSORS(sw_exit_info_1)
 DEFINE_GHCB_ACCESSORS(sw_exit_info_2)
 DEFINE_GHCB_ACCESSORS(sw_scratch)
 DEFINE_GHCB_ACCESSORS(xcr0)
+
+/*
+ * Defines bits for the guest MSR intercept controls.
+ * 
+ * This can be found in Table B-5. AMD64 Architecture Programmer's Manual
+ * Volume 2: System Programming's appendix.
+ */
+#define __define_sev_snp_guest_intercepts_msr(base, write)			\
+	BIT_ULL(base + ((write) ? 1 : 0))
+
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_FS_BASE_R 		__define_sev_snp_guest_intercepts_msr(0, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_FS_BASE_W 		__define_sev_snp_guest_intercepts_msr(0, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_GS_BASE_R 		__define_sev_snp_guest_intercepts_msr(2, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_GS_BASE_W 		__define_sev_snp_guest_intercepts_msr(2, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_KERNEL_GS_BASE_R 	__define_sev_snp_guest_intercepts_msr(4, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_KERNEL_GS_BASE_W 	__define_sev_snp_guest_intercepts_msr(4, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_EFER_R 		__define_sev_snp_guest_intercepts_msr(6, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_EFER_W 		__define_sev_snp_guest_intercepts_msr(6, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_STAR_R 		__define_sev_snp_guest_intercepts_msr(8, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_STAR_W 		__define_sev_snp_guest_intercepts_msr(8, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_LSTAR_R 		__define_sev_snp_guest_intercepts_msr(10, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_LSTAR_W 		__define_sev_snp_guest_intercepts_msr(10, 1)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_CSTAR_R 		__define_sev_snp_guest_intercepts_msr(12, 0)
+#define SEV_SEV_GUEST_MSR_INTERCEPTS_CSTAR_W 		__define_sev_snp_guest_intercepts_msr(12, 1)
 
 #endif

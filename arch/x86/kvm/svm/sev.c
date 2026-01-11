@@ -6,9 +6,8 @@
  *
  * Copyright 2010 Red Hat, Inc. and/or its affiliates.
  */
-#include "asm-generic/int-ll64.h"
-#include "linux/compiler.h"
-#include "linux/printk.h"
+#include "asm/kvm.h"
+#include "asm/svm.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_types.h>
@@ -154,20 +153,19 @@ static int sev_flush_asids(unsigned int min_asid, unsigned int max_asid)
 	return ret;
 }
 
-static u64 allowed_sev_features(struct kvm_sev_info *sev, unsigned int vmpl)
-{
-	if (unlikely(vmpl >= SVM_SEV_VMPL_MAX)) {
-		pr_warn("Requested VMPL is exceed 4");
-		return 0;
-	}
+// static u64 allowed_sev_features(struct kvm_sev_info *sev, unsigned int vmpl)
+// {
+// 	if (unlikely(vmpl >= SVM_SEV_VMPL_MAX)) {
+// 		pr_warn("Requested VMPL is exceed 4");
+// 		return 0;
+// 	}
 
-	if (cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES) &&
-	    (sev->vmsa_features[vmpl] & SVM_SEV_FEAT_ALLOWED_SEV_FEATURES))
-		return sev->vmsa_features[vmpl];
+// 	if (cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES) &&
+// 	    (sev->vmsa_features[vmpl] & SVM_SEV_FEAT_ALLOWED_SEV_FEATURES))
+// 		return sev->vmsa_features[vmpl];
 
-	return 0;
-}
-
+// 	return 0;
+// }
 
 static inline bool is_mirroring_enc_context(struct kvm *kvm)
 {
@@ -853,6 +851,24 @@ e_unpin:
 	return ret;
 }
 
+static int sev_es_sync_vmsa_guest_intercepts(struct sev_es_save_area *save)
+{
+	if (!sev_snp_enable_guest_intercepts)
+		return 0;
+
+	if (!cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES)) {
+		pr_err("The CPU has no Allowed SEV Features bit enabled");
+
+		return -EINVAL;
+	}
+
+	save->sev_features |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+
+	pr_info("VMSA guest intercept controls enabled");
+
+	return 0;
+}
+
 static int sev_es_sync_vmsa(struct vcpu_svm *svm)
 {
 	struct kvm_vcpu *vcpu = &svm->vcpu;
@@ -941,6 +957,11 @@ static int sev_es_sync_vmsa(struct vcpu_svm *svm)
 		else
 			memset(save->fpreg_ymm, 0, 256);
 	}
+
+	/* Enable the guest intercept control if needed. */
+	if (sev_snp_enable_guest_intercepts)
+		if (sev_es_sync_vmsa_guest_intercepts(save))
+			return -EINVAL;
 
 	pr_debug("Virtual Machine Save Area (VMSA):\n");
 	print_hex_dump_debug("", DUMP_PREFIX_NONE, 16, 1, save, sizeof(*save), false);
@@ -2323,6 +2344,7 @@ struct sev_gmem_populate_args {
 static int sev_gmem_post_populate(struct kvm *kvm, gfn_t gfn_start, kvm_pfn_t pfn,
 				  void __user *src, int order, void *opaque)
 {
+	struct sev_es_save_area *vmsa;
 	struct sev_gmem_populate_args *sev_populate_args = opaque;
 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
 	int n_private = 0, ret, i;
@@ -2352,6 +2374,16 @@ static int sev_gmem_post_populate(struct kvm *kvm, gfn_t gfn_start, kvm_pfn_t pf
 				ret = -EFAULT;
 				goto err;
 			}
+			
+			if (sev_populate_args->type == KVM_SEV_SNP_PAGE_TYPE_VMSA) {
+				vmsa = (struct sev_es_save_area *)vaddr;
+
+				if (sev_es_sync_vmsa_guest_intercepts(vmsa)) {
+					ret = -EFAULT;
+					goto err;
+				}
+			}	
+
 			kunmap_local(vaddr);
 		}
 
@@ -2429,6 +2461,7 @@ err:
 static int __snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp,
 			       struct kvm_sev_snp_launch_update_vmpls *params)
 {
+	struct vcpu_svm *svm;
 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
 	struct sev_gmem_populate_args sev_populate_args = {0};
 	struct kvm_memory_slot *memslot;
@@ -2437,7 +2470,7 @@ static int __snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp,
 	int ret = 0;
 	struct kvm_vcpu *vcpu = NULL;
 
-	pr_debug("%s: GFN start 0x%llx length 0x%llx type %d flags %d\n", __func__,
+	pr_info("%s: GFN start 0x%llx length 0x%llx type %d flags %d\n", __func__,
 		 params->lu.gfn_start, params->lu.len, params->lu.type, params->lu.flags);
 
 	if (!PAGE_ALIGNED(params->lu.len) || params->lu.flags ||
@@ -2532,6 +2565,14 @@ static int __snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp,
 		*/
 		svm_enable_lbrv(vcpu);
 		sev->vmsa_updated = true;
+
+		svm = to_svm(vcpu);
+
+		if (sev_snp_enable_guest_intercepts) {
+			pr_info("Enabling SNP guest intercepts for vCPU ID %u\n", vcpu->vcpu_id);
+			if (sev_es_sync_vmsa_guest_intercepts((struct sev_es_save_area *)(svm->vmcb)))
+				pr_warn("Failed to enable SNP guest intercepts\n");
+		}
 	}
 
 out:
@@ -2744,6 +2785,8 @@ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
 		r = -EPERM;
 		goto out;
 	}
+
+	pr_info("called sev_mem_enc_ioctl id: %u\n", sev_cmd.id);
 
 	switch (sev_cmd.id) {
 	case KVM_SEV_ES_INIT:
