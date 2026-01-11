@@ -393,15 +393,19 @@ finish:
 				 MSR_AMD64_SNP_VMGEXIT_PARAM |		\
 				 MSR_AMD64_SNP_VMSA_REG_PROT |		\
 				 MSR_AMD64_SNP_RESERVED_BIT13 |		\
-				 MSR_AMD64_SNP_RESERVED_BIT15 |		\
 				 MSR_AMD64_SNP_RESERVED_MASK)
 
 /*
  * SNP_FEATURES_PRESENT is the mask of SNP features that are implemented
  * by the guest kernel. As and when a new feature is implemented in the
  * guest kernel, a corresponding bit should be added to the mask.
+ * 
+ * We add the support for guest intercept control as this does not require
+ * any of the guest's cooperation to handle the intercepts: this will be
+ * directly trapped into the VMPL0.
  */
-#define SNP_FEATURES_PRESENT	MSR_AMD64_SNP_DEBUG_SWAP
+#define SNP_FEATURES_PRESENT	(MSR_AMD64_SNP_DEBUG_SWAP |		\
+				 MSR_AMD64_SNP_GUEST_INTERCEPT_CTL)
 
 u64 snp_get_unsupported_features(u64 status)
 {

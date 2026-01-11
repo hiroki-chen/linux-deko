@@ -1,3 +1,4 @@
+#include "asm/cache.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
@@ -241,7 +242,6 @@ module_param(avic, bool, 0444);
 
 bool __read_mostly dump_invalid_vmcb;
 module_param(dump_invalid_vmcb, bool, 0644);
-
 
 bool intercept_smi = true;
 module_param(intercept_smi, bool, 0444);

@@ -6,6 +6,9 @@
  *
  * Copyright 2010 Red Hat, Inc. and/or its affiliates.
  */
+#include "asm-generic/int-ll64.h"
+#include "linux/compiler.h"
+#include "linux/printk.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_types.h>
@@ -67,6 +70,14 @@ module_param_named(debug_swap, sev_es_debug_swap_enabled, bool, 0444);
 /* enable/disable SEV-SNP Restricted Injection support */
 static bool sev_snp_restricted_injection_enabled = true;
 module_param_named(restricted_injection, sev_snp_restricted_injection_enabled, bool, 0444);
+/*
+ * enable / disable the support for guest interception.
+ * This requires that the ALLOWED_SEV_FEATURES[61] bit
+ * in the VMCB is set to 1.
+ */
+static bool sev_snp_enable_guest_intercepts = false;
+module_param_named(enable_guest_intercepts, sev_snp_enable_guest_intercepts, bool, 0644);
+
 static u64 sev_supported_vmsa_features;
 
 #define AP_RESET_HOLD_NONE		0
@@ -142,6 +153,21 @@ static int sev_flush_asids(unsigned int min_asid, unsigned int max_asid)
 
 	return ret;
 }
+
+static u64 allowed_sev_features(struct kvm_sev_info *sev, unsigned int vmpl)
+{
+	if (unlikely(vmpl >= SVM_SEV_VMPL_MAX)) {
+		pr_warn("Requested VMPL is exceed 4");
+		return 0;
+	}
+
+	if (cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES) &&
+	    (sev->vmsa_features[vmpl] & SVM_SEV_FEAT_ALLOWED_SEV_FEATURES))
+		return sev->vmsa_features[vmpl];
+
+	return 0;
+}
+
 
 static inline bool is_mirroring_enc_context(struct kvm *kvm)
 {
@@ -457,6 +483,13 @@ static int __sev_guest_init(struct kvm *kvm, struct kvm_sev_cmd *argp,
 
 	if (vm_type == KVM_X86_SNP_VM)
 		sev->vmsa_features[SVM_SEV_VMPL0] |= SVM_SEV_FEAT_SNP_ACTIVE;
+
+	if (sev_snp_enable_guest_intercepts) {
+		sev->vmsa_features[SVM_SEV_VMPL0] |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+		sev->vmsa_features[SVM_SEV_VMPL1] |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+		sev->vmsa_features[SVM_SEV_VMPL2] |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+		sev->vmsa_features[SVM_SEV_VMPL3] |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+	}
 
 	ret = sev_asid_new(sev);
 	if (ret)
@@ -3206,7 +3239,12 @@ out:
 		sev_snp_restricted_injection_enabled = false;
 
 	if (sev_snp_restricted_injection_enabled)
-		sev_supported_vmsa_features |= SVM_SEV_FEAT_RESTRICTED_INJECTION;
+		sev_supported_vmsa_features |= SVM_SEV_FEAT_RESTRICTED_INJECTION;	
+
+	if (sev_snp_enabled && sev_snp_enable_guest_intercepts && cpu_feature_enabled(X86_FEATURE_GUEST_INTERCEPTS)) {
+		pr_info("SEV-SNP Guest Intercepts enabled\n");
+		sev_supported_vmsa_features |= SVM_SEV_FEAT_GUEST_INTERCEPTS;
+	}
 }
 
 void sev_hardware_unsetup(void)
@@ -4982,13 +5020,8 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm)
 		svm->vmcb->control.vmsa_pa = __pa(vmpl_vmsa(svm));
 
 	if (cpu_feature_enabled(X86_FEATURE_ALLOWED_SEV_FEATURES)) {
-		pr_info("SEV-ES guest using feature: Allowed SEV features");
-
 		/* Allow the guest to use the features indicated */
-		svm->vmcb->control.allowed_sev_features = sev->vmsa_features[0];
-
-		pr_info("SEV-ES guest allowed features: %#llx\n",
-			svm->vmcb->control.allowed_sev_features);
+		svm->vmcb->control.allowed_sev_features = sev->vmsa_features[0] | SVM_SEV_FEAT_ALLOWED_SEV_FEATURES;
 	}
 
 	/* Can't intercept CR register access, HV can't modify CR registers */
