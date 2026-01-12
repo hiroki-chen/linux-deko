@@ -312,6 +312,9 @@ struct svsm_call {
 #define SVSM_ATTEST_SERVICES		0
 #define SVSM_ATTEST_SINGLE_SERVICE	1
 
+#define SVSM_EXTEND_CALL(x)		((4ULL << 32) | (x))
+#define SVSM_EXTEND_MSR_INTERCEPT 0
+
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
 extern u8 snp_vmpl;

@@ -7,6 +7,7 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
+#include "linux/array_size.h"
 #define pr_fmt(fmt)	"SEV: " fmt
 
 #include <linux/sched/debug.h>	/* For show_regs() */
@@ -61,6 +62,26 @@
 #define AP_INIT_X87_FCW_DEFAULT		0x0040
 #define AP_INIT_CR0_DEFAULT		0x60000010
 #define AP_INIT_MXCSR_DEFAULT		0x1f80
+
+/*
+ * SEV-SNP guest MSR intercepts
+ * 
+ * The use of these MSRs in a SEV-SNP guest running at VMPL1 / VMPL2
+ * will trigger a #VC exception that should be instead forward to the
+ * VMPL0 monitor for proper handling.
+ * 
+ * Simply forwarding these MSR accesses to the hypervisor is insecure
+ * as the raw register values are copied into the GHCB and may cause
+ * information leaks or integrity issues. For example, if the LSTAR
+ * address is leaked then the attacker may be able to infer the
+ * location of sensitive code sequences in the guest and launch side-
+ * channel attacks.
+ */
+static const u64 sev_snp_guest_msr_intercepts[] = {
+	MSR_STAR,
+	MSR_LSTAR,
+	MSR_CSTAR,
+};
 
 static const char * const sev_status_feat_names[] = {
 	[MSR_AMD64_SEV_ENABLED_BIT]		= "SEV",
@@ -1332,11 +1353,44 @@ int __init sev_es_efi_map_ghcbs(pgd_t *pgd)
 	return 0;
 }
 
+static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
+{
+	struct svsm_call call = {0};
+	enum es_result ret = ES_OK;
+
+	call.caa = this_cpu_read(svsm_caa);
+	call.rcx = ctxt->regs->cx;
+	call.r9 = ctxt->regs->dx;
+	call.r8 = ctxt->regs->ax;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
+
+	if (svsm_perform_call_protocol(&call)) {
+		ret = ES_UNSUPPORTED;
+		goto out;
+	}
+
+out:
+	return ret;
+}
+
 static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 {
 	struct pt_regs *regs = ctxt->regs;
 	enum es_result ret;
 	u64 exit_info_1;
+	bool msr_intercepted = false;
+	int i;
+
+	/* Check if MSRs are within the intercept list. */
+	for (i = 0; i < ARRAY_SIZE(sev_snp_guest_msr_intercepts); i++) {
+		if (regs->cx == sev_snp_guest_msr_intercepts[i]) {
+			msr_intercepted = true;
+			break;
+		}
+	}
+
+	if (msr_intercepted)
+		return svsm_handle_msr(ctxt);
 
 	/* Is it a WRMSR? */
 	exit_info_1 = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
