@@ -1360,8 +1360,9 @@ static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
 
 	call.caa = this_cpu_read(svsm_caa);
 	call.rcx = ctxt->regs->cx;
-	call.r9 = ctxt->regs->dx;
-	call.r8 = ctxt->regs->ax;
+	call.rdx = ctxt->regs->dx;
+	call.r9 = ctxt->regs->ax;
+	call.r8 = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
 
 	if (svsm_perform_call_protocol(&call)) {
