@@ -7,10 +7,9 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
-#include "linux/array_size.h"
-#define pr_fmt(fmt)	"SEV: " fmt
+#define pr_fmt(fmt) "SEV: " fmt
 
-#include <linux/sched/debug.h>	/* For show_regs() */
+#include <linux/sched/debug.h> /* For show_regs() */
 #include <linux/percpu-defs.h>
 #include <linux/cc_platform.h>
 #include <linux/printk.h>
@@ -45,23 +44,26 @@
 #include <asm/cpuid.h>
 #include <asm/cmdline.h>
 
-#define DR7_RESET_VALUE        0x400
+#define DR7_RESET_VALUE 0x400
 
 /* AP INIT values as documented in the APM2  section "Processor Initialization State" */
-#define AP_INIT_CS_LIMIT		0xffff
-#define AP_INIT_DS_LIMIT		0xffff
-#define AP_INIT_LDTR_LIMIT		0xffff
-#define AP_INIT_GDTR_LIMIT		0xffff
-#define AP_INIT_IDTR_LIMIT		0xffff
-#define AP_INIT_TR_LIMIT		0xffff
-#define AP_INIT_RFLAGS_DEFAULT		0x2
-#define AP_INIT_DR6_DEFAULT		0xffff0ff0
-#define AP_INIT_GPAT_DEFAULT		0x0007040600070406ULL
-#define AP_INIT_XCR0_DEFAULT		0x1
-#define AP_INIT_X87_FTW_DEFAULT		0x5555
-#define AP_INIT_X87_FCW_DEFAULT		0x0040
-#define AP_INIT_CR0_DEFAULT		0x60000010
-#define AP_INIT_MXCSR_DEFAULT		0x1f80
+#define AP_INIT_CS_LIMIT 0xffff
+#define AP_INIT_DS_LIMIT 0xffff
+#define AP_INIT_LDTR_LIMIT 0xffff
+#define AP_INIT_GDTR_LIMIT 0xffff
+#define AP_INIT_IDTR_LIMIT 0xffff
+#define AP_INIT_TR_LIMIT 0xffff
+#define AP_INIT_RFLAGS_DEFAULT 0x2
+#define AP_INIT_DR6_DEFAULT 0xffff0ff0
+#define AP_INIT_GPAT_DEFAULT 0x0007040600070406ULL
+#define AP_INIT_XCR0_DEFAULT 0x1
+#define AP_INIT_X87_FTW_DEFAULT 0x5555
+#define AP_INIT_X87_FCW_DEFAULT 0x0040
+#define AP_INIT_CR0_DEFAULT 0x60000010
+#define AP_INIT_MXCSR_DEFAULT 0x1f80
+
+#define TRAMPOLINE_PGD_INDEX 465
+#define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
 
 /*
  * SEV-SNP guest MSR intercepts
@@ -83,23 +85,23 @@ static const u64 sev_snp_guest_msr_intercepts[] = {
 	MSR_CSTAR,
 };
 
-static const char * const sev_status_feat_names[] = {
-	[MSR_AMD64_SEV_ENABLED_BIT]		= "SEV",
-	[MSR_AMD64_SEV_ES_ENABLED_BIT]		= "SEV-ES",
-	[MSR_AMD64_SEV_SNP_ENABLED_BIT]		= "SEV-SNP",
-	[MSR_AMD64_SNP_VTOM_BIT]		= "vTom",
-	[MSR_AMD64_SNP_REFLECT_VC_BIT]		= "ReflectVC",
-	[MSR_AMD64_SNP_RESTRICTED_INJ_BIT]	= "RI",
-	[MSR_AMD64_SNP_ALT_INJ_BIT]		= "AI",
-	[MSR_AMD64_SNP_DEBUG_SWAP_BIT]		= "DebugSwap",
-	[MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT]	= "NoHostIBS",
-	[MSR_AMD64_SNP_BTB_ISOLATION_BIT]	= "BTBIsol",
-	[MSR_AMD64_SNP_VMPL_SSS_BIT]		= "VmplSSS",
-	[MSR_AMD64_SNP_SECURE_TSC_BIT]		= "SecureTSC",
-	[MSR_AMD64_SNP_VMGEXIT_PARAM_BIT]	= "VMGExitParam",
-	[MSR_AMD64_SNP_IBS_VIRT_BIT]		= "IBSVirt",
-	[MSR_AMD64_SNP_VMSA_REG_PROT_BIT]	= "VMSARegProt",
-	[MSR_AMD64_SNP_SMT_PROT_BIT]		= "SMTProt",
+static const char *const sev_status_feat_names[] = {
+	[MSR_AMD64_SEV_ENABLED_BIT] = "SEV",
+	[MSR_AMD64_SEV_ES_ENABLED_BIT] = "SEV-ES",
+	[MSR_AMD64_SEV_SNP_ENABLED_BIT] = "SEV-SNP",
+	[MSR_AMD64_SNP_VTOM_BIT] = "vTom",
+	[MSR_AMD64_SNP_REFLECT_VC_BIT] = "ReflectVC",
+	[MSR_AMD64_SNP_RESTRICTED_INJ_BIT] = "RI",
+	[MSR_AMD64_SNP_ALT_INJ_BIT] = "AI",
+	[MSR_AMD64_SNP_DEBUG_SWAP_BIT] = "DebugSwap",
+	[MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT] = "NoHostIBS",
+	[MSR_AMD64_SNP_BTB_ISOLATION_BIT] = "BTBIsol",
+	[MSR_AMD64_SNP_VMPL_SSS_BIT] = "VmplSSS",
+	[MSR_AMD64_SNP_SECURE_TSC_BIT] = "SecureTSC",
+	[MSR_AMD64_SNP_VMGEXIT_PARAM_BIT] = "VMGExitParam",
+	[MSR_AMD64_SNP_IBS_VIRT_BIT] = "IBSVirt",
+	[MSR_AMD64_SNP_VMSA_REG_PROT_BIT] = "VMSARegProt",
+	[MSR_AMD64_SNP_SMT_PROT_BIT] = "SMTProt",
 };
 
 /* For early boot hypervisor communication in SEV-ES enabled guests */
@@ -113,6 +115,18 @@ static struct ghcb *boot_ghcb __section(".data");
 
 /* Bitmap of SEV features supported by the hypervisor */
 static u64 sev_hv_features __ro_after_init;
+
+struct page *trampoline_page = NULL;
+
+void *trampoline_va = NULL;
+
+struct svsm_sev_guest_lstar_req {
+	u64 syscall_enter_addr;
+	u64 trampoline_va;
+	u64 trampoline_pa;
+	bool ok;
+	u8 reserved[7];
+} __attribute__((aligned(64)));
 
 /* #VC handler runtime per-CPU data */
 struct sev_es_runtime_data {
@@ -158,15 +172,15 @@ struct ghcb_state {
 /* For early boot SVSM communication */
 static struct svsm_ca boot_svsm_ca_page __aligned(PAGE_SIZE);
 
-static DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
+static DEFINE_PER_CPU(struct sev_es_runtime_data *, runtime_data);
 static DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
 static DEFINE_PER_CPU(struct svsm_ca *, svsm_caa);
 static DEFINE_PER_CPU(u64, svsm_caa_pa);
 
 struct sev_config {
-	__u64 debug		: 1,
+	__u64 debug : 1,
 
-	      /*
+		/*
 	       * Indicates when the per-CPU GHCB has been created and registered
 	       * and thus can be used by the BSP instead of the early boot GHCB.
 	       *
@@ -174,18 +188,18 @@ struct sev_config {
 	       * and registered upon startup, so this flag can be used globally
 	       * for the BSP and APs.
 	       */
-	      ghcbs_initialized	: 1,
+		ghcbs_initialized : 1,
 
-	      /*
+		/*
 	       * Indicates when the per-CPU SVSM CA is to be used instead of the
 	       * boot SVSM CA.
 	       *
 	       * For APs, the per-CPU SVSM CA is created as part of the AP
 	       * bringup, so this flag can be used globally for the BSP and APs.
 	       */
-	      use_cas		: 1,
+		use_cas : 1,
 
-	      __reserved	: 61;
+		__reserved : 61;
 };
 
 static struct sev_config sev_cfg __read_mostly;
@@ -202,7 +216,8 @@ static __always_inline bool on_vc_stack(struct pt_regs *regs)
 	if (ip_within_syscall_gap(regs))
 		return false;
 
-	return ((sp >= __this_cpu_ist_bottom_va(VC)) && (sp < __this_cpu_ist_top_va(VC)));
+	return ((sp >= __this_cpu_ist_bottom_va(VC)) &&
+		(sp < __this_cpu_ist_top_va(VC)));
 }
 
 /*
@@ -226,7 +241,8 @@ void noinstr __sev_es_ist_enter(struct pt_regs *regs)
 	unsigned long old_ist, new_ist;
 
 	/* Read old IST entry */
-	new_ist = old_ist = __this_cpu_read(cpu_tss_rw.x86_tss.ist[IST_INDEX_VC]);
+	new_ist = old_ist =
+		__this_cpu_read(cpu_tss_rw.x86_tss.ist[IST_INDEX_VC]);
 
 	/*
 	 * If NMI happened while on the #VC IST stack, set the new IST
@@ -258,7 +274,8 @@ void noinstr __sev_es_ist_exit(void)
 		return;
 
 	/* Read back old IST entry and write it to the TSS */
-	this_cpu_write(cpu_tss_rw.x86_tss.ist[IST_INDEX_VC], *(unsigned long *)ist);
+	this_cpu_write(cpu_tss_rw.x86_tss.ist[IST_INDEX_VC],
+		       *(unsigned long *)ist);
 }
 
 /*
@@ -287,7 +304,7 @@ static noinstr struct ghcb *__sev_get_ghcb(struct ghcb_state *state)
 			 * panic() work, mark GHCBs inactive so that messages
 			 * can be printed out.
 			 */
-			data->ghcb_active        = false;
+			data->ghcb_active = false;
 			data->backup_ghcb_active = false;
 
 			instrumentation_begin();
@@ -310,6 +327,80 @@ static noinstr struct ghcb *__sev_get_ghcb(struct ghcb_state *state)
 	return ghcb;
 }
 
+static int claim_whole_pgd_entry(void)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	struct page *page_l3, *page_l2, *page_l1;
+	phys_addr_t phys_addr;
+	int ret = 0;
+
+	/* We are requesting the memory hole. */
+	pgd = pgd_offset_k(TRAMPOLINE_VA_BASE);
+	if (!pgd_none(*pgd)) {
+		pr_err("SEV-SNP: Trampoline PGD entry already claimed\n");
+		return -EEXIST;
+		goto free_pages;
+	}
+
+	page_l3 = (struct page*)get_zeroed_page(GFP_KERNEL);
+	if (!page_l3) {
+		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
+		return -ENOMEM;
+		goto free_pages;
+	}
+
+	set_pgd(pgd, __pgd(page_to_pfn(page_l3) << PAGE_SHIFT | _PAGE_PRESENT |
+			   _PAGE_RW | _PAGE_USER));
+
+	p4d = p4d_offset(pgd, TRAMPOLINE_VA_BASE);
+	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
+
+	page_l2 = (struct page*)get_zeroed_page(GFP_KERNEL);
+	if (!page_l2) {
+		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+
+	set_pud(pud, __pud(page_to_pfn(page_l2) << PAGE_SHIFT | _PAGE_PRESENT |
+			   _PAGE_RW | _PAGE_USER));
+	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
+
+	page_l1 = (struct page*)get_zeroed_page(GFP_KERNEL);
+	if (!page_l1) {
+		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+
+	set_pmd(pmd, __pmd(page_to_pfn(page_l1) << PAGE_SHIFT | _PAGE_PRESENT |
+			   _PAGE_RW | _PAGE_USER));
+	pte = pte_offset_kernel(pmd, TRAMPOLINE_VA_BASE);
+
+	phys_addr = page_to_phys(trampoline_page);
+
+	set_pte(pte, pfn_pte(phys_addr >> PAGE_SHIFT, PAGE_KERNEL_EXEC));
+
+	goto out;
+
+free_pages:
+	if (ret < 0) {
+		if (page_l1)
+			__free_page(page_l1);
+		if (page_l2)
+			__free_page(page_l2);
+		if (page_l3)
+			__free_page(page_l3);
+	}
+
+out:
+	return ret;
+}
+
 static inline u64 sev_es_rd_ghcb_msr(void)
 {
 	return __rdmsr(MSR_AMD64_SEV_ES_GHCB);
@@ -319,16 +410,16 @@ static __always_inline void sev_es_wr_ghcb_msr(u64 val)
 {
 	u32 low, high;
 
-	low  = (u32)(val);
+	low = (u32)(val);
 	high = (u32)(val >> 32);
 
 	native_wrmsr(MSR_AMD64_SEV_ES_GHCB, low, high);
 }
 
-static int vc_fetch_insn_kernel(struct es_em_ctxt *ctxt,
-				unsigned char *buffer)
+static int vc_fetch_insn_kernel(struct es_em_ctxt *ctxt, unsigned char *buffer)
 {
-	return copy_from_kernel_nofault(buffer, (unsigned char *)ctxt->regs->ip, MAX_INSN_SIZE);
+	return copy_from_kernel_nofault(buffer, (unsigned char *)ctxt->regs->ip,
+					MAX_INSN_SIZE);
 }
 
 static enum es_result __vc_decode_user_insn(struct es_em_ctxt *ctxt)
@@ -339,15 +430,15 @@ static enum es_result __vc_decode_user_insn(struct es_em_ctxt *ctxt)
 	insn_bytes = insn_fetch_from_user_inatomic(ctxt->regs, buffer);
 	if (insn_bytes == 0) {
 		/* Nothing could be copied */
-		ctxt->fi.vector     = X86_TRAP_PF;
+		ctxt->fi.vector = X86_TRAP_PF;
 		ctxt->fi.error_code = X86_PF_INSTR | X86_PF_USER;
-		ctxt->fi.cr2        = ctxt->regs->ip;
+		ctxt->fi.cr2 = ctxt->regs->ip;
 		return ES_EXCEPTION;
 	} else if (insn_bytes == -EINVAL) {
 		/* Effective RIP could not be calculated */
-		ctxt->fi.vector     = X86_TRAP_GP;
+		ctxt->fi.vector = X86_TRAP_GP;
 		ctxt->fi.error_code = 0;
-		ctxt->fi.cr2        = 0;
+		ctxt->fi.cr2 = 0;
 		return ES_EXCEPTION;
 	}
 
@@ -367,9 +458,9 @@ static enum es_result __vc_decode_kern_insn(struct es_em_ctxt *ctxt)
 
 	res = vc_fetch_insn_kernel(ctxt, buffer);
 	if (res) {
-		ctxt->fi.vector     = X86_TRAP_PF;
+		ctxt->fi.vector = X86_TRAP_PF;
 		ctxt->fi.error_code = X86_PF_INSTR;
-		ctxt->fi.cr2        = ctxt->regs->ip;
+		ctxt->fi.cr2 = ctxt->regs->ip;
 		return ES_EXCEPTION;
 	}
 
@@ -388,8 +479,8 @@ static enum es_result vc_decode_insn(struct es_em_ctxt *ctxt)
 		return __vc_decode_kern_insn(ctxt);
 }
 
-static enum es_result vc_write_mem(struct es_em_ctxt *ctxt,
-				   char *dst, char *buf, size_t size)
+static enum es_result vc_write_mem(struct es_em_ctxt *ctxt, char *dst,
+				   char *buf, size_t size)
 {
 	unsigned long error_code = X86_PF_PROT | X86_PF_WRITE;
 
@@ -467,8 +558,8 @@ fault:
 	return ES_EXCEPTION;
 }
 
-static enum es_result vc_read_mem(struct es_em_ctxt *ctxt,
-				  char *src, char *buf, size_t size)
+static enum es_result vc_read_mem(struct es_em_ctxt *ctxt, char *src, char *buf,
+				  size_t size)
 {
 	unsigned long error_code = X86_PF_PROT;
 
@@ -545,8 +636,10 @@ fault:
 	return ES_EXCEPTION;
 }
 
-static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
-					   unsigned long vaddr, phys_addr_t *paddr)
+static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb,
+					   struct es_em_ctxt *ctxt,
+					   unsigned long vaddr,
+					   phys_addr_t *paddr)
 {
 	unsigned long va = (unsigned long)vaddr;
 	unsigned int level;
@@ -558,8 +651,8 @@ static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt 
 	pgd = &pgd[pgd_index(va)];
 	pte = lookup_address_in_pgd(pgd, va, &level);
 	if (!pte) {
-		ctxt->fi.vector     = X86_TRAP_PF;
-		ctxt->fi.cr2        = vaddr;
+		ctxt->fi.vector = X86_TRAP_PF;
+		ctxt->fi.cr2 = vaddr;
 		ctxt->fi.error_code = 0;
 
 		if (user_mode(ctxt->regs))
@@ -580,7 +673,8 @@ static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt 
 	return ES_OK;
 }
 
-static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port, size_t size)
+static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port,
+				    size_t size)
 {
 	BUG_ON(size > 4);
 
@@ -629,7 +723,8 @@ static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
 		exc_alignment_check(ctxt->regs, error_code);
 		break;
 	default:
-		pr_emerg("Unsupported exception in #VC instruction emulation - can't continue\n");
+		pr_emerg(
+			"Unsupported exception in #VC instruction emulation - can't continue\n");
 		BUG();
 	}
 }
@@ -714,8 +809,8 @@ static int svsm_perform_call_protocol(struct svsm_call *call)
 		ghcb = NULL;
 
 	do {
-		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call)
-			   : svsm_perform_msr_protocol(call);
+		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call) :
+			     svsm_perform_msr_protocol(call);
 	} while (ret == -EAGAIN);
 
 	if (RIP_REL_REF(sev_cfg).ghcbs_initialized)
@@ -829,9 +924,9 @@ static u64 __init get_jump_table_addr(void)
 	return ret;
 }
 
-static void __head
-early_set_pages_state(unsigned long vaddr, unsigned long paddr,
-		      unsigned long npages, enum psc_op op)
+static void __head early_set_pages_state(unsigned long vaddr,
+					 unsigned long paddr,
+					 unsigned long npages, enum psc_op op)
 {
 	unsigned long paddr_end;
 	u64 val;
@@ -850,7 +945,8 @@ early_set_pages_state(unsigned long vaddr, unsigned long paddr,
 		 * Use the MSR protocol because this function can be called before
 		 * the GHCB is established.
 		 */
-		sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
+		sev_es_wr_ghcb_msr(
+			GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
 		VMGEXIT();
 
 		val = sev_es_rd_ghcb_msr();
@@ -880,7 +976,8 @@ e_term:
 	sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
 }
 
-void __head early_snp_set_memory_private(unsigned long vaddr, unsigned long paddr,
+void __head early_snp_set_memory_private(unsigned long vaddr,
+					 unsigned long paddr,
 					 unsigned long npages)
 {
 	/*
@@ -892,14 +989,15 @@ void __head early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	if (!(RIP_REL_REF(sev_status) & MSR_AMD64_SEV_SNP_ENABLED))
 		return;
 
-	 /*
+	/*
 	  * Ask the hypervisor to mark the memory pages as private in the RMP
 	  * table.
 	  */
 	early_set_pages_state(vaddr, paddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
-void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr,
+void __init early_snp_set_memory_shared(unsigned long vaddr,
+					unsigned long paddr,
 					unsigned long npages)
 {
 	/*
@@ -911,11 +1009,12 @@ void __init early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr
 	if (!(RIP_REL_REF(sev_status) & MSR_AMD64_SEV_SNP_ENABLED))
 		return;
 
-	 /* Ask hypervisor to mark the memory pages shared in the RMP table. */
+	/* Ask hypervisor to mark the memory pages shared in the RMP table. */
 	early_set_pages_state(vaddr, paddr, npages, SNP_PAGE_STATE_SHARED);
 }
 
-static unsigned long __set_pages_state(struct snp_psc_desc *data, unsigned long vaddr,
+static unsigned long __set_pages_state(struct snp_psc_desc *data,
+				       unsigned long vaddr,
 				       unsigned long vaddr_end, int op)
 {
 	struct ghcb_state state;
@@ -1049,7 +1148,7 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 			/* Protocol 0, Call ID 2 */
 			call.rax = SVSM_CORE_CALL(SVSM_CORE_CREATE_VCPU);
 			call.rdx = __pa(caa);
-			call.r8  = apic_id;
+			call.r8 = apic_id;
 		} else {
 			/* Protocol 0, Call ID 3 */
 			call.rax = SVSM_CORE_CALL(SVSM_CORE_DELETE_VCPU);
@@ -1077,12 +1176,13 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 	return ret;
 }
 
-#define __ATTR_BASE		(SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK)
-#define INIT_CS_ATTRIBS		(__ATTR_BASE | SVM_SELECTOR_READ_MASK | SVM_SELECTOR_CODE_MASK)
-#define INIT_DS_ATTRIBS		(__ATTR_BASE | SVM_SELECTOR_WRITE_MASK)
+#define __ATTR_BASE (SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK)
+#define INIT_CS_ATTRIBS \
+	(__ATTR_BASE | SVM_SELECTOR_READ_MASK | SVM_SELECTOR_CODE_MASK)
+#define INIT_DS_ATTRIBS (__ATTR_BASE | SVM_SELECTOR_WRITE_MASK)
 
-#define INIT_LDTR_ATTRIBS	(SVM_SELECTOR_P_MASK | 2)
-#define INIT_TR_ATTRIBS		(SVM_SELECTOR_P_MASK | 3)
+#define INIT_LDTR_ATTRIBS (SVM_SELECTOR_P_MASK | 2)
+#define INIT_TR_ATTRIBS (SVM_SELECTOR_P_MASK | 3)
 
 static void *snp_alloc_vmsa_page(int cpu)
 {
@@ -1096,7 +1196,8 @@ static void *snp_alloc_vmsa_page(int cpu)
 	 *
 	 * Allocate an 8k page which is also 8k-aligned.
 	 */
-	p = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL_ACCOUNT | __GFP_ZERO, 1);
+	p = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL_ACCOUNT | __GFP_ZERO,
+			     1);
 	if (!p)
 		return NULL;
 
@@ -1177,51 +1278,51 @@ static int wakeup_cpu_via_vmgexit(u32 apic_id, unsigned long start_ip)
 	cr4 = native_read_cr4() & X86_CR4_MCE;
 
 	/* Set the CS value based on the start_ip converted to a SIPI vector */
-	sipi_vector		= (start_ip >> 12);
-	vmsa->cs.base		= sipi_vector << 12;
-	vmsa->cs.limit		= AP_INIT_CS_LIMIT;
-	vmsa->cs.attrib		= INIT_CS_ATTRIBS;
-	vmsa->cs.selector	= sipi_vector << 8;
+	sipi_vector = (start_ip >> 12);
+	vmsa->cs.base = sipi_vector << 12;
+	vmsa->cs.limit = AP_INIT_CS_LIMIT;
+	vmsa->cs.attrib = INIT_CS_ATTRIBS;
+	vmsa->cs.selector = sipi_vector << 8;
 
 	/* Set the RIP value based on start_ip */
-	vmsa->rip		= start_ip & 0xfff;
+	vmsa->rip = start_ip & 0xfff;
 
 	/* Set AP INIT defaults as documented in the APM */
-	vmsa->ds.limit		= AP_INIT_DS_LIMIT;
-	vmsa->ds.attrib		= INIT_DS_ATTRIBS;
-	vmsa->es		= vmsa->ds;
-	vmsa->fs		= vmsa->ds;
-	vmsa->gs		= vmsa->ds;
-	vmsa->ss		= vmsa->ds;
+	vmsa->ds.limit = AP_INIT_DS_LIMIT;
+	vmsa->ds.attrib = INIT_DS_ATTRIBS;
+	vmsa->es = vmsa->ds;
+	vmsa->fs = vmsa->ds;
+	vmsa->gs = vmsa->ds;
+	vmsa->ss = vmsa->ds;
 
-	vmsa->gdtr.limit	= AP_INIT_GDTR_LIMIT;
-	vmsa->ldtr.limit	= AP_INIT_LDTR_LIMIT;
-	vmsa->ldtr.attrib	= INIT_LDTR_ATTRIBS;
-	vmsa->idtr.limit	= AP_INIT_IDTR_LIMIT;
-	vmsa->tr.limit		= AP_INIT_TR_LIMIT;
-	vmsa->tr.attrib		= INIT_TR_ATTRIBS;
+	vmsa->gdtr.limit = AP_INIT_GDTR_LIMIT;
+	vmsa->ldtr.limit = AP_INIT_LDTR_LIMIT;
+	vmsa->ldtr.attrib = INIT_LDTR_ATTRIBS;
+	vmsa->idtr.limit = AP_INIT_IDTR_LIMIT;
+	vmsa->tr.limit = AP_INIT_TR_LIMIT;
+	vmsa->tr.attrib = INIT_TR_ATTRIBS;
 
-	vmsa->cr4		= cr4;
-	vmsa->cr0		= AP_INIT_CR0_DEFAULT;
-	vmsa->dr7		= DR7_RESET_VALUE;
-	vmsa->dr6		= AP_INIT_DR6_DEFAULT;
-	vmsa->rflags		= AP_INIT_RFLAGS_DEFAULT;
-	vmsa->g_pat		= AP_INIT_GPAT_DEFAULT;
-	vmsa->xcr0		= AP_INIT_XCR0_DEFAULT;
-	vmsa->mxcsr		= AP_INIT_MXCSR_DEFAULT;
-	vmsa->x87_ftw		= AP_INIT_X87_FTW_DEFAULT;
-	vmsa->x87_fcw		= AP_INIT_X87_FCW_DEFAULT;
+	vmsa->cr4 = cr4;
+	vmsa->cr0 = AP_INIT_CR0_DEFAULT;
+	vmsa->dr7 = DR7_RESET_VALUE;
+	vmsa->dr6 = AP_INIT_DR6_DEFAULT;
+	vmsa->rflags = AP_INIT_RFLAGS_DEFAULT;
+	vmsa->g_pat = AP_INIT_GPAT_DEFAULT;
+	vmsa->xcr0 = AP_INIT_XCR0_DEFAULT;
+	vmsa->mxcsr = AP_INIT_MXCSR_DEFAULT;
+	vmsa->x87_ftw = AP_INIT_X87_FTW_DEFAULT;
+	vmsa->x87_fcw = AP_INIT_X87_FCW_DEFAULT;
 
 	/* SVME must be set. */
-	vmsa->efer		= EFER_SVME;
+	vmsa->efer = EFER_SVME;
 
 	/*
 	 * Set the SNP-specific fields for this VMSA:
 	 *   VMPL level
 	 *   SEV_FEATURES (matches the SEV STATUS MSR right shifted 2 bits)
 	 */
-	vmsa->vmpl		= snp_vmpl;
-	vmsa->sev_features	= sev_status >> 2;
+	vmsa->vmpl = snp_vmpl;
+	vmsa->sev_features = sev_status >> 2;
 
 	/* Switch the page over to a VMSA page now that it is initialized */
 	ret = snp_set_vmsa(vmsa, caa, apic_id, true);
@@ -1240,10 +1341,9 @@ static int wakeup_cpu_via_vmgexit(u32 apic_id, unsigned long start_ip)
 	vc_ghcb_invalidate(ghcb);
 	ghcb_set_rax(ghcb, vmsa->sev_features);
 	ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_AP_CREATION);
-	ghcb_set_sw_exit_info_1(ghcb,
-				((u64)apic_id << 32)	|
-				((u64)snp_vmpl << 16)	|
-				SVM_VMGEXIT_AP_CREATE);
+	ghcb_set_sw_exit_info_1(ghcb, ((u64)apic_id << 32) |
+					      ((u64)snp_vmpl << 16) |
+					      SVM_VMGEXIT_AP_CREATE);
 	ghcb_set_sw_exit_info_2(ghcb, __pa(vmsa));
 
 	sev_es_wr_ghcb_msr(__pa(ghcb));
@@ -1308,8 +1408,8 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
 	jump_table_pa = jump_table_addr & PAGE_MASK;
 
 	startup_cs = (u16)(rmh->trampoline_start >> 4);
-	startup_ip = (u16)(rmh->sev_es_trampoline_start -
-			   rmh->trampoline_start);
+	startup_ip =
+		(u16)(rmh->sev_es_trampoline_start - rmh->trampoline_start);
 
 	jump_table = ioremap_encrypted(jump_table_pa, PAGE_SIZE);
 	if (!jump_table)
@@ -1353,25 +1453,113 @@ int __init sev_es_efi_map_ghcbs(pgd_t *pgd)
 	return 0;
 }
 
-static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
+/*
+ * "Allocate" an isolated region from the VM hole for the trampoline code.
+ * This region shall never interfere with any other memory used by the linux
+ * kernel so we can reduce the overhead of page faults handling etc. if
+ * any other code is trying to R/W the data/code that coincidentally share
+ * the same intermedate page translation paths.
+ */
+static int alloc_isolated_trampoline(void)
 {
-	struct svsm_call call = {0};
+	int ret = 0;
+
+	if (trampoline_page)
+		return 0;
+
+	trampoline_page = alloc_page(GFP_KERNEL);
+	if (!trampoline_page) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/*
+	 * Mark the trampoline page as non-present.
+	 * 
+	 * This avoid the direct mapping from touching the page.
+	 */
+	if (set_memory_np((unsigned long)(page_address(trampoline_page)), 1)) {
+		__free_page(trampoline_page);
+		trampoline_page = NULL;
+		ret = -EFAULT;
+		goto out;
+	}
+
+	printk(KERN_INFO "SEV-SNP: Isolated trampoline allocated at VA %p\n",
+	       trampoline_va);
+
+	/*
+	 * Now we utilize the "hole" for placing the trampoline code.
+	 * 
+	 * This avoids interference with other kernel functionalities and ensure
+	 * no potential #PF will occur.
+	 */
+	claim_whole_pgd_entry();
+
+out:
+	return ret;
+}
+
+static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
+					struct svsm_call *call)
+{
 	enum es_result ret = ES_OK;
+	struct svsm_sev_guest_lstar_req *req;
 
-	call.caa = this_cpu_read(svsm_caa);
-	call.rcx = ctxt->regs->cx;
-	call.rdx = ctxt->regs->dx;
-	call.r9 = ctxt->regs->ax;
-	call.r8 = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
-	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
+	if (alloc_isolated_trampoline()) {
+		ret = ES_EXCEPTION;
+		goto out;
+	}
 
-	if (svsm_perform_call_protocol(&call)) {
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req) {
+		ret = ES_EXCEPTION;
+		goto out;
+	}
+
+	req->syscall_enter_addr = ctxt->regs->ax;
+	req->trampoline_va = (u64)trampoline_va;
+	req->trampoline_pa = virt_to_phys(trampoline_va);
+
+	/* Set the call's physical address. */
+	call->r9 = virt_to_phys(req);
+
+	if (svsm_perform_call_protocol(call)) {
+		ret = ES_UNSUPPORTED;
+		goto out;
+	}
+
+	/* Check if the monitor has honored our request. */
+	if (!req->ok) {
 		ret = ES_UNSUPPORTED;
 		goto out;
 	}
 
 out:
+	kfree(req);
+
 	return ret;
+}
+
+static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
+{
+	struct svsm_call call = { 0 };
+
+	if (alloc_isolated_trampoline()) {
+		return ES_EXCEPTION;
+	}
+
+	call.caa = this_cpu_read(svsm_caa);
+	call.rcx = ctxt->regs->cx;
+	call.rdx = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
+
+	switch (call.rcx) {
+	case MSR_LSTAR:
+		return svsm_handle_lstar(ctxt, &call);
+	default:
+		return ES_UNSUPPORTED;
+	}
 }
 
 static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
@@ -1522,8 +1710,8 @@ static void sev_es_play_dead(void)
 	 */
 	soft_restart_cpu();
 }
-#else  /* CONFIG_HOTPLUG_CPU */
-#define sev_es_play_dead	native_play_dead
+#else /* CONFIG_HOTPLUG_CPU */
+#define sev_es_play_dead native_play_dead
 #endif /* CONFIG_HOTPLUG_CPU */
 
 #ifdef CONFIG_SMP
@@ -1532,7 +1720,9 @@ static void __init sev_es_setup_play_dead(void)
 	smp_ops.play_dead = sev_es_play_dead;
 }
 #else
-static inline void sev_es_setup_play_dead(void) { }
+static inline void sev_es_setup_play_dead(void)
+{
+}
 #endif
 
 static void __init alloc_runtime_data(int cpu)
@@ -1580,7 +1770,8 @@ void __init sev_es_init_vc_handling(void)
 {
 	int cpu;
 
-	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) % PAGE_SIZE);
+	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) %
+		     PAGE_SIZE);
 
 	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
 		return;
@@ -1596,7 +1787,8 @@ void __init sev_es_init_vc_handling(void)
 		sev_hv_features = get_hv_features();
 
 		if (!(sev_hv_features & GHCB_HV_FT_SNP))
-			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
+			sev_es_terminate(SEV_TERM_SET_GEN,
+					 GHCB_SNP_UNSUPPORTED);
 	}
 
 	/* Initialize per-cpu GHCB pages */
@@ -1654,7 +1846,7 @@ static long *vc_insn_get_rm(struct es_em_ctxt *ctxt)
 	int offset;
 
 	reg_array = (long *)ctxt->regs;
-	offset    = insn_get_modrm_rm_off(&ctxt->insn, ctxt->regs);
+	offset = insn_get_modrm_rm_off(&ctxt->insn, ctxt->regs);
 
 	if (offset < 0)
 		return NULL;
@@ -1690,9 +1882,11 @@ static enum es_result vc_do_mmio(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 	/* Can never be greater than 8 */
 	exit_info_2 = bytes;
 
-	ghcb_set_sw_scratch(ghcb, ghcb_pa + offsetof(struct ghcb, shared_buffer));
+	ghcb_set_sw_scratch(ghcb,
+			    ghcb_pa + offsetof(struct ghcb, shared_buffer));
 
-	return sev_es_ghcb_hv_call(ghcb, ctxt, exit_code, exit_info_1, exit_info_2);
+	return sev_es_ghcb_hv_call(ghcb, ctxt, exit_code, exit_info_1,
+				   exit_info_2);
 }
 
 /*
@@ -1747,7 +1941,7 @@ static enum es_result vc_handle_mmio_movs(struct es_em_ctxt *ctxt,
 	if (ctxt->regs->flags & X86_EFLAGS_DF)
 		off = -bytes;
 	else
-		off =  bytes;
+		off = bytes;
 
 	ctxt->regs->si += off;
 	ctxt->regs->di += off;
@@ -1910,7 +2104,8 @@ static enum es_result vc_handle_wbinvd(struct ghcb *ghcb,
 	return sev_es_ghcb_hv_call(ghcb, ctxt, SVM_EXIT_WBINVD, 0, 0);
 }
 
-static enum es_result vc_handle_rdpmc(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
+static enum es_result vc_handle_rdpmc(struct ghcb *ghcb,
+				      struct es_em_ctxt *ctxt)
 {
 	enum es_result ret;
 
@@ -2057,14 +2252,15 @@ static enum es_result vc_handle_exitcode(struct es_em_ctxt *ctxt,
 
 static __always_inline bool is_vc2_stack(unsigned long sp)
 {
-	return (sp >= __this_cpu_ist_bottom_va(VC2) && sp < __this_cpu_ist_top_va(VC2));
+	return (sp >= __this_cpu_ist_bottom_va(VC2) &&
+		sp < __this_cpu_ist_top_va(VC2));
 }
 
 static __always_inline bool vc_from_invalid_context(struct pt_regs *regs)
 {
 	unsigned long sp, prev_sp;
 
-	sp      = (unsigned long)regs;
+	sp = (unsigned long)regs;
 	prev_sp = regs->sp;
 
 	/*
@@ -2075,7 +2271,8 @@ static __always_inline bool vc_from_invalid_context(struct pt_regs *regs)
 	return is_vc2_stack(sp) && !is_vc2_stack(prev_sp);
 }
 
-static bool vc_raw_handle_exception(struct pt_regs *regs, unsigned long error_code)
+static bool vc_raw_handle_exception(struct pt_regs *regs,
+				    unsigned long error_code)
 {
 	struct ghcb_state state;
 	struct es_em_ctxt ctxt;
@@ -2099,18 +2296,21 @@ static bool vc_raw_handle_exception(struct pt_regs *regs, unsigned long error_co
 		vc_finish_insn(&ctxt);
 		break;
 	case ES_UNSUPPORTED:
-		pr_err_ratelimited("Unsupported exit-code 0x%02lx in #VC exception (IP: 0x%lx)\n",
-				   error_code, regs->ip);
+		pr_err_ratelimited(
+			"Unsupported exit-code 0x%02lx in #VC exception (IP: 0x%lx)\n",
+			error_code, regs->ip);
 		ret = false;
 		break;
 	case ES_VMM_ERROR:
-		pr_err_ratelimited("Failure in communication with VMM (exit-code 0x%02lx IP: 0x%lx)\n",
-				   error_code, regs->ip);
+		pr_err_ratelimited(
+			"Failure in communication with VMM (exit-code 0x%02lx IP: 0x%lx)\n",
+			error_code, regs->ip);
 		ret = false;
 		break;
 	case ES_DECODE_FAILED:
-		pr_err_ratelimited("Failed to decode instruction (exit-code 0x%02lx IP: 0x%lx)\n",
-				   error_code, regs->ip);
+		pr_err_ratelimited(
+			"Failed to decode instruction (exit-code 0x%02lx IP: 0x%lx)\n",
+			error_code, regs->ip);
 		ret = false;
 		break;
 	case ES_EXCEPTION:
@@ -2236,16 +2436,19 @@ bool __init handle_vc_boot_ghcb(struct pt_regs *regs)
 		vc_finish_insn(&ctxt);
 		break;
 	case ES_UNSUPPORTED:
-		early_printk("PANIC: Unsupported exit-code 0x%02lx in early #VC exception (IP: 0x%lx)\n",
-				exit_code, regs->ip);
+		early_printk(
+			"PANIC: Unsupported exit-code 0x%02lx in early #VC exception (IP: 0x%lx)\n",
+			exit_code, regs->ip);
 		goto fail;
 	case ES_VMM_ERROR:
-		early_printk("PANIC: Failure in communication with VMM (exit-code 0x%02lx IP: 0x%lx)\n",
-				exit_code, regs->ip);
+		early_printk(
+			"PANIC: Failure in communication with VMM (exit-code 0x%02lx IP: 0x%lx)\n",
+			exit_code, regs->ip);
 		goto fail;
 	case ES_DECODE_FAILED:
-		early_printk("PANIC: Failed to decode instruction (exit-code 0x%02lx IP: 0x%lx)\n",
-				exit_code, regs->ip);
+		early_printk(
+			"PANIC: Failed to decode instruction (exit-code 0x%02lx IP: 0x%lx)\n",
+			exit_code, regs->ip);
 		goto fail;
 	case ES_EXCEPTION:
 		vc_early_forward_exception(&ctxt);
@@ -2284,7 +2487,8 @@ static __head struct cc_blob_sev_info *find_cc_blob(struct boot_params *bp)
 
 	/* Boot kernel would have passed the CC blob via boot_params. */
 	if (bp->cc_blob_address) {
-		cc_info = (struct cc_blob_sev_info *)(unsigned long)bp->cc_blob_address;
+		cc_info = (struct cc_blob_sev_info *)(unsigned long)
+				  bp->cc_blob_address;
 		goto found_cc_info;
 	}
 
@@ -2339,7 +2543,8 @@ static __head void svsm_setup(struct cc_blob_sev_info *cc_info)
 	call.rcx = pa;
 	ret = svsm_perform_call_protocol(&call);
 	if (ret)
-		panic("Can't remap the SVSM CA, ret=%d, rax_out=0x%llx\n", ret, call.rax_out);
+		panic("Can't remap the SVSM CA, ret=%d, rax_out=0x%llx\n", ret,
+		      call.rax_out);
 
 	RIP_REL_REF(boot_svsm_caa) = (struct svsm_ca *)pa;
 	RIP_REL_REF(boot_svsm_caa_pa) = pa;
@@ -2390,8 +2595,8 @@ static void dump_cpuid_table(void)
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
 	int i = 0;
 
-	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n",
-		cpuid_table->count, cpuid_table->__reserved1, cpuid_table->__reserved2);
+	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n", cpuid_table->count,
+		cpuid_table->__reserved1, cpuid_table->__reserved2);
 
 	for (i = 0; i < SNP_CPUID_COUNT_MAX; i++) {
 		const struct snp_cpuid_fn *fn = &cpuid_table->fn[i];
@@ -2447,7 +2652,8 @@ static int __init init_sev_config(char *str)
 }
 __setup("sev=", init_sev_config);
 
-static void update_attest_input(struct svsm_call *call, struct svsm_attest_call *input)
+static void update_attest_input(struct svsm_call *call,
+				struct svsm_attest_call *input)
 {
 	/* If (new) lengths have been returned, propagate them up */
 	if (call->rcx_out != call->rcx)
@@ -2476,7 +2682,8 @@ int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call,
 	call->caa = svsm_get_caa();
 
 	ac = (struct svsm_attest_call *)call->caa->svsm_buffer;
-	attest_call_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	attest_call_pa =
+		svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	*ac = *input;
 
@@ -2497,7 +2704,8 @@ int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call,
 }
 EXPORT_SYMBOL_GPL(snp_issue_svsm_attest_req);
 
-int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, struct snp_guest_request_ioctl *rio)
+int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input,
+			    struct snp_guest_request_ioctl *rio)
 {
 	struct ghcb_state state;
 	struct es_em_ctxt ctxt;
@@ -2526,7 +2734,8 @@ int snp_issue_guest_request(u64 exit_code, struct snp_req_data *input, struct sn
 		ghcb_set_rbx(ghcb, input->data_npages);
 	}
 
-	ret = sev_es_ghcb_hv_call(ghcb, &ctxt, exit_code, input->req_gpa, input->resp_gpa);
+	ret = sev_es_ghcb_hv_call(ghcb, &ctxt, exit_code, input->req_gpa,
+				  input->resp_gpa);
 	if (ret)
 		goto e_put;
 
@@ -2562,13 +2771,13 @@ e_restore_irq:
 EXPORT_SYMBOL_GPL(snp_issue_guest_request);
 
 static struct platform_device sev_guest_device = {
-	.name		= "sev-guest",
-	.id		= -1,
+	.name = "sev-guest",
+	.id = -1,
 };
 
 static struct platform_device tpm_device = {
-	.name		= "tpm",
-	.id		= -1,
+	.name = "tpm",
+	.id = -1,
 };
 
 static int snp_issue_svsm_vtpm_send_command(u8 *buffer)
@@ -2678,18 +2887,15 @@ void __init snp_update_svsm_ca(void)
 }
 
 #ifdef CONFIG_SYSFS
-static ssize_t vmpl_show(struct kobject *kobj,
-			 struct kobj_attribute *attr, char *buf)
+static ssize_t vmpl_show(struct kobject *kobj, struct kobj_attribute *attr,
+			 char *buf)
 {
 	return sysfs_emit(buf, "%d\n", snp_vmpl);
 }
 
 static struct kobj_attribute vmpl_attr = __ATTR_RO(vmpl);
 
-static struct attribute *vmpl_attrs[] = {
-	&vmpl_attr.attr,
-	NULL
-};
+static struct attribute *vmpl_attrs[] = { &vmpl_attr.attr, NULL };
 
 static struct attribute_group sev_attr_group = {
 	.attrs = vmpl_attrs,
