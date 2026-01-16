@@ -18,6 +18,7 @@
 #include <linux/memblock.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/memory.h>
 #include <linux/cpumask.h>
 #include <linux/efi.h>
 #include <linux/platform_device.h>
@@ -62,7 +63,7 @@
 #define AP_INIT_CR0_DEFAULT 0x60000010
 #define AP_INIT_MXCSR_DEFAULT 0x1f80
 
-#define TRAMPOLINE_PGD_INDEX 465
+#define TRAMPOLINE_PGD_INDEX 466
 #define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
 
 /*
@@ -107,6 +108,8 @@ static const char *const sev_status_feat_names[] = {
 /* For early boot hypervisor communication in SEV-ES enabled guests */
 static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
 
+static const char trampoline_init_magic[] __read_mostly = "TRAMPOLINE_INIT";
+
 /*
  * Needs to be in the .data section because we need it NULL before bss is
  * cleared
@@ -116,9 +119,9 @@ static struct ghcb *boot_ghcb __section(".data");
 /* Bitmap of SEV features supported by the hypervisor */
 static u64 sev_hv_features __ro_after_init;
 
-struct page *trampoline_page = NULL;
-
-void *trampoline_va = NULL;
+static phys_addr_t trampoline_pa __ro_after_init = 0;
+/* The reserved pages for re-constructing the page table later. */
+static phys_addr_t page_l3 = 0, page_l2 = 0;
 
 struct svsm_sev_guest_lstar_req {
 	u64 syscall_enter_addr;
@@ -327,74 +330,75 @@ static noinstr struct ghcb *__sev_get_ghcb(struct ghcb_state *state)
 	return ghcb;
 }
 
-static int claim_whole_pgd_entry(void)
+static __init phys_addr_t alloc_stolen_mem(unsigned long size)
+{
+	phys_addr_t pa;
+
+	pa = memblock_phys_alloc(size, PAGE_SIZE);
+	if (!pa)
+		return 0;
+
+	memblock_reserve(pa, size);
+
+	return pa;
+}
+
+static __init int claim_whole_pgd_entry(void)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
-	pte_t *pte;
-	struct page *page_l3, *page_l2, *page_l1;
-	phys_addr_t phys_addr;
 	int ret = 0;
 
-	/* We are requesting the memory hole. */
+	if (!trampoline_pa || !IS_ALIGNED(trampoline_pa, PAGE_SIZE))
+		return -EINVAL;
+
 	pgd = pgd_offset_k(TRAMPOLINE_VA_BASE);
 	if (!pgd_none(*pgd)) {
-		pr_err("SEV-SNP: Trampoline PGD entry already claimed\n");
-		return -EEXIST;
-		goto free_pages;
+		pgd_clear(pgd);
+		__flush_tlb_all();
 	}
 
-	page_l3 = (struct page*)get_zeroed_page(GFP_KERNEL);
+	/* --- Level 3 (PUD Table) --- */
+	page_l3 = alloc_stolen_mem(PAGE_SIZE);
 	if (!page_l3) {
-		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
 		goto free_pages;
 	}
+	memset(__va(page_l3), 0, PAGE_SIZE);
 
-	set_pgd(pgd, __pgd(page_to_pfn(page_l3) << PAGE_SHIFT | _PAGE_PRESENT |
-			   _PAGE_RW | _PAGE_USER));
+	set_pgd(pgd, __pgd((page_l3 | 0x67 | _ENC)));
 
 	p4d = p4d_offset(pgd, TRAMPOLINE_VA_BASE);
-	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
 
-	page_l2 = (struct page*)get_zeroed_page(GFP_KERNEL);
+	/* --- Level 2 (PMD Table) --- */
+	page_l2 = alloc_stolen_mem(PAGE_SIZE);
 	if (!page_l2) {
-		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
 		ret = -ENOMEM;
 		goto free_pages;
 	}
+	memset(__va(page_l2), 0, PAGE_SIZE);
 
-	set_pud(pud, __pud(page_to_pfn(page_l2) << PAGE_SHIFT | _PAGE_PRESENT |
-			   _PAGE_RW | _PAGE_USER));
+	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
+	set_pud(pud, __pud((page_l2 | 0x63 | _ENC)));
+
 	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
 
-	page_l1 = (struct page*)get_zeroed_page(GFP_KERNEL);
-	if (!page_l1) {
-		pr_err("SEV-SNP: Unable to allocate page for trampoline\n");
-		ret = -ENOMEM;
-		goto free_pages;
-	}
+	set_pmd(pmd, __pmd((trampoline_pa | 0x1e1 | _ENC)));
 
-	set_pmd(pmd, __pmd(page_to_pfn(page_l1) << PAGE_SHIFT | _PAGE_PRESENT |
-			   _PAGE_RW | _PAGE_USER));
-	pte = pte_offset_kernel(pmd, TRAMPOLINE_VA_BASE);
-
-	phys_addr = page_to_phys(trampoline_page);
-
-	set_pte(pte, pfn_pte(phys_addr >> PAGE_SHIFT, PAGE_KERNEL_EXEC));
+	__flush_tlb_all();
 
 	goto out;
 
 free_pages:
 	if (ret < 0) {
-		if (page_l1)
-			__free_page(page_l1);
 		if (page_l2)
-			__free_page(page_l2);
+			memblock_add(page_l2, PAGE_SIZE);
 		if (page_l3)
-			__free_page(page_l3);
+			memblock_add(page_l3, PAGE_SIZE);
+		if (pgd)
+			pgd_clear(pgd);
 	}
 
 out:
@@ -1460,33 +1464,22 @@ int __init sev_es_efi_map_ghcbs(pgd_t *pgd)
  * any other code is trying to R/W the data/code that coincidentally share
  * the same intermedate page translation paths.
  */
-static int alloc_isolated_trampoline(void)
+int __init alloc_isolated_trampoline(void)
 {
-	int ret = 0;
+	void *target_va;
 
-	if (trampoline_page)
-		return 0;
+	if (trampoline_pa)
+		return -EINVAL;
 
-	trampoline_page = alloc_page(GFP_KERNEL);
-	if (!trampoline_page) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	trampoline_pa = alloc_stolen_mem(PMD_SIZE);
+	if (!trampoline_pa)
+		return -ENOMEM;
 
-	/*
-	 * Mark the trampoline page as non-present.
-	 * 
-	 * This avoid the direct mapping from touching the page.
-	 */
-	if (set_memory_np((unsigned long)(page_address(trampoline_page)), 1)) {
-		__free_page(trampoline_page);
-		trampoline_page = NULL;
-		ret = -EFAULT;
-		goto out;
-	}
+	target_va = __va(trampoline_pa);
 
-	printk(KERN_INFO "SEV-SNP: Isolated trampoline allocated at VA %p\n",
-	       trampoline_va);
+	/* Now copy the magic number. */
+	memcpy((char *)(target_va), trampoline_init_magic,
+	       sizeof(trampoline_init_magic));
 
 	/*
 	 * Now we utilize the "hole" for placing the trampoline code.
@@ -1494,35 +1487,74 @@ static int alloc_isolated_trampoline(void)
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
-	claim_whole_pgd_entry();
-
-out:
-	return ret;
+	return claim_whole_pgd_entry();
 }
 
+void __init register_trampoline_page(void)
+{
+}
+
+/* Must be called after the buddy system is up */
+void __init register_syscall_trampoline(void)
+{
+	struct svsm_sev_guest_lstar_req *req;
+	struct svsm_call call = { 0 };
+	struct sev_es_runtime_data *data;
+	struct ghcb *ghcb;
+
+	pr_info("Registering syscall trampoline with SVSM\n");
+
+	data = this_cpu_read(runtime_data);
+	ghcb = &data->ghcb_page;
+
+	if (trampoline_pa)
+		return;
+
+	/* Allocate a page for that trampoline. */
+	if (alloc_isolated_trampoline())
+		panic("Failed to allocate isolated trampoline page\n");
+
+	/* Re-use the SVSM buffer for allocating the request body. */
+	req = (struct svsm_sev_guest_lstar_req *)(svsm_get_caa()->svsm_buffer);
+	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_REGISTER_TRAMPOLINE);
+
+	req->trampoline_pa = trampoline_pa;
+	req->trampoline_va = TRAMPOLINE_VA_BASE;
+
+	pr_info("Calling the SVSM call\n");
+	if (svsm_perform_ghcb_protocol(ghcb, &call)) {
+		pr_err("Failed to register syscall trampoline with SVSM\n");
+		return;
+	}
+
+	if (!req->ok) {
+		pr_err("SVSM refused to register syscall trampoline\n");
+		return;
+	}
+}
+
+/*
+ * This function notifies the monitor that we are writing to
+ * LSTAR and it should set up the syscall interception accordingly.
+ */
 static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 					struct svsm_call *call)
 {
 	enum es_result ret = ES_OK;
 	struct svsm_sev_guest_lstar_req *req;
+	phys_addr_t req_pa;
 
-	if (alloc_isolated_trampoline()) {
-		ret = ES_EXCEPTION;
-		goto out;
-	}
+	/* Re-use the SVSM buffer for allocating the request body. */
+	req = (struct svsm_sev_guest_lstar_req *)(call->caa->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	call->r9 = req_pa;
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
 
-	req = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!req) {
-		ret = ES_EXCEPTION;
-		goto out;
-	}
-
-	req->syscall_enter_addr = ctxt->regs->ax;
-	req->trampoline_va = (u64)trampoline_va;
-	req->trampoline_pa = virt_to_phys(trampoline_va);
-
-	/* Set the call's physical address. */
-	call->r9 = virt_to_phys(req);
+	req->syscall_enter_addr = (ctxt->regs->dx << 32) |
+				  (ctxt->regs->ax & 0xffffffff);
+	req->trampoline_va = TRAMPOLINE_VA_BASE;
+	req->trampoline_pa = trampoline_pa;
 
 	if (svsm_perform_call_protocol(call)) {
 		ret = ES_UNSUPPORTED;
@@ -1536,8 +1568,6 @@ static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 	}
 
 out:
-	kfree(req);
-
 	return ret;
 }
 
@@ -1545,16 +1575,11 @@ static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
 {
 	struct svsm_call call = { 0 };
 
-	if (alloc_isolated_trampoline()) {
-		return ES_EXCEPTION;
-	}
-
-	call.caa = this_cpu_read(svsm_caa);
+	call.caa = svsm_get_caa();
 	call.rcx = ctxt->regs->cx;
 	call.rdx = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
-	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
 
-	switch (call.rcx) {
+	switch ((unsigned int)(ctxt->regs->cx)) {
 	case MSR_LSTAR:
 		return svsm_handle_lstar(ctxt, &call);
 	default:

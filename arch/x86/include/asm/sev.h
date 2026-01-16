@@ -314,11 +314,11 @@ struct svsm_call {
 
 #define SVSM_EXTEND_CALL(x)		((4ULL << 32) | (x))
 #define SVSM_EXTEND_MSR_INTERCEPT 0
+#define SVSM_EXTEND_MSR_REGISTER_TRAMPOLINE 1
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
 extern u8 snp_vmpl;
-
 extern void __sev_es_ist_enter(struct pt_regs *regs);
 extern void __sev_es_ist_exit(void);
 static __always_inline void sev_es_ist_enter(struct pt_regs *regs)

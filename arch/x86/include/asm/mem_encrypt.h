@@ -31,6 +31,8 @@ static inline void __init mem_encrypt_setup_arch(void) { }
 extern u64 sme_me_mask;
 extern u64 sev_status;
 
+extern int alloc_isolated_trampoline(void);
+
 void sme_encrypt_execute(unsigned long encrypted_kernel_vaddr,
 			 unsigned long decrypted_kernel_vaddr,
 			 unsigned long kernel_len,

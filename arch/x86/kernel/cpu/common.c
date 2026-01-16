@@ -2026,6 +2026,8 @@ static void wrmsrl_cstar(unsigned long val)
 
 static inline void idt_syscall_init(void)
 {
+	alloc_isolated_trampoline();
+
 	wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
 
 	if (ia32_enabled()) {

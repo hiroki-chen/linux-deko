@@ -899,6 +899,137 @@ static void __init early_numa_node_init(void)
 #endif
 }
 
+/* 假设 raw_print 和 raw_print_hex 已经定义好 */
+
+static void debug_trampoline_page_table(unsigned long va)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    unsigned long val;
+
+	rdmsrl(0xC0010010, val);
+if (!(val & (1ULL << 23))) {
+    // 必须在这里手动写 1，或者报错停止
+    // 注意：有些 BIOS 会锁定这个 MSR，导致写入失败
+    printk(KERN_ALERT "FATAL: SYSCFG[MemEncryptEn] is OFF! Hardware thinks C-Bit is Reserved.\n");
+}
+    pr_info("\n");
+    pr_info("================ [DEKO DEBUG START] ================\n");
+    pr_info("Inspecting Virtual Address: %016lx\n", va);
+
+    /* --- Level 4: PGD --- */
+    pgd = pgd_offset_k(va);
+    val = pgd_val(*pgd);
+    pr_info("PGD Entry (@%p): %016lx\n", pgd, val);
+    
+    if (pgd_none(*pgd)) {
+        pr_err("!!! FATAL: PGD is empty/none!\n");
+        return;
+    }
+    if ((val & sme_me_mask) == 0) pr_err("!!! ERROR: PGD missing C-Bit (Encryption)!\n");
+    if (val & _PAGE_NX)           pr_err("!!! ERROR: PGD has NX bit set!\n");
+
+    /* x86通常 P4D = PGD (4-Level) 或 P4D 独立 (5-Level) */
+    p4d = p4d_offset(pgd, va); 
+
+    /* --- Level 3: PUD --- */
+    pud = pud_offset(p4d, va);
+    val = pud_val(*pud);
+    pr_info("PUD Entry (@%p): %016lx\n", pud, val);
+
+    if (pud_none(*pud)) {
+        pr_err("!!! FATAL: PUD is empty!\n");
+        return;
+    }
+    if ((val & sme_me_mask) == 0) pr_err("!!! ERROR: PUD missing C-Bit!\n");
+    if (val & _PAGE_NX)           pr_err("!!! ERROR: PUD has NX bit set! (Blocks execution)\n");
+
+    /* --- Level 2: PMD --- */
+    pmd = pmd_offset(pud, va);
+    val = pmd_val(*pmd);
+    pr_info("PMD Entry (@%p): %016lx\n", pmd, val);
+
+    if (pmd_none(*pmd)) {
+        pr_err("!!! FATAL: PMD is empty!\n");
+        return;
+    }
+    if ((val & sme_me_mask) == 0) pr_err("!!! ERROR: PMD missing C-Bit!\n");
+    if (val & _PAGE_NX)           pr_err("!!! ERROR: PMD has NX bit set! (Blocks execution)\n");
+
+    /* --- Level 1: PTE --- */
+    pte = pte_offset_kernel(pmd, va);
+    val = pte_val(*pte);
+    pr_info("PTE Entry (@%p): %016lx\n", pte, val);
+
+    if (pte_none(*pte)) {
+        pr_err("!!! FATAL: PTE is empty!\n");
+        return;
+    }
+
+    /* --- PTE 深度体检 --- */
+    int fatal_error = 0;
+
+    // 1. 检查 C-Bit
+    if ((val & sme_me_mask) == 0) {
+        pr_err("!!! FATAL: PTE missing C-Bit! Hardware will read garbage.\n");
+        fatal_error = 1;
+    } else {
+        pr_info("PASS: C-Bit is set.\n");
+    }
+
+    // 2. 检查 NX (No-Execute)
+    if (val & _PAGE_NX) {
+        pr_err("!!! FATAL: PTE has NX set! Instruction Fetch will PF.\n");
+        fatal_error = 1;
+    } else {
+        pr_info("PASS: NX is cleared (Executable).\n");
+    }
+
+    // 3. 检查 User (SMEP)
+    if (val & _PAGE_USER) {
+        pr_err("!!! FATAL: PTE has USER bit set! SMEP will kill this.\n");
+        fatal_error = 1;
+    } else {
+        pr_info("PASS: PTE is Kernel-only (No _PAGE_USER).\n");
+    }
+
+    // 4. 检查 Global
+    if (val & _PAGE_GLOBAL) {
+        pr_info("PASS: PTE is Global.\n");
+    } else {
+        pr_warn("WARN: PTE is NOT Global. Risk of sync issues with User CR3.\n");
+    }
+
+    // if (fatal_error) {
+    //     pr_err("Aborting memory read test due to fatal page table errors.\n");
+    //     return;
+    // }
+
+    /* --- Step 2: 硬件访问测试 --- */
+    pr_info("--- Attempting Memory READ Test --- (If crash happens next, it's hardware blocking)\n");
+
+    // 使用 volatile 防止编译器优化读操作
+    unsigned long *ptr = (unsigned long *)va;
+    unsigned long data = 0;
+
+    // 这一步是关键：如果这里崩了，说明 PVALIDATE 没做或者 RMP 权限不够
+    data = *ptr; 
+
+    pr_info("READ SUCCESS! Data at %016lx: %016lx\n", va, data);
+
+    if (data == 0) {
+        pr_warn("WARN: Read ZERO. Did you flush the cache after writing code?\n");
+    } else {
+        pr_info("PASS: Non-zero data read. Looks good.\n");
+    }
+    
+    pr_info("================ [DEKO DEBUG END] ================\n");
+}
+
+
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
@@ -931,7 +1062,6 @@ void start_kernel(void)
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 	early_numa_node_init();
 	boot_cpu_hotplug_init();
-
 	pr_notice("Kernel command line: %s\n", saved_command_line);
 	/* parameters may set static keys */
 	jump_label_init();
@@ -1098,10 +1228,11 @@ void start_kernel(void)
 	acpi_subsystem_init();
 	arch_post_acpi_subsys_init();
 	kcsan_init();
-
+	
+	debug_trampoline_page_table(0xffffe90000000000UL);
 	/* Do the rest non-__init'ed, we're now alive */
 	rest_init();
-
+	
 	/*
 	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
 	 * and older.
