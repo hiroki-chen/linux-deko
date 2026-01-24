@@ -67,6 +67,12 @@
 #define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
 
 /*
+ * Should communicate with us but for convienience just
+ * allocate a large chunk of memory here.
+ */
+#define DEKO_IFC_POLICY_ENGINE_MEM_SIZE ((SZ_64M))
+
+/*
  * SEV-SNP guest MSR intercepts
  * 
  * The use of these MSRs in a SEV-SNP guest running at VMPL1 / VMPL2
@@ -122,6 +128,8 @@ static u64 sev_hv_features __ro_after_init;
 static phys_addr_t trampoline_pa __ro_after_init = 0;
 /* The reserved pages for re-constructing the page table later. */
 static phys_addr_t page_l3 = 0, page_l2 = 0;
+/* The reserved memory for the IFC policy engine. */
+static phys_addr_t deko_ifc_policy_engine_mem __ro_after_init = 0;
 
 struct svsm_sev_guest_lstar_req {
 	u64 syscall_enter_addr;
@@ -343,6 +351,62 @@ static __init phys_addr_t alloc_stolen_mem(unsigned long size)
 	return pa;
 }
 
+static __init int set_up_deko_ifc_policy_engine_mapping(void)
+{
+	int ret = 0;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	unsigned long va_start = TRAMPOLINE_VA_BASE + PMD_SIZE;
+	unsigned long cur_va;
+	phys_addr_t cur_pa;
+	int i;
+
+	if (!deko_ifc_policy_engine_mem ||
+	    !IS_ALIGNED(deko_ifc_policy_engine_mem, PAGE_SIZE))
+		return -EINVAL;
+
+	pgd = pgd_offset_k(va_start);
+	if (pgd_none(*pgd))
+		return -ENOMEM;
+	p4d = p4d_offset(pgd, va_start);
+	pud = pud_offset(p4d, va_start);
+
+	if (pud_none(*pud)) {
+		unsigned long new_pud = alloc_stolen_mem(PAGE_SIZE);
+		if (!new_pud)
+			return -ENOMEM;
+
+		set_p4d(p4d, __p4d(__pa(new_pud) | 0x67 | _ENC));
+		pud = pud_offset(p4d, va_start);
+	}
+
+	pmd = pmd_offset(pud, va_start);
+	if (pud_none(*pud)) {
+		unsigned long new_pmd = alloc_stolen_mem(PAGE_SIZE);
+		if (!new_pmd)
+			return -ENOMEM;
+		set_pud(pud, __pud(__pa(new_pmd) | 0x63 | _ENC));
+	}
+
+	cur_pa = deko_ifc_policy_engine_mem;
+	cur_va = va_start;
+	for (i = 0; i < (DEKO_IFC_POLICY_ENGINE_MEM_SIZE / PMD_SIZE); i++) {
+		pmd = pmd_offset(pud, cur_va);
+		pgprot_t prot =
+			__pgprot(__PAGE_KERNEL_LARGE | _PAGE_GLOBAL | _ENC);
+		set_pmd(pmd, pfn_pmd(cur_pa >> PAGE_SHIFT, prot));
+
+		cur_pa += PMD_SIZE;
+		cur_va += PMD_SIZE;
+	}
+
+	__flush_tlb_all();
+
+	return ret;
+}
+
 static __init int claim_whole_pgd_entry(void)
 {
 	pgd_t *pgd;
@@ -385,7 +449,7 @@ static __init int claim_whole_pgd_entry(void)
 
 	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
 
-	set_pmd(pmd, __pmd((trampoline_pa | 0x1e1 | _ENC)));
+	set_pmd(pmd, __pmd((trampoline_pa | 0x1e3 | _ENC)));
 
 	__flush_tlb_all();
 
@@ -1468,11 +1532,20 @@ int __init alloc_isolated_trampoline(void)
 {
 	void *target_va;
 
-	if (trampoline_pa)
+	if (trampoline_pa || deko_ifc_policy_engine_mem)
 		return -EINVAL;
 
 	trampoline_pa = alloc_stolen_mem(PMD_SIZE);
 	if (!trampoline_pa)
+		return -ENOMEM;
+
+	deko_ifc_policy_engine_mem =
+		alloc_stolen_mem(DEKO_IFC_POLICY_ENGINE_MEM_SIZE);
+	if (!deko_ifc_policy_engine_mem)
+		/*
+		 * Need to free the memory but returning this eventually panics the system
+		 * so should be fine.
+		 */
 		return -ENOMEM;
 
 	target_va = __va(trampoline_pa);
@@ -1487,7 +1560,11 @@ int __init alloc_isolated_trampoline(void)
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
-	return claim_whole_pgd_entry();
+	if (claim_whole_pgd_entry()) {
+		return -EINVAL;
+	}
+
+	return set_up_deko_ifc_policy_engine_mapping();
 }
 
 void __init register_trampoline_page(void)
