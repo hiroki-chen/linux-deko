@@ -697,6 +697,7 @@ static void __init setup_command_line(char *command_line)
  */
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
+static void debug_trampoline_page_table(unsigned long va);
 
 static noinline void __ref __noreturn rest_init(void)
 {
@@ -737,6 +738,7 @@ static noinline void __ref __noreturn rest_init(void)
 	system_state = SYSTEM_SCHEDULING;
 
 	complete(&kthreadd_done);
+	debug_trampoline_page_table(0xffffe90000000000UL);
 
 	/*
 	 * The boot idle thread must execute schedule()
@@ -1012,19 +1014,10 @@ if (!(val & (1ULL << 23))) {
     pr_info("--- Attempting Memory READ Test --- (If crash happens next, it's hardware blocking)\n");
 
     // 使用 volatile 防止编译器优化读操作
-    unsigned long *ptr = (unsigned long *)va;
-    unsigned long data = 0;
-
-    // 这一步是关键：如果这里崩了，说明 PVALIDATE 没做或者 RMP 权限不够
-    data = *ptr; 
-
-    pr_info("READ SUCCESS! Data at %016lx: %016lx\n", va, data);
-
-    if (data == 0) {
-        pr_warn("WARN: Read ZERO. Did you flush the cache after writing code?\n");
-    } else {
-        pr_info("PASS: Non-zero data read. Looks good.\n");
-    }
+    u8 *ptr = (u8 *)va;
+    
+		print_hex_dump(KERN_INFO, "DATA DUMP: ", DUMP_PREFIX_ADDRESS, 16, 1,
+											 ptr, 64, false);
     
     pr_info("================ [DEKO DEBUG END] ================\n");
 }
@@ -1228,11 +1221,9 @@ void start_kernel(void)
 	acpi_subsystem_init();
 	arch_post_acpi_subsys_init();
 	kcsan_init();
-	
-	debug_trampoline_page_table(0xffffe90000000000UL);
 	/* Do the rest non-__init'ed, we're now alive */
 	rest_init();
-	
+		
 	/*
 	 * Avoid stack canaries in callers of boot_init_stack_canary for gcc-10
 	 * and older.

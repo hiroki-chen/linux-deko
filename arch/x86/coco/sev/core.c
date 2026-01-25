@@ -135,9 +135,10 @@ struct svsm_sev_guest_lstar_req {
 	u64 syscall_enter_addr;
 	u64 trampoline_va;
 	u64 trampoline_pa;
+	u64 blob_pa;
 	bool ok;
 	u8 reserved[7];
-} __attribute__((aligned(64)));
+} __attribute__((aligned(8)));
 
 /* #VC handler runtime per-CPU data */
 struct sev_es_runtime_data {
@@ -342,7 +343,7 @@ static __init phys_addr_t alloc_stolen_mem(unsigned long size)
 {
 	phys_addr_t pa;
 
-	pa = memblock_phys_alloc(size, PAGE_SIZE);
+	pa = memblock_phys_alloc(size, PMD_SIZE);
 	if (!pa)
 		return 0;
 
@@ -1567,50 +1568,6 @@ int __init alloc_isolated_trampoline(void)
 	return set_up_deko_ifc_policy_engine_mapping();
 }
 
-void __init register_trampoline_page(void)
-{
-}
-
-/* Must be called after the buddy system is up */
-void __init register_syscall_trampoline(void)
-{
-	struct svsm_sev_guest_lstar_req *req;
-	struct svsm_call call = { 0 };
-	struct sev_es_runtime_data *data;
-	struct ghcb *ghcb;
-
-	pr_info("Registering syscall trampoline with SVSM\n");
-
-	data = this_cpu_read(runtime_data);
-	ghcb = &data->ghcb_page;
-
-	if (trampoline_pa)
-		return;
-
-	/* Allocate a page for that trampoline. */
-	if (alloc_isolated_trampoline())
-		panic("Failed to allocate isolated trampoline page\n");
-
-	/* Re-use the SVSM buffer for allocating the request body. */
-	req = (struct svsm_sev_guest_lstar_req *)(svsm_get_caa()->svsm_buffer);
-	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
-	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_REGISTER_TRAMPOLINE);
-
-	req->trampoline_pa = trampoline_pa;
-	req->trampoline_va = TRAMPOLINE_VA_BASE;
-
-	pr_info("Calling the SVSM call\n");
-	if (svsm_perform_ghcb_protocol(ghcb, &call)) {
-		pr_err("Failed to register syscall trampoline with SVSM\n");
-		return;
-	}
-
-	if (!req->ok) {
-		pr_err("SVSM refused to register syscall trampoline\n");
-		return;
-	}
-}
-
 /*
  * This function notifies the monitor that we are writing to
  * LSTAR and it should set up the syscall interception accordingly.
@@ -1630,6 +1587,7 @@ static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 
 	req->syscall_enter_addr = (ctxt->regs->dx << 32) |
 				  (ctxt->regs->ax & 0xffffffff);
+	req->blob_pa = deko_ifc_policy_engine_mem;
 	req->trampoline_va = TRAMPOLINE_VA_BASE;
 	req->trampoline_pa = trampoline_pa;
 
