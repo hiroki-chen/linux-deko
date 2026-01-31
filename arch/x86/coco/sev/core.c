@@ -7,8 +7,13 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
+#include <string.h>
 #define pr_fmt(fmt) "SEV: " fmt
 
+#include "asm/page.h"
+#include "linux/cred.h"
+#include "linux/sched.h"
+#include "linux/types.h"
 #include <linux/sched/debug.h> /* For show_regs() */
 #include <linux/percpu-defs.h>
 #include <linux/cc_platform.h>
@@ -1582,7 +1587,7 @@ int __init alloc_isolated_trampoline(void)
 
 	/* Copy the trampoline code to the allocated region. */
 	memcpy(cpu_trampoline_va, trampoline_init_magic,
-					sizeof(trampoline_init_magic));
+	       sizeof(trampoline_init_magic));
 
 	/*
 	 * Now we utilize the "hole" for placing the trampoline code.
@@ -1594,6 +1599,37 @@ int __init alloc_isolated_trampoline(void)
 		return -EINVAL;
 
 	return set_up_deko_ifc_policy_engine_mapping();
+}
+
+enum es_result svsm_deko_new_app_req(struct task_struct *task)
+{
+	enum es_result ret = ES_OK;
+	phys_addr_t req_pa;
+	struct deko_new_app_req *req;
+	struct svsm_call call = { 0 };
+
+	/* Re-use the SVSM buffer for allocating the request body. */
+	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+
+	req->pid = task->pid;
+	req->ppid = task->real_parent->pid;
+	req->tgid = task->tgid;
+	req->uid = current_cred()->uid.val;
+	req->mnt_ns_id = 0;
+	memcpy(req->comm, task->comm, sizeof(req->comm));
+
+	if (task->nsproxy && task->nsproxy->mnt_ns)
+		req->mnt_ns_id = (u64)task->nsproxy->mnt_ns;
+
+	call.caa = svsm_get_caa();
+	call.r9 = req_pa;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
+
+	if (svsm_perform_call_protocol(&call))
+		ret = ES_UNSUPPORTED;
+
+	return ret;
 }
 
 /*
