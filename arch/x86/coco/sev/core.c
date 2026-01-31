@@ -125,9 +125,13 @@ static struct ghcb *boot_ghcb __section(".data");
 /* Bitmap of SEV features supported by the hypervisor */
 static u64 sev_hv_features __ro_after_init;
 
-static phys_addr_t trampoline_pa __ro_after_init = 0;
+// static DEFINE_PER_CPU(phys_addr_t, deko_trampoline_pa);
+
+/* The base address for the trampoline code's physical address. */
+static phys_addr_t trampoline_pa_base = 0;
+
 /* The reserved pages for re-constructing the page table later. */
-static phys_addr_t page_l3 = 0, page_l2 = 0;
+static phys_addr_t page_l3 = 0, page_l2, page_l1 = 0;
 /* The reserved memory for the IFC policy engine. */
 static phys_addr_t deko_ifc_policy_engine_mem __ro_after_init = 0;
 
@@ -136,6 +140,7 @@ struct svsm_sev_guest_lstar_req {
 	u64 trampoline_va;
 	u64 trampoline_pa;
 	u64 blob_pa;
+	u64 page_offset_base;
 	bool ok;
 	u8 reserved[7];
 } __attribute__((aligned(8)));
@@ -414,9 +419,11 @@ static __init int claim_whole_pgd_entry(void)
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
+	pte_t *pte;
+	int i;
 	int ret = 0;
 
-	if (!trampoline_pa || !IS_ALIGNED(trampoline_pa, PAGE_SIZE))
+	if (!trampoline_pa_base || !IS_ALIGNED(trampoline_pa_base, PMD_SIZE))
 		return -EINVAL;
 
 	pgd = pgd_offset_k(TRAMPOLINE_VA_BASE);
@@ -448,9 +455,22 @@ static __init int claim_whole_pgd_entry(void)
 	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
 	set_pud(pud, __pud((page_l2 | 0x63 | _ENC)));
 
+	page_l1 = alloc_stolen_mem(PAGE_SIZE);
+	if (!page_l1) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+	memset(__va(page_l1), 0, PAGE_SIZE);
+
 	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
 
-	set_pmd(pmd, __pmd((trampoline_pa | 0x1e3 | _ENC)));
+	set_pmd(pmd, __pmd((page_l1 | 0x67 | _ENC)));
+	pte = pte_offset_kernel(pmd, TRAMPOLINE_VA_BASE);
+
+	for (i = 0; i < PTRS_PER_PTE; i++) {
+		phys_addr_t slice_pa = trampoline_pa_base + (i * PAGE_SIZE);
+		set_pte(&pte[i], __pte(slice_pa | 0x163 | _ENC));
+	}
 
 	__flush_tlb_all();
 
@@ -458,6 +478,8 @@ static __init int claim_whole_pgd_entry(void)
 
 free_pages:
 	if (ret < 0) {
+		if (page_l1)
+			memblock_add(page_l1, PAGE_SIZE);
 		if (page_l2)
 			memblock_add(page_l2, PAGE_SIZE);
 		if (page_l3)
@@ -1532,28 +1554,35 @@ int __init sev_es_efi_map_ghcbs(pgd_t *pgd)
 int __init alloc_isolated_trampoline(void)
 {
 	void *target_va;
+	int cpu;
+	char *cpu_trampoline_va;
 
-	if (trampoline_pa || deko_ifc_policy_engine_mem)
-		return -EINVAL;
+	if (!trampoline_pa_base) {
+		trampoline_pa_base = alloc_stolen_mem(PMD_SIZE);
+		if (!trampoline_pa_base)
+			return -ENOMEM;
+	}
 
-	trampoline_pa = alloc_stolen_mem(PMD_SIZE);
-	if (!trampoline_pa)
-		return -ENOMEM;
-
-	deko_ifc_policy_engine_mem =
-		alloc_stolen_mem(DEKO_IFC_POLICY_ENGINE_MEM_SIZE);
-	if (!deko_ifc_policy_engine_mem)
-		/*
+	if (!deko_ifc_policy_engine_mem) {
+		deko_ifc_policy_engine_mem =
+			alloc_stolen_mem(DEKO_IFC_POLICY_ENGINE_MEM_SIZE);
+		if (!deko_ifc_policy_engine_mem)
+			/*
 		 * Need to free the memory but returning this eventually panics the system
 		 * so should be fine.
 		 */
-		return -ENOMEM;
+			return -ENOMEM;
+	}
 
-	target_va = __va(trampoline_pa);
+	target_va = __va(trampoline_pa_base);
 
 	/* Now copy the magic number. */
-	memcpy((char *)(target_va), trampoline_init_magic,
-	       sizeof(trampoline_init_magic));
+	cpu = smp_processor_id();
+	cpu_trampoline_va = (char *)(target_va + (cpu * PAGE_SIZE));
+
+	/* Copy the trampoline code to the allocated region. */
+	memcpy(cpu_trampoline_va, trampoline_init_magic,
+					sizeof(trampoline_init_magic));
 
 	/*
 	 * Now we utilize the "hole" for placing the trampoline code.
@@ -1561,9 +1590,8 @@ int __init alloc_isolated_trampoline(void)
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
-	if (claim_whole_pgd_entry()) {
+	if (!cpu && claim_whole_pgd_entry())
 		return -EINVAL;
-	}
 
 	return set_up_deko_ifc_policy_engine_mapping();
 }
@@ -1578,6 +1606,9 @@ static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 	enum es_result ret = ES_OK;
 	struct svsm_sev_guest_lstar_req *req;
 	phys_addr_t req_pa;
+	int cpu_id;
+
+	cpu_id = smp_processor_id();
 
 	/* Re-use the SVSM buffer for allocating the request body. */
 	req = (struct svsm_sev_guest_lstar_req *)(call->caa->svsm_buffer);
@@ -1588,8 +1619,9 @@ static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 	req->syscall_enter_addr = (ctxt->regs->dx << 32) |
 				  (ctxt->regs->ax & 0xffffffff);
 	req->blob_pa = deko_ifc_policy_engine_mem;
-	req->trampoline_va = TRAMPOLINE_VA_BASE;
-	req->trampoline_pa = trampoline_pa;
+	req->trampoline_va = TRAMPOLINE_VA_BASE + (cpu_id * PAGE_SIZE);
+	req->trampoline_pa = trampoline_pa_base + (cpu_id * PAGE_SIZE);
+	req->page_offset_base = page_offset_base;
 
 	if (svsm_perform_call_protocol(call)) {
 		ret = ES_UNSUPPORTED;
