@@ -23,9 +23,6 @@
  * formats.
  */
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-#include <asm/sev.h>
-#endif
 
 #include <linux/cred.h>
 #include <linux/types.h>
@@ -1519,10 +1516,6 @@ void setup_new_exec(struct linux_binprm *bprm)
 	 * some architectures like powerpc
 	 */
 	me->mm->task_size = TASK_SIZE;
-
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-	svsm_deko_new_app_req(current);
-#endif
 
 	up_write(&me->signal->exec_update_lock);
 	mutex_unlock(&me->signal->cred_guard_mutex);

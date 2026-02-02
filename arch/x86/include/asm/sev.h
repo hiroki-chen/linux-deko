@@ -34,8 +34,10 @@ struct deko_new_app_req {
 	u32 uid;
 
 	u64 mnt_ns_id;
+	u64 start_code;
+	u64 end_code;
 	char comm[16];
-} __attribute__((aligned(8), packed));
+} __attribute__((aligned(8)));
 
 enum es_result {
 	ES_OK, /* All good */
@@ -91,7 +93,8 @@ static inline u64 lower_bits(u64 val, unsigned int bits)
 struct real_mode_header;
 enum stack_type;
 
-extern enum es_result svsm_deko_new_app_req(struct task_struct *task);
+extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
+					    bool creation);
 
 /* Early IDT entry points for #VC handler */
 extern void vc_no_ghcb(void);

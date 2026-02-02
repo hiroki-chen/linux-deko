@@ -7,9 +7,7 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
-#include <string.h>
 #define pr_fmt(fmt) "SEV: " fmt
-
 #include "asm/page.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
@@ -1601,7 +1599,7 @@ int __init alloc_isolated_trampoline(void)
 	return set_up_deko_ifc_policy_engine_mapping();
 }
 
-enum es_result svsm_deko_new_app_req(struct task_struct *task)
+enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id, bool creation)
 {
 	enum es_result ret = ES_OK;
 	phys_addr_t req_pa;
@@ -1617,13 +1615,16 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task)
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
 	req->mnt_ns_id = 0;
-	memcpy(req->comm, task->comm, sizeof(req->comm));
+	req->start_code = task->mm ? task->mm->start_code : 0;
+	req->end_code = task->mm ? task->mm->end_code : 0;
+	strscpy(req->comm, task->comm, sizeof(req->comm));
 
 	if (task->nsproxy && task->nsproxy->mnt_ns)
-		req->mnt_ns_id = (u64)task->nsproxy->mnt_ns;
+		req->mnt_ns_id = ns_id;
 
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
+	call.r8 = creation ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
 	if (svsm_perform_call_protocol(&call))
