@@ -8,6 +8,7 @@
 #ifndef __ASM_ENCRYPTED_STATE_H
 #define __ASM_ENCRYPTED_STATE_H
 
+#include "linux/percpu-defs.h"
 #include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/sev-guest.h>
@@ -131,6 +132,8 @@ struct rmp_state {
 } __packed;
 
 #define RMPADJUST_VMSA_PAGE_BIT BIT(16)
+
+DECLARE_PER_CPU(u64, deko_sysret_trampoline);
 
 /* SNP Guest message request */
 struct snp_req_data {
@@ -333,6 +336,7 @@ struct svsm_call {
 #define SVSM_EXTEND_MSR_INTERCEPT 0
 #define SVSM_EXTEND_SYSCALL_ANALYSIS 1
 #define SVSM_EXTEND_REPORT_APP 2
+#define SVSM_EXTEND_LAUNCH_APP 3
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

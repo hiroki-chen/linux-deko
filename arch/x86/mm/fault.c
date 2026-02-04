@@ -525,8 +525,8 @@ show_fault_oops(struct pt_regs *regs, unsigned long error_code, unsigned long ad
 		pte = lookup_address_in_pgd_attr(pgd, address, &level, &nx, &rw);
 
 		if (pte && pte_present(*pte) && (!pte_exec(*pte) || nx))
-			pr_crit("kernel tried to execute NX-protected page - exploit attempt? (uid: %d)\n",
-				from_kuid(&init_user_ns, current_uid()));
+			pr_crit("kernel tried to execute NX-protected page - exploit attempt? (uid: %d) (addr: %lu)\n",
+				from_kuid(&init_user_ns, current_uid()), address);
 		if (pte && pte_present(*pte) && pte_exec(*pte) && !nx &&
 				(pgd_flags(*pgd) & _PAGE_USER) &&
 				(__read_cr4() & X86_CR4_SMEP))

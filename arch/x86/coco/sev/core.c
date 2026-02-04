@@ -7,8 +7,6 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
-#define pr_fmt(fmt) "SEV: " fmt
-#include "asm/page.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
 #include "linux/types.h"
@@ -114,6 +112,8 @@ static const char *const sev_status_feat_names[] = {
 	[MSR_AMD64_SNP_SMT_PROT_BIT] = "SMTProt",
 };
 
+DEFINE_PER_CPU(u64, deko_sysret_trampoline);
+
 /* For early boot hypervisor communication in SEV-ES enabled guests */
 static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
 
@@ -144,8 +144,7 @@ struct svsm_sev_guest_lstar_req {
 	u64 trampoline_pa;
 	u64 blob_pa;
 	u64 page_offset_base;
-	bool ok;
-	u8 reserved[7];
+	u64 sysret_trampoline;
 } __attribute__((aligned(8)));
 
 /* #VC handler runtime per-CPU data */
@@ -380,18 +379,16 @@ static __init int set_up_deko_ifc_policy_engine_mapping(void)
 	if (pgd_none(*pgd))
 		return -ENOMEM;
 	p4d = p4d_offset(pgd, va_start);
-	pud = pud_offset(p4d, va_start);
 
-	if (pud_none(*pud)) {
+	if (p4d_none(*p4d)) {
 		unsigned long new_pud = alloc_stolen_mem(PAGE_SIZE);
 		if (!new_pud)
 			return -ENOMEM;
 
 		set_p4d(p4d, __p4d(__pa(new_pud) | 0x67 | _ENC));
-		pud = pud_offset(p4d, va_start);
 	}
 
-	pmd = pmd_offset(pud, va_start);
+	pud = pud_offset(p4d, va_start);
 	if (pud_none(*pud)) {
 		unsigned long new_pmd = alloc_stolen_mem(PAGE_SIZE);
 		if (!new_pmd)
@@ -403,8 +400,8 @@ static __init int set_up_deko_ifc_policy_engine_mapping(void)
 	cur_va = va_start;
 	for (i = 0; i < (DEKO_IFC_POLICY_ENGINE_MEM_SIZE / PMD_SIZE); i++) {
 		pmd = pmd_offset(pud, cur_va);
-		pgprot_t prot =
-			__pgprot(__PAGE_KERNEL_LARGE | _PAGE_GLOBAL | _ENC);
+		pgprot_t prot = __pgprot(_PAGE_PRESENT | _PAGE_RW |
+					 _PAGE_GLOBAL | _PAGE_PSE | _ENC);
 		set_pmd(pmd, pfn_pmd(cur_pa >> PAGE_SHIFT, prot));
 
 		cur_pa += PMD_SIZE;
@@ -1593,13 +1590,15 @@ int __init alloc_isolated_trampoline(void)
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
-	if (!cpu && claim_whole_pgd_entry())
+	if (!cpu && (claim_whole_pgd_entry() ||
+		     set_up_deko_ifc_policy_engine_mapping()))
 		return -EINVAL;
 
-	return set_up_deko_ifc_policy_engine_mapping();
+	return 0;
 }
 
-enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id, bool creation)
+enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
+				     bool creation)
 {
 	enum es_result ret = ES_OK;
 	phys_addr_t req_pa;
@@ -1665,11 +1664,8 @@ static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
 		goto out;
 	}
 
-	/* Check if the monitor has honored our request. */
-	if (!req->ok) {
-		ret = ES_UNSUPPORTED;
-		goto out;
-	}
+	this_cpu_write(deko_sysret_trampoline,
+		       req->sysret_trampoline + TRAMPOLINE_VA_BASE);
 
 out:
 	return ret;
@@ -2270,10 +2266,34 @@ static enum es_result vc_handle_mwait(struct ghcb *ghcb,
 	return ES_OK;
 }
 
+static enum es_result vc_handle_vmmcall_user(struct ghcb *ghcb,
+					     struct es_em_ctxt *ctxt)
+{
+	enum es_result ret;
+	struct svsm_call call = { 0 };
+
+	/* Begin svsm call. */
+	call.caa = svsm_get_caa();
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+
+	ret = svsm_perform_call_protocol(&call);
+	if (ret)
+		return ret;
+
+	return ES_OK;
+}
+
 static enum es_result vc_handle_vmmcall(struct ghcb *ghcb,
 					struct es_em_ctxt *ctxt)
 {
 	enum es_result ret;
+
+	/*
+	 * We place a trampoline vmmcall to the user space to
+	 * jump to the SVSM handler.
+	 */
+	if (user_mode(ctxt->regs))
+		return vc_handle_vmmcall_user(ghcb, ctxt);
 
 	ghcb_set_rax(ghcb, ctxt->regs->ax);
 	ghcb_set_cpl(ghcb, user_mode(ctxt->regs) ? 3 : 0);
@@ -2370,6 +2390,8 @@ static enum es_result vc_handle_exitcode(struct es_em_ctxt *ctxt,
 		result = vc_handle_mmio(ghcb, ctxt);
 		break;
 	default:
+		pr_info("Unhandled exit-code 0x%02lx in #VC exception (IP: 0x%lx)\n",
+			exit_code, ctxt->regs->ip);
 		/*
 		 * Unexpected #VC exception
 		 */

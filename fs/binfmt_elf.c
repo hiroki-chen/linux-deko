@@ -10,6 +10,9 @@
  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
  */
 
+#include "linux/kern_levels.h"
+#include "linux/page-flags.h"
+#include "linux/printk.h"
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -112,6 +115,46 @@ static struct linux_binfmt elf_format = {
 	.min_coredump = ELF_EXEC_PAGESIZE,
 #endif
 };
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+static struct page *deko_trampoline_pages[2] = { NULL, NULL };
+
+static void deko_init_trampoline_once(void)
+{
+	struct page *p;
+	unsigned long tramp;
+	void *vaddr;
+
+	if (deko_trampoline_pages[0])
+		return;
+
+	p = alloc_page(GFP_KERNEL);
+	if (!p) {
+		pr_err("Deko: Failed to allocate trampoline page\n");
+		return;
+	}
+
+	SetPageReserved(p);
+
+	vaddr = page_address(p);
+	tramp = this_cpu_read(deko_sysret_trampoline);
+
+	pr_info("Deko: Initializing trampoline page at %p; copying from %lx\n",
+		vaddr, tramp);
+
+	print_hex_dump(KERN_INFO, "Deko: Trampoline code: ", DUMP_PREFIX_OFFSET,
+		       16, 1, (void *)tramp, 64, false);
+
+	memset(vaddr, 0, PAGE_SIZE);
+	memcpy(vaddr, (void *)tramp, 0x100);
+
+	deko_trampoline_pages[0] = p;
+	deko_trampoline_pages[1] = NULL;
+
+	pr_info("Deko: Trampoline page initialized at %p\n", vaddr);
+}
+
+#endif
 
 #define BAD_ADDR(x) (unlikely((unsigned long)(x) >= TASK_SIZE))
 
@@ -819,20 +862,125 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 
 	return ret == -ENOENT ? 0 : ret;
 }
+static bool is_spawned_by_container_runtime(void)
+{
+	struct task_struct *task = current;
+	struct task_struct *parent;
+	int depth = 0;
+	bool found = false;
+
+	rcu_read_lock();
+
+	if (strstr(task->comm, "runc") ||
+	    strstr(task->comm, "containerd-shim") ||
+	    strstr(task->comm,
+		   "docker-init")) { // 很多容器会有 tini/docker-init
+		rcu_read_unlock();
+		return false;
+	}
+
+	while (task && task->pid > 1 && depth < 10) {
+		parent = rcu_dereference(task->real_parent);
+
+		if (!parent || parent == task)
+			break;
+
+		if (strstr(parent->comm, "runc") ||
+		    strstr(parent->comm, "containerd-shim") ||
+		    strstr(parent->comm, "docker-init")) {
+			found = true;
+			break;
+		}
+
+		task = parent;
+		depth++;
+	}
+
+	rcu_read_unlock();
+
+	return found;
+}
+
+static int deko_pin_range(struct mm_struct *mm, unsigned long start,
+			  unsigned long end, struct page ***out_pages)
+{
+	unsigned long len;
+	unsigned long nr_pages;
+	struct page **pages;
+	int locked_pages;
+	unsigned long gup_flags = FOLL_FORCE | FOLL_LONGTERM;
+
+	if (end <= start)
+		return -EINVAL;
+
+	len = end - start;
+	nr_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+
+	pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (!pages)
+		return -ENOMEM;
+
+	locked_pages = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
+					     pages, NULL);
+
+	if (locked_pages < 0) {
+		pr_err("Deko: Failed to pin pages: %d\n", locked_pages);
+		kvfree(pages);
+		return locked_pages;
+	}
+
+	*out_pages = pages;
+	return locked_pages;
+}
 
 static void bprm_force_load(struct mm_struct *mm)
 {
-	unsigned long addr;
-	unsigned long end = mm->end_code;
-	char dummy;
+	struct page **pages = NULL;
+	int ret;
 
-	if (end < mm->start_code)
-		return;
+	mmap_read_lock(mm);
 
-	for (addr = mm->start_code; addr < end; addr += PAGE_SIZE) {
-		get_user(dummy, (char __user *)addr);
+	ret = deko_pin_range(mm, mm->start_code, mm->end_code, &pages);
+
+	mmap_read_unlock(mm);
+
+	if (ret > 0) {
+		pr_info("Deko: Pinned %d code pages at %lx\n", ret,
+			mm->start_code);
+		// unpin_user_pages(pages, ret);
+		// kvfree(pages);
 	}
 }
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+static unsigned long install_sysret_trampoline(struct mm_struct *mm)
+{
+	unsigned long addr;
+	int ret;
+
+	if (!deko_trampoline_pages[0])
+		deko_init_trampoline_once();
+
+	if (down_write_killable(&mm->mmap_lock))
+		return -EINTR;
+	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
+	if (IS_ERR_VALUE(addr)) {
+		up_write(&mm->mmap_lock);
+		return addr;
+	}
+
+	ret = install_special_mapping(mm, addr, PAGE_SIZE,
+				      VM_READ | VM_EXEC | VM_MAYREAD |
+					      VM_MAYEXEC | VM_DONTEXPAND,
+				      deko_trampoline_pages);
+	up_write(&mm->mmap_lock);
+
+	if (ret)
+		return ret;
+
+	return addr;
+}
+#endif
 
 static int load_elf_binary(struct linux_binprm *bprm)
 {
@@ -849,6 +997,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	unsigned long interp_load_addr = 0;
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long reloc_func_desc __maybe_unused = 0;
+	unsigned long tramp;
 	int executable_stack = EXSTACK_DEFAULT;
 	struct elfhdr *elf_ex = (struct elfhdr *)bprm->buf;
 	struct elfhdr *interp_elf_ex = NULL;
@@ -1358,8 +1507,25 @@ out_free_interp:
 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
-	if (current && current->mm && !(current->flags & PF_KTHREAD))
+	/* Temporarily disable the preempt to avoid page race. */
+	if (current && !(current->flags & PF_KTHREAD) &&
+	    is_spawned_by_container_runtime()) {
+		pr_info("Deko: Detected Docker process! Name: %s, Comm: %s\n",
+			bprm->filename, current->comm);
+		pr_info("range is from %lx to %lx\n", current->mm->start_code,
+			current->mm->end_code);
 		bprm_force_load(current->mm);
+
+		tramp = install_sysret_trampoline(current->mm);
+		if (IS_ERR_VALUE(tramp)) {
+			pr_err("Deko: Failed to install sysret trampoline: %lx\n",
+			       tramp);
+			goto out;
+		}
+
+		regs = current_pt_regs();
+		regs->ip = tramp;
+	}
 
 	svsm_deko_new_app_req(current, current->nsproxy->mnt_ns->ns.inum, true);
 #endif
