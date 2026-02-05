@@ -7,6 +7,7 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
+#include "asm/io.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
 #include "linux/types.h"
@@ -1598,7 +1599,9 @@ int __init alloc_isolated_trampoline(void)
 }
 
 enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
-				     bool creation)
+				     bool creation, unsigned long *token_low,
+				     unsigned long *token_high,
+				     enum deko_new_app_type ty)
 {
 	enum es_result ret = ES_OK;
 	phys_addr_t req_pa;
@@ -1616,6 +1619,8 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->mnt_ns_id = 0;
 	req->start_code = task->mm ? task->mm->start_code : 0;
 	req->end_code = task->mm ? task->mm->end_code : 0;
+	req->app_type = ty;
+
 	strscpy(req->comm, task->comm, sizeof(req->comm));
 
 	if (task->nsproxy && task->nsproxy->mnt_ns)
@@ -1628,6 +1633,11 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 	if (svsm_perform_call_protocol(&call))
 		ret = ES_UNSUPPORTED;
+
+	if (creation && ty == DEKO_DOCKER_APPS) {
+		*token_low = req->token_low;
+		*token_high = req->token_high;
+	}
 
 	return ret;
 }
@@ -2271,10 +2281,15 @@ static enum es_result vc_handle_vmmcall_user(struct ghcb *ghcb,
 {
 	enum es_result ret;
 	struct svsm_call call = { 0 };
+	struct pt_regs *regs = ctxt->regs;
 
 	/* Begin svsm call. */
 	call.caa = svsm_get_caa();
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+
+	/* Fill in the caa buffer region with user register context */
+	memcpy(svsm_get_caa()->svsm_buffer, regs, sizeof(struct pt_regs));
+	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	ret = svsm_perform_call_protocol(&call);
 	if (ret)

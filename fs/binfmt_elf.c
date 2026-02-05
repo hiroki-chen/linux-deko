@@ -9,10 +9,6 @@
  *
  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
  */
-
-#include "linux/kern_levels.h"
-#include "linux/page-flags.h"
-#include "linux/printk.h"
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -862,33 +858,98 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 
 	return ret == -ENOENT ? 0 : ret;
 }
-static bool is_spawned_by_container_runtime(void)
+
+static inline bool comm_starts_with(const char *filename, const char *prefix)
+{
+	return strncmp(filename, prefix,
+		       min(strlen(prefix), (size_t)TASK_COMM_LEN - 1)) == 0;
+}
+
+static bool is_docker_infrastructure(struct linux_binprm *bprm)
 {
 	struct task_struct *task = current;
 	struct task_struct *parent;
 	int depth = 0;
-	bool found = false;
+	const char *f = bprm->filename;
+
+	if (strstr(f, "runc"))
+		return true;
+	if (strstr(f, "docker-init"))
+		return true;
+	if (strstr(f, "containerd-shim"))
+		return true;
+	if (strstr(f, "conmon"))
+		return true;
+
+	if (strstr(f, "/proc/self/fd")) {
+		rcu_read_lock();
+
+		parent = rcu_dereference(task->real_parent);
+		while (parent && parent->pid > 1 && depth < 6) {
+			if (comm_starts_with(parent->comm,
+					     "containerd-shim") || // Docker/K8s
+			    comm_starts_with(parent->comm,
+					     "docker-init") || // Docker --init
+			    comm_starts_with(parent->comm,
+					     "conmon") || // Podman
+			    comm_starts_with(parent->comm,
+					     "crun") || // RedHat/Fedora
+			    comm_starts_with(parent->comm,
+					     "runsc") || // gVisor
+			    comm_starts_with(parent->comm,
+					     "lxc-") || // LXC
+			    comm_starts_with(parent->comm, "runc")) {
+				rcu_read_unlock();
+				return true;
+			}
+
+			parent = rcu_dereference(parent->real_parent);
+			depth++;
+		}
+
+		rcu_read_unlock();
+	}
+
+	return false;
+}
+
+static bool is_spawned_by_container_runtime(struct linux_binprm *bprm)
+{
+	struct task_struct *task = current;
+	struct task_struct *parent;
+	int depth = 0;
+	bool found_runtime_parent = false;
+	bool is_isolated_ns = false;
 
 	rcu_read_lock();
 
-	if (strstr(task->comm, "runc") ||
-	    strstr(task->comm, "containerd-shim") ||
-	    strstr(task->comm,
-		   "docker-init")) { // 很多容器会有 tini/docker-init
+	if (is_docker_infrastructure(bprm)) {
 		rcu_read_unlock();
 		return false;
 	}
 
-	while (task && task->pid > 1 && depth < 10) {
+	if (task_active_pid_ns(task) != &init_pid_ns) {
+		is_isolated_ns = true;
+	}
+
+	while (task && task->pid > 1 && depth < 6) {
 		parent = rcu_dereference(task->real_parent);
 
 		if (!parent || parent == task)
 			break;
 
-		if (strstr(parent->comm, "runc") ||
-		    strstr(parent->comm, "containerd-shim") ||
-		    strstr(parent->comm, "docker-init")) {
-			found = true;
+		if (comm_starts_with(parent->comm,
+				     "containerd-shim") || // Docker/K8s
+		    comm_starts_with(parent->comm,
+				     "docker-init") || // Docker --init
+		    comm_starts_with(parent->comm,
+				     "conmon") || // Podman
+		    comm_starts_with(parent->comm,
+				     "crun") || // RedHat/Fedora
+		    comm_starts_with(parent->comm, "runsc") || // gVisor
+		    comm_starts_with(parent->comm, "lxc-") || // LXC
+		    comm_starts_with(parent->comm, "runc")) {
+			found_runtime_parent = true;
 			break;
 		}
 
@@ -898,7 +959,24 @@ static bool is_spawned_by_container_runtime(void)
 
 	rcu_read_unlock();
 
-	return found;
+	if (is_isolated_ns) {
+		pr_info("Deko: Detected namespace isolation (PID NS != Init)\n");
+		return true;
+	}
+
+	if (found_runtime_parent) {
+		return true;
+	}
+
+	return false;
+}
+
+static bool is_target_app(struct linux_binprm *bprm)
+{
+	if (is_docker_infrastructure(bprm))
+		return false;
+
+	return is_spawned_by_container_runtime(bprm);
 }
 
 static int deko_pin_range(struct mm_struct *mm, unsigned long start,
@@ -1004,6 +1082,9 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct arch_elf_state arch_state = INIT_ARCH_ELF_STATE;
 	struct mm_struct *mm;
 	struct pt_regs *regs;
+	bool is_app = false;
+	bool is_infra = false;
+	enum es_result res;
 
 	retval = -ENOEXEC;
 	/* First of all, some simple consistency checks */
@@ -1507,27 +1588,65 @@ out_free_interp:
 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
-	/* Temporarily disable the preempt to avoid page race. */
-	if (current && !(current->flags & PF_KTHREAD) &&
-	    is_spawned_by_container_runtime()) {
-		pr_info("Deko: Detected Docker process! Name: %s, Comm: %s\n",
-			bprm->filename, current->comm);
-		pr_info("range is from %lx to %lx\n", current->mm->start_code,
-			current->mm->end_code);
+	regs = current_pt_regs();
+	is_app = false;
+	is_infra = false;
+
+	if (current->flags & PF_KTHREAD)
+		goto out_deko;
+
+	is_app = is_target_app(bprm);
+	if (!is_app) {
+		is_infra = is_docker_infrastructure(bprm);
+	}
+
+	if (!is_app && !is_infra)
+		goto out_deko;
+
+	if (is_app) {
+		pr_info("Deko: Detected Container App! Comm: %s, PID: %d\n",
+			current->comm, current->pid);
+
 		bprm_force_load(current->mm);
+		pr_info("Deko: Force load range %lx - %lx\n",
+			current->mm->start_code, current->mm->end_code);
 
 		tramp = install_sysret_trampoline(current->mm);
 		if (IS_ERR_VALUE(tramp)) {
-			pr_err("Deko: Failed to install sysret trampoline: %lx\n",
+			pr_err("Deko: Failed to install trampoline: %ld\n",
 			       tramp);
-			goto out;
+			force_sig(SIGKILL);
+			return PTR_ERR((void *)tramp);
 		}
 
-		regs = current_pt_regs();
+		/* C. Context Setup: */
 		regs->ip = tramp;
+		regs->bx = elf_entry;
+		regs->r12 = bprm->p;
 	}
 
-	svsm_deko_new_app_req(current, current->nsproxy->mnt_ns->ns.inum, true);
+	if (is_app || is_infra) {
+		pr_info("Deko: Communicating with SVSM for process %s (App=%d)\n",
+			current->comm, is_app);
+
+		preempt_disable();
+
+		res = svsm_deko_new_app_req(
+			current, current->nsproxy->mnt_ns->ns.inum, true,
+			&regs->cx, &regs->dx, /* Do not use ax as it will gets cleared */
+			is_app ? DEKO_DOCKER_APPS : DEKO_DOCKER_INFRA);
+
+		preempt_enable();
+
+		if (res != ES_OK) {
+			pr_err("Deko: SVSM rejected process %s (App=%d)\n",
+			       current->comm, is_app);
+			force_sig(SIGKILL);
+			return -EACCES;
+		}
+	}
+
+out_deko:
 #endif
 	retval = 0;
 out:

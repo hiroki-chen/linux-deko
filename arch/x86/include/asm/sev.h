@@ -28,6 +28,11 @@
 
 struct boot_params;
 
+enum deko_new_app_type {
+	DEKO_DOCKER_INFRA = 0,
+	DEKO_DOCKER_APPS = 1,
+};
+
 struct deko_new_app_req {
 	u32 pid;
 	u32 tgid;
@@ -38,6 +43,9 @@ struct deko_new_app_req {
 	u64 start_code;
 	u64 end_code;
 	char comm[16];
+	u64 token_low;
+	u64 token_high;
+	enum deko_new_app_type app_type;
 } __attribute__((aligned(8)));
 
 enum es_result {
@@ -95,7 +103,10 @@ struct real_mode_header;
 enum stack_type;
 
 extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
-					    bool creation);
+					    bool creation,
+					    unsigned long *token_low,
+					    unsigned long *token_high,
+					    enum deko_new_app_type ty);
 
 /* Early IDT entry points for #VC handler */
 extern void vc_no_ghcb(void);

@@ -834,7 +834,7 @@ void __noreturn do_exit(long code)
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 	if (tsk->mm && !(tsk->flags & PF_KTHREAD))
-		svsm_deko_new_app_req(tsk, ns_id, false);
+		// svsm_deko_new_app_req(tsk, ns_id, false, NULL, NULL);
 #endif
 
 	WARN_ON(irqs_disabled());
