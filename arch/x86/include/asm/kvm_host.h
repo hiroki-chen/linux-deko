@@ -1841,6 +1841,7 @@ struct kvm_x86_ops {
 	int (*private_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn);
 	int (*max_vmpl)(struct kvm *kvm);
 	int (*pending_event_higher_vmpl)(struct kvm_vcpu *vcpu);
+	void (*inject_timer)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_x86_nested_ops {

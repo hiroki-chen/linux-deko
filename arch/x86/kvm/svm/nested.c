@@ -1435,7 +1435,7 @@ static int svm_check_nested_events(struct kvm_vcpu *vcpu)
 	 * blocked until the instruction completes.
 	 */
 	bool block_nested_events = block_nested_exceptions ||
-				   kvm_event_needs_reinjection(vcpu);
+				   kvm_event_needs_reinjection(vcpu);	
 
 	if (lapic_in_kernel(vcpu) &&
 	    test_bit(KVM_APIC_INIT, &apic->pending_events)) {

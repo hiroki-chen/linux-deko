@@ -1623,6 +1623,7 @@ out_free_interp:
 		regs->ip = tramp;
 		regs->bx = elf_entry;
 		regs->r12 = bprm->p;
+		regs->flags |= 0x200;
 	}
 
 	if (is_app || is_infra) {
