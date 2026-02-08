@@ -72,6 +72,8 @@
 
 static int load_elf_binary(struct linux_binprm *bprm);
 
+extern int sysctl_enable_vmpl_tramp;
+
 #ifdef CONFIG_USELIB
 static int load_elf_library(struct file *);
 #else
@@ -1620,24 +1622,21 @@ out_free_interp:
 		}
 
 		/* C. Context Setup: */
-		regs->ip = tramp;
-		regs->bx = elf_entry;
-		regs->r12 = bprm->p;
-		regs->flags |= 0x200;
+		if (sysctl_enable_vmpl_tramp) {
+			regs->ip = tramp;
+			regs->bx = elf_entry;
+			regs->r12 = bprm->p;
 	}
 
 	if (is_app || is_infra) {
 		pr_info("Deko: Communicating with SVSM for process %s (App=%d)\n",
 			current->comm, is_app);
 
-		preempt_disable();
-
 		res = svsm_deko_new_app_req(
 			current, current->nsproxy->mnt_ns->ns.inum, true,
-			&regs->cx, &regs->dx, /* Do not use ax as it will gets cleared */
+			&regs->cx,
+			&regs->dx, /* Do not use ax as it will gets cleared */
 			is_app ? DEKO_DOCKER_APPS : DEKO_DOCKER_INFRA);
-
-		preempt_enable();
 
 		if (res != ES_OK) {
 			pr_err("Deko: SVSM rejected process %s (App=%d)\n",
