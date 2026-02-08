@@ -3672,7 +3672,7 @@ static void svm_inject_timer(struct kvm_vcpu *vcpu)
 		return;
 
 	/*
-	 * If the guest has enabled interrupt, we should prvent
+	 * If the guest has disabled interrupt, we should prvent
 	 * injecting the timer interrupt right now to avoid
 	 * inconsistent state.
 	 */
