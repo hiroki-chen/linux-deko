@@ -738,7 +738,7 @@ static noinline void __ref __noreturn rest_init(void)
 	system_state = SYSTEM_SCHEDULING;
 
 	complete(&kthreadd_done);
-	debug_trampoline_page_table(0xffffe90000000000UL);
+	debug_trampoline_page_table(0xFFFFFF800048A000);
 
 	/*
 	 * The boot idle thread must execute schedule()
@@ -1013,11 +1013,11 @@ if (!(val & (1ULL << 23))) {
     /* --- Step 2: 硬件访问测试 --- */
     pr_info("--- Attempting Memory READ Test --- (If crash happens next, it's hardware blocking)\n");
 
-    // 使用 volatile 防止编译器优化读操作
-    u8 *ptr = (u8 *)va;
+    // // 使用 volatile 防止编译器优化读操作
+    // u8 *ptr = (u8 *)va;
     
-		print_hex_dump(KERN_INFO, "DATA DUMP: ", DUMP_PREFIX_ADDRESS, 16, 1,
-											 ptr, 64, false);
+		// print_hex_dump(KERN_INFO, "DATA DUMP: ", DUMP_PREFIX_ADDRESS, 16, 1,
+		// 									 ptr, 64, false);
     
     pr_info("================ [DEKO DEBUG END] ================\n");
 }

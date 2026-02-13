@@ -2028,6 +2028,8 @@ static inline void idt_syscall_init(void)
 {
 	alloc_isolated_trampoline();
 
+	svsm_map_vmpl1();
+
 	wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
 
 	if (ia32_enabled()) {

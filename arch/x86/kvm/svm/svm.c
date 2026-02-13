@@ -2117,6 +2117,12 @@ static int npf_interception(struct kvm_vcpu *vcpu)
 	u64 fault_address = svm->vmcb->control.exit_info_2;
 	u64 error_code = svm->vmcb->control.exit_info_1;
 
+	if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1 &&
+	    ((error_code & 0x1) !=
+	     0) /* Present page => NPF must be some violation. */)
+		pr_warn("SEV-ES: Nested page fault in VMPL1, address: 0x%llx, error code: 0x%llx, cpu:0x%x\n",
+			fault_address, error_code, vcpu->vcpu_id);
+
 	/*
 	 * WARN if hardware generates a fault with an error code that collides
 	 * with KVM-defined sythentic flags.  Clear the flags and continue on,

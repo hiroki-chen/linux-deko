@@ -42,6 +42,8 @@ struct deko_new_app_req {
 	u64 mnt_ns_id;
 	u64 start_code;
 	u64 end_code;
+	u64 user_stack;
+	u64 user_stack_size;
 	char comm[16];
 	u64 token_low;
 	u64 token_high;
@@ -348,6 +350,7 @@ struct svsm_call {
 #define SVSM_EXTEND_SYSCALL_ANALYSIS 1
 #define SVSM_EXTEND_REPORT_APP 2
 #define SVSM_EXTEND_LAUNCH_APP 3
+#define SVSM_EXTEND_MAP_IFC 4
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

@@ -7,9 +7,12 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
-#include "asm/io.h"
+#include "asm/pgtable_types.h"
+#include "asm/tlbflush.h"
 #include "linux/cred.h"
+#include "linux/rcupdate.h"
 #include "linux/sched.h"
+#include "linux/smp.h"
 #include "linux/types.h"
 #include <linux/sched/debug.h> /* For show_regs() */
 #include <linux/percpu-defs.h>
@@ -67,6 +70,8 @@
 
 #define TRAMPOLINE_PGD_INDEX 466
 #define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
+
+#define SVSM_PERCPU_BASE 0xffffffff00000000UL
 
 /*
  * Should communicate with us but for convienience just
@@ -147,6 +152,21 @@ struct svsm_sev_guest_lstar_req {
 	u64 page_offset_base;
 	u64 sysret_trampoline;
 } __attribute__((aligned(8)));
+
+struct svsm_map_ifc_single_req {
+	u64 va_start;
+	u64 va_end;
+	u64 pa_start;
+	u64 pa_end;
+	bool is_per_cpu;
+} __attribute__((aligned(8)));
+
+struct svsm_map_ifc_req {
+	u16 req_len;
+	u16 __reserved[3];
+	u64 ghcb_va;
+	struct svsm_map_ifc_single_req reqs[16];
+} __attribute__((packed, aligned(8)));
 
 /* #VC handler runtime per-CPU data */
 struct sev_es_runtime_data {
@@ -473,7 +493,7 @@ static __init int claim_whole_pgd_entry(void)
 		set_pte(&pte[i], __pte(slice_pa | 0x163 | _ENC));
 	}
 
-	__flush_tlb_all();
+	// __flush_tlb_all();
 
 	goto out;
 
@@ -491,6 +511,80 @@ free_pages:
 
 out:
 	return ret;
+}
+
+static void *alloc_page_table_safe(void)
+{
+	void *ptr;
+
+	if (slab_is_available()) {
+		ptr = (void *)get_zeroed_page(GFP_ATOMIC);
+	} else {
+		phys_addr_t pa = alloc_stolen_mem(PAGE_SIZE);
+		if (pa) {
+			ptr = __va(pa);
+			memset(ptr, 0, PAGE_SIZE);
+		} else {
+			ptr = NULL;
+		}
+	}
+	return ptr;
+}
+
+static int force_map_va_range(unsigned long va_start, unsigned long va_end,
+			      phys_addr_t pa_start, unsigned long flags)
+{
+	unsigned long addr;
+	phys_addr_t paddr = pa_start;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	for (addr = va_start; addr < va_end;
+	     addr += PAGE_SIZE, paddr += PAGE_SIZE) {
+		/* --- Level 4: PGD --- */
+		pgd = pgd_offset_k(addr);
+
+		if (pgd_none(*pgd)) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+
+			set_pgd(pgd, __pgd(__pa(new_page) | 0x67 | _ENC));
+		}
+
+		p4d = p4d_offset(pgd, addr);
+
+		/* --- Level 3: PUD --- */
+		if (pud_none(*pud_offset(p4d, addr))) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+			set_pud(pud_offset(p4d, addr),
+				__pud(__pa(new_page) | 0x63 | _ENC));
+		}
+		pud = pud_offset(p4d, addr);
+
+		/* --- Level 2: PMD --- */
+		if (pmd_none(*pmd_offset(pud, addr))) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+
+			set_pmd(pmd_offset(pud, addr),
+				__pmd(__pa(new_page) | 0x67 | _ENC));
+		}
+		pmd = pmd_offset(pud, addr);
+
+		/* --- Level 1: PTE --- */
+		pte = pte_offset_kernel(pmd, addr);
+
+		set_pte(pte, __pte(paddr | 0x167 | _ENC));
+	}
+
+	return 0;
 }
 
 static inline u64 sev_es_rd_ghcb_msr(void)
@@ -1607,6 +1701,8 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	phys_addr_t req_pa;
 	struct deko_new_app_req *req;
 	struct svsm_call call = { 0 };
+	u64 stack_size = 0;
+	struct vm_area_struct *vma;
 
 	/* Re-use the SVSM buffer for allocating the request body. */
 	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
@@ -1617,8 +1713,29 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
 	req->mnt_ns_id = 0;
-	req->start_code = task->mm ? task->mm->start_code : 0;
-	req->end_code = task->mm ? task->mm->end_code : 0;
+
+	if (task->mm) {
+		req->start_code = task->mm->start_code;
+		req->end_code = task->mm->end_code;
+		req->user_stack = task->mm->start_stack;
+
+		mmap_read_lock(task->mm);
+
+		vma = find_vma(task->mm, task->mm->start_stack);
+
+		if (vma && vma->vm_start <= task->mm->start_stack) {
+			stack_size = vma->vm_end - vma->vm_start;
+		}
+
+		mmap_read_unlock(task->mm);
+	} else {
+		req->start_code = 0;
+		req->end_code = 0;
+		req->user_stack = 0;
+	}
+
+	req->user_stack_size = stack_size;
+
 	req->app_type = ty;
 
 	strscpy(req->comm, task->comm, sizeof(req->comm));
@@ -1640,6 +1757,130 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	}
 
 	return ret;
+}
+
+static void make_va_decrypted(unsigned long va)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	/* 1. Walk PGD */
+	pgd = pgd_offset_k(va);
+	if (pgd_none(*pgd))
+		return;
+
+	p4d = p4d_offset(pgd, va);
+	if (p4d_none(*p4d))
+		return;
+
+	/* 2. Walk PUD */
+	pud = pud_offset(p4d, va);
+	if (pud_none(*pud))
+		return;
+
+	/* 3. Walk PMD */
+	pmd = pmd_offset(pud, va);
+	if (pmd_none(*pmd))
+		return;
+
+	if ((pmd_val(*pmd) & _PAGE_PSE)) {
+		unsigned long val = pmd_val(*pmd);
+
+		val &= ~_ENC;
+		set_pmd(pmd, __pmd(val));
+		pr_info("SVSM: GHCB VA %lx (PMD Huge) marked as Decrypted to %lx.\n",
+			va, val);
+		return;
+	}
+
+	pte = pte_offset_kernel(pmd, va);
+	if (pte_none(*pte))
+		return;
+
+	unsigned long val = pte_val(*pte);
+	val &= ~_ENC;
+	set_pte(pte, __pte(val));
+
+	pr_info("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va, val);
+}
+
+static void process_map_vmpl1(struct svsm_map_ifc_req *req)
+{
+	size_t i;
+	struct svsm_map_ifc_single_req *cur;
+	int cpu;
+	u64 ghcb_va;
+	unsigned long calculated_va;
+
+	for (i = 0; i < req->req_len; i++) {
+		cur = &req->reqs[i];
+
+		if (!cur->is_per_cpu) {
+			if (smp_processor_id() == 0) {
+				force_map_va_range(cur->va_start, cur->va_end,
+						   cur->pa_start, 0x163);
+			}
+		} else {
+			cpu = smp_processor_id();
+			calculated_va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
+
+			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
+				cpu, calculated_va, cur->pa_start);
+
+			if (force_map_va_range(calculated_va,
+					       calculated_va + PAGE_SIZE,
+					       cur->pa_start, 0x163))
+				pr_err("Mapping PER-CPU failed.");
+		}
+	}
+
+	ghcb_va = req->ghcb_va;
+	make_va_decrypted(ghcb_va);
+
+	__flush_tlb_all();
+}
+
+static phys_addr_t get_anything_pa(void *vaddr)
+{
+	unsigned long addr = (unsigned long)vaddr;
+	struct page *page;
+
+	if (is_vmalloc_addr(vaddr)) {
+		page = vmalloc_to_page(vaddr);
+		if (!page)
+			return 0;
+		return (page_to_pfn(page) << PAGE_SHIFT) | (addr & ~PAGE_MASK);
+	}
+
+	return __pa(addr);
+}
+
+/*
+ * Leverage Linux's support for mapping the VMPL1 GHCB within it.
+ * 
+ * The kernel cannot see the content nor write to the GHCB due to RMP protections
+ * but it can help us manage the mapping in its kernel space so that we can utilize
+ * the GHCB protocol for SVSM calls when VMPL1 is active.
+ */
+enum es_result __init svsm_map_vmpl1(void)
+{
+	struct svsm_call call = { 0 };
+	struct svsm_map_ifc_req req = { 0 };
+	unsigned long pa = get_anything_pa(&req);
+
+	call.caa = svsm_get_caa();
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MAP_IFC);
+	call.rcx = pa;
+
+	if (svsm_perform_call_protocol(&call))
+		return ES_UNSUPPORTED;
+
+	process_map_vmpl1(&req);
+
+	return ES_OK;
 }
 
 /*

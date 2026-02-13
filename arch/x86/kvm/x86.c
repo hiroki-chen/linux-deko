@@ -15,6 +15,7 @@
  *   Amit Shah    <amit.shah@qumranet.com>
  *   Ben-Ami Yassour <benami@il.ibm.com>
  */
+#include "asm/svm.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
@@ -11456,14 +11457,17 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 				kvm_inject_pending_timer_irqs(
 					vcpu_parent->vcpu_vmpl[vmpl]);
 
-				/*
+				  /*
 					 * If the vCPU currently running does not match
 					 * the one that has timer expired, we need to
 					 * inject a #HV doorbell for timer notification
 					 * so that the vCPU can decide what to do.
 					 */
 				if (vcpu_parent->current_vmpl != vmpl) {
-					kvm_x86_call(inject_timer)(vcpu);
+					if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
+						pr_info("VMPL1 running!\n");
+
+					// kvm_x86_call(inject_timer)(vcpu);
 				}
 			}
 		}

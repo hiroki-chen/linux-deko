@@ -4938,9 +4938,10 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 	/* SEV-SNP guest requires that the GHCB GPA must be registered */
 	if (sev_snp_guest(svm->vcpu.kvm) &&
 	    !ghcb_gpa_is_registered(svm, ghcb_gpa)) {
-		vcpu_unimpl(&svm->vcpu,
-			    "vmgexit: GHCB GPA [%#llx] is not registered.\n",
-			    ghcb_gpa);
+		vcpu_unimpl(
+			&svm->vcpu,
+			"vmgexit: GHCB GPA [%#llx] is not registered for VMPL%d.\n",
+			ghcb_gpa, vcpu->vcpu_parent->current_vmpl);
 		return -EINVAL;
 	}
 

@@ -90,15 +90,7 @@ static DEFINE_RWLOCK(binfmt_lock);
 
 int sysctl_enable_vmpl_tramp = 0;
 
-static int __init setup_vmpl_tramp(char *str)
-{
-	if (str) {
-		sysctl_enable_vmpl_tramp = simple_strtoul(str, NULL, 0);
-	}
-	return 1;
-}
-__setup("vmpl_tramp=", setup_vmpl_tramp);
-
+module_param_named(vmpl_tramp, sysctl_enable_vmpl_tramp, int, 0644);
 
 void __register_binfmt(struct linux_binfmt *fmt, int insert)
 {
