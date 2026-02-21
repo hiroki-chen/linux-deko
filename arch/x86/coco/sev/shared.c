@@ -12,17 +12,17 @@
 #include <asm/setup_data.h>
 
 #ifndef __BOOT_COMPRESSED
-#define error(v)			pr_err(v)
-#define has_cpuflag(f)			boot_cpu_has(f)
-#define sev_printk(fmt, ...)		printk(fmt, ##__VA_ARGS__)
-#define sev_printk_rtl(fmt, ...)	printk_ratelimited(fmt, ##__VA_ARGS__)
+#define error(v) pr_err(v)
+#define has_cpuflag(f) boot_cpu_has(f)
+#define sev_printk(fmt, ...) printk(fmt, ##__VA_ARGS__)
+#define sev_printk_rtl(fmt, ...) printk_ratelimited(fmt, ##__VA_ARGS__)
 #else
 #undef WARN
 #define WARN(condition, format...) (!!(condition))
 #define sev_printk(fmt, ...)
 #define sev_printk_rtl(fmt, ...)
 #undef vc_forward_exception
-#define vc_forward_exception(c)		panic("SNP: Hypervisor requested exception\n")
+#define vc_forward_exception(c) panic("SNP: Hypervisor requested exception\n")
 #endif
 
 /*
@@ -41,9 +41,9 @@ EXPORT_SYMBOL_GPL(snp_vmpl);
 static struct svsm_ca *boot_svsm_caa __ro_after_init;
 static u64 boot_svsm_caa_pa __ro_after_init;
 
-static struct svsm_ca *svsm_get_caa(void);
-static u64 svsm_get_caa_pa(void);
-static int svsm_perform_call_protocol(struct svsm_call *call);
+extern struct svsm_ca *svsm_get_caa(void);
+extern u64 svsm_get_caa_pa(void);
+extern int svsm_perform_call_protocol(struct svsm_call *call);
 
 /* I/O parameters for CPUID-related helpers */
 struct cpuid_leaf {
@@ -117,8 +117,8 @@ static bool __init sev_es_check_cpu_features(void)
 	return true;
 }
 
-static void __head __noreturn
-sev_es_terminate(unsigned int set, unsigned int reason)
+static void __head __noreturn sev_es_terminate(unsigned int set,
+					       unsigned int reason)
 {
 	u64 val = GHCB_MSR_TERM_REQ;
 
@@ -185,7 +185,8 @@ static bool sev_es_negotiate_protocol(void)
 	    GHCB_MSR_PROTO_MIN(val) > GHCB_PROTOCOL_MAX)
 		return false;
 
-	ghcb_version = min_t(size_t, GHCB_MSR_PROTO_MAX(val), GHCB_PROTOCOL_MAX);
+	ghcb_version =
+		min_t(size_t, GHCB_MSR_PROTO_MAX(val), GHCB_PROTOCOL_MAX);
 
 	return true;
 }
@@ -193,7 +194,8 @@ static bool sev_es_negotiate_protocol(void)
 static __always_inline void vc_ghcb_invalidate(struct ghcb *ghcb)
 {
 	ghcb->save.sw_exit_code = 0;
-	__builtin_memset(ghcb->save.valid_bitmap, 0, sizeof(ghcb->save.valid_bitmap));
+	__builtin_memset(ghcb->save.valid_bitmap, 0,
+			 sizeof(ghcb->save.valid_bitmap));
 }
 
 static bool vc_decoding_needed(unsigned long exit_code)
@@ -223,7 +225,8 @@ static void vc_finish_insn(struct es_em_ctxt *ctxt)
 	ctxt->regs->ip += ctxt->insn.length;
 }
 
-static enum es_result verify_exception_info(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
+static enum es_result verify_exception_info(struct ghcb *ghcb,
+					    struct es_em_ctxt *ctxt)
 {
 	u32 ret;
 
@@ -284,25 +287,26 @@ static __always_inline void svsm_issue_call(struct svsm_call *call, u8 *pending)
 	register unsigned long rax asm("rax") = call->rax;
 	register unsigned long rcx asm("rcx") = call->rcx;
 	register unsigned long rdx asm("rdx") = call->rdx;
-	register unsigned long r8  asm("r8")  = call->r8;
-	register unsigned long r9  asm("r9")  = call->r9;
+	register unsigned long r8 asm("r8") = call->r8;
+	register unsigned long r9 asm("r9") = call->r9;
 
 	call->caa->call_pending = 1;
 
 	asm volatile("rep; vmmcall\n\t"
-		     : "+r" (rax), "+r" (rcx), "+r" (rdx), "+r" (r8), "+r" (r9)
-		     : : "memory");
+		     : "+r"(rax), "+r"(rcx), "+r"(rdx), "+r"(r8), "+r"(r9)
+		     :
+		     : "memory");
 
 	*pending = xchg(&call->caa->call_pending, *pending);
 
 	call->rax_out = rax;
 	call->rcx_out = rcx;
 	call->rdx_out = rdx;
-	call->r8_out  = r8;
-	call->r9_out  = r9;
+	call->r8_out = r8;
+	call->r9_out = r9;
 }
 
-static int svsm_perform_msr_protocol(struct svsm_call *call)
+int svsm_perform_msr_protocol(struct svsm_call *call)
 {
 	u8 pending = 0;
 	u64 val, resp;
@@ -345,7 +349,7 @@ static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 	 * in the boot, so use rip-relative references as needed.
 	 */
 	ghcb->protocol_version = RIP_REL_REF(ghcb_version);
-	ghcb->ghcb_usage       = GHCB_DEFAULT_USAGE;
+	ghcb->ghcb_usage = GHCB_DEFAULT_USAGE;
 
 	ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_SNP_RUN_VMPL);
 	ghcb_set_sw_exit_info_1(ghcb, 0);
@@ -378,7 +382,7 @@ static enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb,
 {
 	/* Fill in protocol and format specifiers */
 	ghcb->protocol_version = ghcb_version;
-	ghcb->ghcb_usage       = GHCB_DEFAULT_USAGE;
+	ghcb->ghcb_usage = GHCB_DEFAULT_USAGE;
 
 	ghcb_set_sw_exit_code(ghcb, exit_code);
 	ghcb_set_sw_exit_info_1(ghcb, exit_info_1);
@@ -420,15 +424,16 @@ static int __sev_cpuid_hv_msr(struct cpuid_leaf *leaf)
 	if (cpuid_function_is_indexed(leaf->fn) && leaf->subfn)
 		return -EINVAL;
 
-	ret =         __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EAX, &leaf->eax);
-	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EBX, &leaf->ebx);
-	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_ECX, &leaf->ecx);
-	ret = ret ? : __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EDX, &leaf->edx);
+	ret = __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EAX, &leaf->eax);
+	ret = ret ?: __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EBX, &leaf->ebx);
+	ret = ret ?: __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_ECX, &leaf->ecx);
+	ret = ret ?: __sev_cpuid_hv(leaf->fn, GHCB_CPUID_REQ_EDX, &leaf->edx);
 
 	return ret;
 }
 
-static int __sev_cpuid_hv_ghcb(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struct cpuid_leaf *leaf)
+static int __sev_cpuid_hv_ghcb(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
+			       struct cpuid_leaf *leaf)
 {
 	u32 cr4 = native_read_cr4();
 	int ret;
@@ -447,10 +452,8 @@ static int __sev_cpuid_hv_ghcb(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struc
 	if (ret != ES_OK)
 		return ret;
 
-	if (!(ghcb_rax_is_valid(ghcb) &&
-	      ghcb_rbx_is_valid(ghcb) &&
-	      ghcb_rcx_is_valid(ghcb) &&
-	      ghcb_rdx_is_valid(ghcb)))
+	if (!(ghcb_rax_is_valid(ghcb) && ghcb_rbx_is_valid(ghcb) &&
+	      ghcb_rcx_is_valid(ghcb) && ghcb_rdx_is_valid(ghcb)))
 		return ES_VMM_ERROR;
 
 	leaf->eax = ghcb->save.rax;
@@ -461,10 +464,11 @@ static int __sev_cpuid_hv_ghcb(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struc
 	return ES_OK;
 }
 
-static int sev_cpuid_hv(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struct cpuid_leaf *leaf)
+static int sev_cpuid_hv(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
+			struct cpuid_leaf *leaf)
 {
-	return ghcb ? __sev_cpuid_hv_ghcb(ghcb, ctxt, leaf)
-		    : __sev_cpuid_hv_msr(leaf);
+	return ghcb ? __sev_cpuid_hv_ghcb(ghcb, ctxt, leaf) :
+		      __sev_cpuid_hv_msr(leaf);
 }
 
 /*
@@ -534,8 +538,7 @@ static u32 snp_cpuid_calc_xsave_size(u64 xfeatures_en, bool compacted)
 	return xsave_size;
 }
 
-static bool __head
-snp_cpuid_get_validated_func(struct cpuid_leaf *leaf)
+static bool __head snp_cpuid_get_validated_func(struct cpuid_leaf *leaf)
 {
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
 	int i;
@@ -546,7 +549,8 @@ snp_cpuid_get_validated_func(struct cpuid_leaf *leaf)
 		if (e->eax_in != leaf->fn)
 			continue;
 
-		if (cpuid_function_is_indexed(leaf->fn) && e->ecx_in != leaf->subfn)
+		if (cpuid_function_is_indexed(leaf->fn) &&
+		    e->ecx_in != leaf->subfn)
 			continue;
 
 		/*
@@ -570,7 +574,8 @@ snp_cpuid_get_validated_func(struct cpuid_leaf *leaf)
 	return false;
 }
 
-static void snp_cpuid_hv(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struct cpuid_leaf *leaf)
+static void snp_cpuid_hv(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
+			 struct cpuid_leaf *leaf)
 {
 	if (sev_cpuid_hv(ghcb, ctxt, leaf))
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID_HV);
@@ -586,7 +591,8 @@ static int snp_cpuid_postprocess(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 		snp_cpuid_hv(ghcb, ctxt, &leaf_hv);
 
 		/* initial APIC ID */
-		leaf->ebx = (leaf_hv.ebx & GENMASK(31, 24)) | (leaf->ebx & GENMASK(23, 0));
+		leaf->ebx = (leaf_hv.ebx & GENMASK(31, 24)) |
+			    (leaf->ebx & GENMASK(23, 0));
 		/* APIC enabled bit */
 		leaf->edx = (leaf_hv.edx & BIT(9)) | (leaf->edx & ~BIT(9));
 
@@ -622,8 +628,9 @@ static int snp_cpuid_postprocess(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 			if (leaf->eax & BIT(3)) {
 				unsigned long lo, hi;
 
-				asm volatile("rdmsr" : "=a" (lo), "=d" (hi)
-						     : "c" (MSR_IA32_XSS));
+				asm volatile("rdmsr"
+					     : "=a"(lo), "=d"(hi)
+					     : "c"(MSR_IA32_XSS));
 				xss = (hi << 32) | lo;
 			}
 
@@ -647,17 +654,18 @@ static int snp_cpuid_postprocess(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 			return -EINVAL;
 
 		leaf->ebx = xsave_size;
-		}
-		break;
+	} break;
 	case 0x8000001E:
 		snp_cpuid_hv(ghcb, ctxt, &leaf_hv);
 
 		/* extended APIC ID */
 		leaf->eax = leaf_hv.eax;
 		/* compute ID */
-		leaf->ebx = (leaf->ebx & GENMASK(31, 8)) | (leaf_hv.ebx & GENMASK(7, 0));
+		leaf->ebx = (leaf->ebx & GENMASK(31, 8)) |
+			    (leaf_hv.ebx & GENMASK(7, 0));
 		/* node ID */
-		leaf->ecx = (leaf->ecx & GENMASK(31, 8)) | (leaf_hv.ecx & GENMASK(7, 0));
+		leaf->ecx = (leaf->ecx & GENMASK(31, 8)) |
+			    (leaf_hv.ecx & GENMASK(7, 0));
 		break;
 	default:
 		/* No fix-ups needed, use values as-is. */
@@ -671,8 +679,8 @@ static int snp_cpuid_postprocess(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
  * Returns -EOPNOTSUPP if feature not enabled. Any other non-zero return value
  * should be treated as fatal by caller.
  */
-static int __head
-snp_cpuid(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struct cpuid_leaf *leaf)
+static int __head snp_cpuid(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
+			    struct cpuid_leaf *leaf)
 {
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
 
@@ -701,8 +709,10 @@ snp_cpuid(struct ghcb *ghcb, struct es_em_ctxt *ctxt, struct cpuid_leaf *leaf)
 
 		/* Skip post-processing for out-of-range zero leafs. */
 		if (!(leaf->fn <= RIP_REL_REF(cpuid_std_range_max) ||
-		      (leaf->fn >= 0x40000000 && leaf->fn <= RIP_REL_REF(cpuid_hyp_range_max)) ||
-		      (leaf->fn >= 0x80000000 && leaf->fn <= RIP_REL_REF(cpuid_ext_range_max))))
+		      (leaf->fn >= 0x40000000 &&
+		       leaf->fn <= RIP_REL_REF(cpuid_hyp_range_max)) ||
+		      (leaf->fn >= 0x80000000 &&
+		       leaf->fn <= RIP_REL_REF(cpuid_ext_range_max))))
 			return 0;
 	}
 
@@ -782,13 +792,12 @@ fail:
 }
 
 static enum es_result vc_insn_string_check(struct es_em_ctxt *ctxt,
-					   unsigned long address,
-					   bool write)
+					   unsigned long address, bool write)
 {
 	if (user_mode(ctxt->regs) && fault_in_kernel_space(address)) {
-		ctxt->fi.vector     = X86_TRAP_PF;
+		ctxt->fi.vector = X86_TRAP_PF;
 		ctxt->fi.error_code = X86_PF_USER;
-		ctxt->fi.cr2        = address;
+		ctxt->fi.cr2 = address;
 		if (write)
 			ctxt->fi.error_code |= X86_PF_WRITE;
 
@@ -798,11 +807,9 @@ static enum es_result vc_insn_string_check(struct es_em_ctxt *ctxt,
 	return ES_OK;
 }
 
-static enum es_result vc_insn_string_read(struct es_em_ctxt *ctxt,
-					  void *src, char *buf,
-					  unsigned int data_size,
-					  unsigned int count,
-					  bool backwards)
+static enum es_result vc_insn_string_read(struct es_em_ctxt *ctxt, void *src,
+					  char *buf, unsigned int data_size,
+					  unsigned int count, bool backwards)
 {
 	int i, b = backwards ? -1 : 1;
 	unsigned long address = (unsigned long)src;
@@ -824,11 +831,9 @@ static enum es_result vc_insn_string_read(struct es_em_ctxt *ctxt,
 	return ret;
 }
 
-static enum es_result vc_insn_string_write(struct es_em_ctxt *ctxt,
-					   void *dst, char *buf,
-					   unsigned int data_size,
-					   unsigned int count,
-					   bool backwards)
+static enum es_result vc_insn_string_write(struct es_em_ctxt *ctxt, void *dst,
+					   char *buf, unsigned int data_size,
+					   unsigned int count, bool backwards)
 {
 	int i, s = backwards ? -1 : 1;
 	unsigned long address = (unsigned long)dst;
@@ -850,24 +855,24 @@ static enum es_result vc_insn_string_write(struct es_em_ctxt *ctxt,
 	return ret;
 }
 
-#define IOIO_TYPE_STR  BIT(2)
-#define IOIO_TYPE_IN   1
-#define IOIO_TYPE_INS  (IOIO_TYPE_IN | IOIO_TYPE_STR)
-#define IOIO_TYPE_OUT  0
+#define IOIO_TYPE_STR BIT(2)
+#define IOIO_TYPE_IN 1
+#define IOIO_TYPE_INS (IOIO_TYPE_IN | IOIO_TYPE_STR)
+#define IOIO_TYPE_OUT 0
 #define IOIO_TYPE_OUTS (IOIO_TYPE_OUT | IOIO_TYPE_STR)
 
-#define IOIO_REP       BIT(3)
+#define IOIO_REP BIT(3)
 
-#define IOIO_ADDR_64   BIT(9)
-#define IOIO_ADDR_32   BIT(8)
-#define IOIO_ADDR_16   BIT(7)
+#define IOIO_ADDR_64 BIT(9)
+#define IOIO_ADDR_32 BIT(8)
+#define IOIO_ADDR_16 BIT(7)
 
-#define IOIO_DATA_32   BIT(6)
-#define IOIO_DATA_16   BIT(5)
-#define IOIO_DATA_8    BIT(4)
+#define IOIO_DATA_32 BIT(6)
+#define IOIO_DATA_16 BIT(5)
+#define IOIO_DATA_8 BIT(4)
 
-#define IOIO_SEG_ES    (0 << 10)
-#define IOIO_SEG_DS    (3 << 10)
+#define IOIO_SEG_ES (0 << 10)
+#define IOIO_SEG_DS (3 << 10)
 
 static enum es_result vc_ioio_exitinfo(struct es_em_ctxt *ctxt, u64 *exitinfo)
 {
@@ -883,7 +888,7 @@ static enum es_result vc_ioio_exitinfo(struct es_em_ctxt *ctxt, u64 *exitinfo)
 	case 0x6d:
 		*exitinfo |= IOIO_TYPE_INS;
 		*exitinfo |= IOIO_SEG_ES;
-		port	   = ctxt->regs->dx & 0xffff;
+		port = ctxt->regs->dx & 0xffff;
 		break;
 
 	/* OUTS opcodes */
@@ -891,35 +896,35 @@ static enum es_result vc_ioio_exitinfo(struct es_em_ctxt *ctxt, u64 *exitinfo)
 	case 0x6f:
 		*exitinfo |= IOIO_TYPE_OUTS;
 		*exitinfo |= IOIO_SEG_DS;
-		port	   = ctxt->regs->dx & 0xffff;
+		port = ctxt->regs->dx & 0xffff;
 		break;
 
 	/* IN immediate opcodes */
 	case 0xe4:
 	case 0xe5:
 		*exitinfo |= IOIO_TYPE_IN;
-		port	   = (u8)insn->immediate.value & 0xffff;
+		port = (u8)insn->immediate.value & 0xffff;
 		break;
 
 	/* OUT immediate opcodes */
 	case 0xe6:
 	case 0xe7:
 		*exitinfo |= IOIO_TYPE_OUT;
-		port	   = (u8)insn->immediate.value & 0xffff;
+		port = (u8)insn->immediate.value & 0xffff;
 		break;
 
 	/* IN register opcodes */
 	case 0xec:
 	case 0xed:
 		*exitinfo |= IOIO_TYPE_IN;
-		port	   = ctxt->regs->dx & 0xffff;
+		port = ctxt->regs->dx & 0xffff;
 		break;
 
 	/* OUT register opcodes */
 	case 0xee:
 	case 0xef:
 		*exitinfo |= IOIO_TYPE_OUT;
-		port	   = ctxt->regs->dx & 0xffff;
+		port = ctxt->regs->dx & 0xffff;
 		break;
 
 	default:
@@ -937,13 +942,13 @@ static enum es_result vc_ioio_exitinfo(struct es_em_ctxt *ctxt, u64 *exitinfo)
 	case 0xee:
 		/* Single byte opcodes */
 		*exitinfo |= IOIO_DATA_8;
-		size       = 1;
+		size = 1;
 		break;
 	default:
 		/* Length determined by instruction parsing */
-		*exitinfo |= (insn->opnd_bytes == 2) ? IOIO_DATA_16
-						     : IOIO_DATA_32;
-		size       = (insn->opnd_bytes == 2) ? 2 : 4;
+		*exitinfo |= (insn->opnd_bytes == 2) ? IOIO_DATA_16 :
+						       IOIO_DATA_32;
+		size = (insn->opnd_bytes == 2) ? 2 : 4;
 	}
 
 	switch (insn->addr_bytes) {
@@ -975,7 +980,6 @@ static enum es_result vc_handle_ioio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 		return ret;
 
 	if (exit_info_1 & IOIO_TYPE_STR) {
-
 		/* (REP) INS/OUTS */
 
 		bool df = ((regs->flags & X86_EFLAGS_DF) == X86_EFLAGS_DF);
@@ -990,21 +994,21 @@ static enum es_result vc_handle_ioio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 		 * has a chance to take interrupts and re-schedule while the
 		 * instruction is emulated.
 		 */
-		io_bytes   = (exit_info_1 >> 4) & 0x7;
+		io_bytes = (exit_info_1 >> 4) & 0x7;
 		ghcb_count = sizeof(ghcb->shared_buffer) / io_bytes;
 
-		op_count    = (exit_info_1 & IOIO_REP) ? regs->cx : 1;
+		op_count = (exit_info_1 & IOIO_REP) ? regs->cx : 1;
 		exit_info_2 = min(op_count, ghcb_count);
-		exit_bytes  = exit_info_2 * io_bytes;
+		exit_bytes = exit_info_2 * io_bytes;
 
 		es_base = insn_get_seg_base(ctxt->regs, INAT_SEG_REG_ES);
 
 		/* Read bytes of OUTS into the shared buffer */
 		if (!(exit_info_1 & IOIO_TYPE_IN)) {
 			ret = vc_insn_string_read(ctxt,
-					       (void *)(es_base + regs->si),
-					       ghcb->shared_buffer, io_bytes,
-					       exit_info_2, df);
+						  (void *)(es_base + regs->si),
+						  ghcb->shared_buffer, io_bytes,
+						  exit_info_2, df);
 			if (ret)
 				return ret;
 		}
@@ -1025,8 +1029,8 @@ static enum es_result vc_handle_ioio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 		if (exit_info_1 & IOIO_TYPE_IN) {
 			ret = vc_insn_string_write(ctxt,
 						   (void *)(es_base + regs->di),
-						   ghcb->shared_buffer, io_bytes,
-						   exit_info_2, df);
+						   ghcb->shared_buffer,
+						   io_bytes, exit_info_2, df);
 			if (ret)
 				return ret;
 
@@ -1047,7 +1051,6 @@ static enum es_result vc_handle_ioio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 		ret = regs->cx ? ES_RETRY : ES_OK;
 
 	} else {
-
 		/* IN/OUT into/from rAX */
 
 		int bits = (exit_info_1 & 0x70) >> 1;
@@ -1058,7 +1061,8 @@ static enum es_result vc_handle_ioio(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 
 		ghcb_set_rax(ghcb, rax);
 
-		ret = sev_es_ghcb_hv_call(ghcb, ctxt, SVM_EXIT_IOIO, exit_info_1, 0);
+		ret = sev_es_ghcb_hv_call(ghcb, ctxt, SVM_EXIT_IOIO,
+					  exit_info_1, 0);
 		if (ret != ES_OK)
 			return ret;
 
@@ -1119,10 +1123,8 @@ static enum es_result vc_handle_cpuid(struct ghcb *ghcb,
 	if (ret != ES_OK)
 		return ret;
 
-	if (!(ghcb_rax_is_valid(ghcb) &&
-	      ghcb_rbx_is_valid(ghcb) &&
-	      ghcb_rcx_is_valid(ghcb) &&
-	      ghcb_rdx_is_valid(ghcb)))
+	if (!(ghcb_rax_is_valid(ghcb) && ghcb_rbx_is_valid(ghcb) &&
+	      ghcb_rcx_is_valid(ghcb) && ghcb_rdx_is_valid(ghcb)))
 		return ES_VMM_ERROR;
 
 	regs->ax = ghcb->save.rax;
@@ -1145,7 +1147,7 @@ static enum es_result vc_handle_rdtsc(struct ghcb *ghcb,
 		return ret;
 
 	if (!(ghcb_rax_is_valid(ghcb) && ghcb_rdx_is_valid(ghcb) &&
-	     (!rdtscp || ghcb_rcx_is_valid(ghcb))))
+	      (!rdtscp || ghcb_rcx_is_valid(ghcb))))
 		return ES_VMM_ERROR;
 
 	ctxt->regs->ax = ghcb->save.rax;
@@ -1165,8 +1167,8 @@ struct cc_setup_data {
  * Search for a Confidential Computing blob passed in as a setup_data entry
  * via the Linux Boot Protocol.
  */
-static __head
-struct cc_blob_sev_info *find_cc_blob_setup_data(struct boot_params *bp)
+static __head struct cc_blob_sev_info *
+find_cc_blob_setup_data(struct boot_params *bp)
 {
 	struct cc_setup_data *sd = NULL;
 	struct setup_data *hdr;
@@ -1176,7 +1178,8 @@ struct cc_blob_sev_info *find_cc_blob_setup_data(struct boot_params *bp)
 	while (hdr) {
 		if (hdr->type == SETUP_CC_BLOB) {
 			sd = (struct cc_setup_data *)hdr;
-			return (struct cc_blob_sev_info *)(unsigned long)sd->cc_blob_address;
+			return (struct cc_blob_sev_info *)(unsigned long)
+				sd->cc_blob_address;
 		}
 		hdr = (struct setup_data *)hdr->next;
 	}
@@ -1202,7 +1205,8 @@ static void __head setup_cpuid_table(const struct cc_blob_sev_info *cc_info)
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID);
 
 	cpuid_table_fw = (const struct snp_cpuid_table *)cc_info->cpuid_phys;
-	if (!cpuid_table_fw->count || cpuid_table_fw->count > SNP_CPUID_COUNT_MAX)
+	if (!cpuid_table_fw->count ||
+	    cpuid_table_fw->count > SNP_CPUID_COUNT_MAX)
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_CPUID);
 
 	cpuid_table = snp_cpuid_get_table();
@@ -1221,16 +1225,19 @@ static void __head setup_cpuid_table(const struct cc_blob_sev_info *cc_info)
 	}
 }
 
-static inline void __pval_terminate(u64 pfn, bool action, unsigned int page_size,
-				    int ret, u64 svsm_ret)
+static inline void __pval_terminate(u64 pfn, bool action,
+				    unsigned int page_size, int ret,
+				    u64 svsm_ret)
 {
-	WARN(1, "PVALIDATE failure: pfn: 0x%llx, action: %u, size: %u, ret: %d, svsm_ret: 0x%llx\n",
+	WARN(1,
+	     "PVALIDATE failure: pfn: 0x%llx, action: %u, size: %u, ret: %d, svsm_ret: 0x%llx\n",
 	     pfn, action, page_size, ret, svsm_ret);
 
 	sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
 }
 
-static void svsm_pval_terminate(struct svsm_pvalidate_call *pc, int ret, u64 svsm_ret)
+static void svsm_pval_terminate(struct svsm_pvalidate_call *pc, int ret,
+				u64 svsm_ret)
 {
 	unsigned int page_size;
 	bool action;
@@ -1263,11 +1270,11 @@ static void svsm_pval_4k_page(unsigned long paddr, bool validate)
 	pc_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	pc->num_entries = 1;
-	pc->cur_index   = 0;
+	pc->cur_index = 0;
 	pc->entry[0].page_size = RMP_PG_SIZE_4K;
-	pc->entry[0].action    = validate;
+	pc->entry[0].action = validate;
 	pc->entry[0].ignore_cf = 0;
-	pc->entry[0].pfn       = paddr >> PAGE_SHIFT;
+	pc->entry[0].pfn = paddr >> PAGE_SHIFT;
 
 	/* Protocol 0, Call ID 1 */
 	call.rax = SVSM_CORE_CALL(SVSM_CORE_PVALIDATE);
@@ -1280,7 +1287,8 @@ static void svsm_pval_4k_page(unsigned long paddr, bool validate)
 	native_local_irq_restore(flags);
 }
 
-static void pvalidate_4k_page(unsigned long vaddr, unsigned long paddr, bool validate)
+static void pvalidate_4k_page(unsigned long vaddr, unsigned long paddr,
+			      bool validate)
 {
 	int ret;
 
@@ -1293,7 +1301,8 @@ static void pvalidate_4k_page(unsigned long vaddr, unsigned long paddr, bool val
 	} else {
 		ret = pvalidate(vaddr, RMP_PG_SIZE_4K, validate);
 		if (ret)
-			__pval_terminate(PHYS_PFN(paddr), validate, RMP_PG_SIZE_4K, ret, 0);
+			__pval_terminate(PHYS_PFN(paddr), validate,
+					 RMP_PG_SIZE_4K, ret, 0);
 	}
 }
 
@@ -1319,13 +1328,15 @@ static void pval_pages(struct snp_psc_desc *desc)
 		if (!rc)
 			continue;
 
-		if (rc == PVALIDATE_FAIL_SIZEMISMATCH && size == RMP_PG_SIZE_2M) {
+		if (rc == PVALIDATE_FAIL_SIZEMISMATCH &&
+		    size == RMP_PG_SIZE_2M) {
 			unsigned long vaddr_end = vaddr + PMD_SIZE;
 
 			for (; vaddr < vaddr_end; vaddr += PAGE_SIZE, pfn++) {
 				rc = pvalidate(vaddr, RMP_PG_SIZE_4K, validate);
 				if (rc)
-					__pval_terminate(pfn, validate, RMP_PG_SIZE_4K, rc, 0);
+					__pval_terminate(pfn, validate,
+							 RMP_PG_SIZE_4K, rc, 0);
 			}
 		} else {
 			__pval_terminate(pfn, validate, size, rc, 0);
@@ -1340,15 +1351,15 @@ static u64 svsm_build_ca_from_pfn_range(u64 pfn, u64 pfn_end, bool action,
 
 	/* Nothing in the CA yet */
 	pc->num_entries = 0;
-	pc->cur_index   = 0;
+	pc->cur_index = 0;
 
 	pe = &pc->entry[0];
 
 	while (pfn < pfn_end) {
 		pe->page_size = RMP_PG_SIZE_4K;
-		pe->action    = action;
+		pe->action = action;
 		pe->ignore_cf = 0;
-		pe->pfn       = pfn;
+		pe->pfn = pfn;
 
 		pe++;
 		pfn++;
@@ -1361,7 +1372,8 @@ static u64 svsm_build_ca_from_pfn_range(u64 pfn, u64 pfn_end, bool action,
 	return pfn;
 }
 
-static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc, unsigned int desc_entry,
+static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc,
+				       unsigned int desc_entry,
 				       struct svsm_pvalidate_call *pc)
 {
 	struct svsm_pvalidate_entry *pe;
@@ -1369,16 +1381,16 @@ static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc, unsigned int d
 
 	/* Nothing in the CA yet */
 	pc->num_entries = 0;
-	pc->cur_index   = 0;
+	pc->cur_index = 0;
 
 	pe = &pc->entry[0];
-	e  = &desc->entries[desc_entry];
+	e = &desc->entries[desc_entry];
 
 	while (desc_entry <= desc->hdr.end_entry) {
 		pe->page_size = e->pagesize ? RMP_PG_SIZE_2M : RMP_PG_SIZE_4K;
-		pe->action    = e->operation == SNP_PAGE_STATE_PRIVATE;
+		pe->action = e->operation == SNP_PAGE_STATE_PRIVATE;
 		pe->ignore_cf = 0;
-		pe->pfn       = e->gfn;
+		pe->pfn = e->gfn;
 
 		pe++;
 		e++;
@@ -1440,7 +1452,8 @@ static void svsm_pval_pages(struct snp_psc_desc *desc)
 			 */
 
 			if (call.rax_out == SVSM_PVALIDATE_FAIL_SIZEMISMATCH &&
-			    pc->entry[pc->cur_index].page_size == RMP_PG_SIZE_2M) {
+			    pc->entry[pc->cur_index].page_size ==
+				    RMP_PG_SIZE_2M) {
 				/* Save this entry for post-processing at 4K */
 				pv_4k[pv_4k_count++] = pc->entry[pc->cur_index];
 
@@ -1461,12 +1474,13 @@ static void svsm_pval_pages(struct snp_psc_desc *desc)
 	for (i = 0; i < pv_4k_count; i++) {
 		u64 pfn, pfn_end;
 
-		action  = pv_4k[i].action;
-		pfn     = pv_4k[i].pfn;
+		action = pv_4k[i].action;
+		pfn = pv_4k[i].pfn;
 		pfn_end = pfn + 512;
 
 		while (pfn < pfn_end) {
-			pfn = svsm_build_ca_from_pfn_range(pfn, pfn_end, action, pc);
+			pfn = svsm_build_ca_from_pfn_range(pfn, pfn_end, action,
+							   pc);
 
 			ret = svsm_perform_call_protocol(&call);
 			if (ret)
@@ -1495,7 +1509,8 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 
 	/* Copy the input desc into GHCB shared buffer */
 	data = (struct snp_psc_desc *)ghcb->shared_buffer;
-	memcpy(ghcb->shared_buffer, desc, min_t(int, GHCB_SHARED_BUF_SIZE, sizeof(*desc)));
+	memcpy(ghcb->shared_buffer, desc,
+	       min_t(int, GHCB_SHARED_BUF_SIZE, sizeof(*desc)));
 
 	/*
 	 * As per the GHCB specification, the hypervisor can resume the guest
@@ -1523,14 +1538,15 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 		 * exit_info_2.
 		 */
 		if (WARN(ret || ghcb->save.sw_exit_info_2,
-			 "SNP: PSC failed ret=%d exit_info_2=%llx\n",
-			 ret, ghcb->save.sw_exit_info_2)) {
+			 "SNP: PSC failed ret=%d exit_info_2=%llx\n", ret,
+			 ghcb->save.sw_exit_info_2)) {
 			ret = 1;
 			goto out;
 		}
 
 		/* Verify that reserved bit is not set */
-		if (WARN(data->hdr.reserved, "Reserved bit is set in the PSC header\n")) {
+		if (WARN(data->hdr.reserved,
+			 "Reserved bit is set in the PSC header\n")) {
 			ret = 1;
 			goto out;
 		}
@@ -1539,9 +1555,11 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 		 * Sanity check that entry processing is not going backwards.
 		 * This will happen only if hypervisor is tricking us.
 		 */
-		if (WARN(data->hdr.end_entry > end_entry || cur_entry > data->hdr.cur_entry,
-"SNP: PSC processing going backward, end_entry %d (got %d) cur_entry %d (got %d)\n",
-			 end_entry, data->hdr.end_entry, cur_entry, data->hdr.cur_entry)) {
+		if (WARN(data->hdr.end_entry > end_entry ||
+				 cur_entry > data->hdr.cur_entry,
+			 "SNP: PSC processing going backward, end_entry %d (got %d) cur_entry %d (got %d)\n",
+			 end_entry, data->hdr.end_entry, cur_entry,
+			 data->hdr.cur_entry)) {
 			ret = 1;
 			goto out;
 		}
@@ -1558,7 +1576,6 @@ static enum es_result vc_check_opcode_bytes(struct es_em_ctxt *ctxt,
 	u8 modrm = ctxt->insn.modrm.value;
 
 	switch (exit_code) {
-
 	case SVM_EXIT_IOIO:
 	case SVM_EXIT_NPF:
 		/* handled separately */
@@ -1589,7 +1606,7 @@ static enum es_result vc_check_opcode_bytes(struct es_em_ctxt *ctxt,
 	case SVM_EXIT_MSR:
 		/* RDMSR */
 		if (opcode == 0x320f ||
-		/* WRMSR */
+		    /* WRMSR */
 		    opcode == 0x300f)
 			return ES_OK;
 		break;
@@ -1636,8 +1653,10 @@ static enum es_result vc_check_opcode_bytes(struct es_em_ctxt *ctxt,
 		break;
 	}
 
-	sev_printk(KERN_ERR "Wrong/unhandled opcode bytes: 0x%x, exit_code: 0x%lx, rIP: 0x%lx\n",
-		   opcode, exit_code, ctxt->regs->ip);
+	sev_printk(
+		KERN_ERR
+		"Wrong/unhandled opcode bytes: 0x%x, exit_code: 0x%lx, rIP: 0x%lx\n",
+		opcode, exit_code, ctxt->regs->ip);
 
 	return ES_UNSUPPORTED;
 }
@@ -1669,14 +1688,16 @@ static bool __head svsm_setup_ca(const struct cc_blob_sev_info *cc_info)
 	 * routine is running identity mapped when called, both by the decompressor
 	 * code and the early kernel code.
 	 */
-	if (!rmpadjust((unsigned long)&RIP_REL_REF(boot_ghcb_page), RMP_PG_SIZE_4K, 1))
+	if (!rmpadjust((unsigned long)&RIP_REL_REF(boot_ghcb_page),
+		       RMP_PG_SIZE_4K, 1))
 		return false;
 
 	/*
 	 * Not running at VMPL0, ensure everything has been properly supplied
 	 * for running under an SVSM.
 	 */
-	if (!cc_info || !cc_info->secrets_phys || cc_info->secrets_len != PAGE_SIZE)
+	if (!cc_info || !cc_info->secrets_phys ||
+	    cc_info->secrets_len != PAGE_SIZE)
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_SECRETS_PAGE);
 
 	secrets_page = (struct snp_secrets_page *)cc_info->secrets_phys;

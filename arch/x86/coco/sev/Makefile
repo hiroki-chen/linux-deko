@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 
-obj-y += core.o
+obj-y += core.o deko.o
 
 ifdef CONFIG_FUNCTION_TRACER
 CFLAGS_REMOVE_core.o = -pg

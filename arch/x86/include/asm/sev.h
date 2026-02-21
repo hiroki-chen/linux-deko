@@ -318,6 +318,10 @@ struct svsm_attest_call {
 	u8 rsvd[4];
 };
 
+struct deko_task_work {
+	struct callback_head work;
+};
+
 /*
  * SVSM protocol structure
  */
@@ -334,6 +338,13 @@ struct svsm_call {
 	u64 r8_out;
 	u64 r9_out;
 };
+
+extern struct svsm_ca *svsm_get_caa(void);
+extern u64 svsm_get_caa_pa(void);
+extern int svsm_perform_call_protocol(struct svsm_call *call);
+extern int svsm_perform_msr_protocol(struct svsm_call *call);
+extern void deko_proxy_loop(struct callback_head *work);
+extern phys_addr_t get_anything_pa(void *vaddr);
 
 #define SVSM_CORE_CALL(x) ((0ULL << 32) | (x))
 #define SVSM_CORE_REMAP_CA 0

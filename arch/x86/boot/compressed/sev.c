@@ -129,17 +129,17 @@ static bool fault_in_kernel_space(unsigned long address)
 /* Include code for early handlers */
 #include "../../coco/sev/shared.c"
 
-static struct svsm_ca *svsm_get_caa(void)
+struct svsm_ca *svsm_get_caa(void)
 {
 	return boot_svsm_caa;
 }
 
-static u64 svsm_get_caa_pa(void)
+u64 svsm_get_caa_pa(void)
 {
 	return boot_svsm_caa_pa;
 }
 
-static int svsm_perform_call_protocol(struct svsm_call *call)
+int svsm_perform_call_protocol(struct svsm_call *call)
 {
 	struct ghcb *ghcb;
 	int ret;

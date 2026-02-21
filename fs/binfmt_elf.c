@@ -9,6 +9,8 @@
  *
  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
  */
+#include "linux/gfp_types.h"
+#include "linux/task_work.h"
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -1032,35 +1034,35 @@ static void bprm_force_load(struct mm_struct *mm)
 	}
 }
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-static unsigned long install_sysret_trampoline(struct mm_struct *mm)
-{
-	unsigned long addr;
-	int ret;
+// #ifdef CONFIG_AMD_MEM_ENCRYPT
+// static unsigned long install_sysret_trampoline(struct mm_struct *mm)
+// {
+// 	unsigned long addr;
+// 	int ret;
 
-	if (!deko_trampoline_pages[0])
-		deko_init_trampoline_once();
+// 	if (!deko_trampoline_pages[0])
+// 		deko_init_trampoline_once();
 
-	if (down_write_killable(&mm->mmap_lock))
-		return -EINTR;
-	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
-	if (IS_ERR_VALUE(addr)) {
-		up_write(&mm->mmap_lock);
-		return addr;
-	}
+// 	if (down_write_killable(&mm->mmap_lock))
+// 		return -EINTR;
+// 	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
+// 	if (IS_ERR_VALUE(addr)) {
+// 		up_write(&mm->mmap_lock);
+// 		return addr;
+// 	}
 
-	ret = install_special_mapping(mm, addr, PAGE_SIZE,
-				      VM_READ | VM_EXEC | VM_MAYREAD |
-					      VM_MAYEXEC | VM_DONTEXPAND,
-				      deko_trampoline_pages);
-	up_write(&mm->mmap_lock);
+// 	ret = install_special_mapping(mm, addr, PAGE_SIZE,
+// 				      VM_READ | VM_EXEC | VM_MAYREAD |
+// 					      VM_MAYEXEC | VM_DONTEXPAND,
+// 				      deko_trampoline_pages);
+// 	up_write(&mm->mmap_lock);
 
-	if (ret)
-		return ret;
+// 	if (ret)
+// 		return ret;
 
-	return addr;
-}
-#endif
+// 	return addr;
+// }
+// #endif
 
 static int load_elf_binary(struct linux_binprm *bprm)
 {
@@ -1087,6 +1089,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	bool is_app = false;
 	bool is_infra = false;
 	enum es_result res;
+	struct deko_task_work *dw;
 
 	retval = -ENOEXEC;
 	/* First of all, some simple consistency checks */
@@ -1613,20 +1616,13 @@ out_free_interp:
 		pr_info("Deko: Force load range %lx - %lx\n",
 			current->mm->start_code, current->mm->end_code);
 
-		tramp = install_sysret_trampoline(current->mm);
-		if (IS_ERR_VALUE(tramp)) {
-			pr_err("Deko: Failed to install trampoline: %ld\n",
-			       tramp);
-			force_sig(SIGKILL);
-			return PTR_ERR((void *)tramp);
-		}
-
-		/* C. Context Setup: */
-		if (sysctl_enable_vmpl_tramp) {
-			regs->ip = tramp;
-			regs->bx = elf_entry;
-			regs->r12 = bprm->p;
-		}
+		// tramp = install_sysret_trampoline(current->mm);
+		// if (IS_ERR_VALUE(tramp)) {
+		// 	pr_err("Deko: Failed to install trampoline: %ld\n",
+		// 	       tramp);
+		// 	force_sig(SIGKILL);
+		// 	return PTR_ERR((void *)tramp);
+		// }
 	}
 
 	if (is_app || is_infra) {
@@ -1642,9 +1638,23 @@ out_free_interp:
 		if (res != ES_OK) {
 			pr_err("Deko: SVSM rejected process %s (App=%d)\n",
 			       current->comm, is_app);
-			force_sig(SIGKILL);
-			return -EACCES;
 		}
+	}
+
+	if (is_app && sysctl_enable_vmpl_tramp) {
+		regs->bx = elf_entry;
+		regs->r12 = bprm->p;
+
+		dw = kzalloc(sizeof(*dw), GFP_KERNEL);
+		if (!dw) {
+			pr_err("Deko: Failed to allocate task work for process %s\n",
+			       current->comm);
+			force_sig(SIGKILL);
+			return -ENOMEM;
+		}
+
+		init_task_work(&dw->work, deko_proxy_loop);
+		task_work_add(current, &dw->work, TWA_RESUME);
 	}
 
 out_deko:

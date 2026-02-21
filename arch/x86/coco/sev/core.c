@@ -348,6 +348,7 @@ static noinstr struct ghcb *__sev_get_ghcb(struct ghcb_state *state)
 			data->backup_ghcb_active = false;
 
 			instrumentation_begin();
+			dump_stack();
 			panic("Unable to handle #VC exception! GHCB and Backup GHCB are already in use");
 			instrumentation_end();
 		}
@@ -918,7 +919,7 @@ static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
 /* Include code shared with pre-decompression boot stage */
 #include "shared.c"
 
-static inline struct svsm_ca *svsm_get_caa(void)
+inline struct svsm_ca *svsm_get_caa(void)
 {
 	/*
 	 * Use rIP-relative references when called early in the boot. If
@@ -931,7 +932,7 @@ static inline struct svsm_ca *svsm_get_caa(void)
 		return RIP_REL_REF(boot_svsm_caa);
 }
 
-static u64 svsm_get_caa_pa(void)
+u64 svsm_get_caa_pa(void)
 {
 	/*
 	 * Use rIP-relative references when called early in the boot. If
@@ -969,7 +970,7 @@ static noinstr void __sev_put_ghcb(struct ghcb_state *state)
 	}
 }
 
-static int svsm_perform_call_protocol(struct svsm_call *call)
+int svsm_perform_call_protocol(struct svsm_call *call)
 {
 	struct ghcb_state state;
 	unsigned long flags;
@@ -1804,7 +1805,8 @@ static void make_va_decrypted(unsigned long va)
 	val &= ~_ENC;
 	set_pte(pte, __pte(val));
 
-	pr_info("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va, val);
+	pr_info("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va,
+		val);
 }
 
 static void process_map_vmpl1(struct svsm_map_ifc_req *req)
@@ -1843,7 +1845,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	__flush_tlb_all();
 }
 
-static phys_addr_t get_anything_pa(void *vaddr)
+phys_addr_t get_anything_pa(void *vaddr)
 {
 	unsigned long addr = (unsigned long)vaddr;
 	struct page *page;
@@ -2533,6 +2535,7 @@ static enum es_result vc_handle_vmmcall_user(struct ghcb *ghcb,
 	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	ret = svsm_perform_call_protocol(&call);
+
 	if (ret)
 		return ret;
 
