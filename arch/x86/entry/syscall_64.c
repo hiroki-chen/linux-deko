@@ -24,6 +24,7 @@
 const sys_call_ptr_t sys_call_table[] = {
 #include <asm/syscalls_64.h>
 };
+EXPORT_SYMBOL_GPL(sys_call_table);
 #undef  __SYSCALL
 
 #define __SYSCALL(nr, sym) case nr: return __x64_##sym(regs);
