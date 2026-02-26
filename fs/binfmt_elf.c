@@ -983,86 +983,56 @@ static bool is_target_app(struct linux_binprm *bprm)
 	return is_spawned_by_container_runtime(bprm);
 }
 
-static int deko_pin_range(struct mm_struct *mm, unsigned long start,
-			  unsigned long end, struct page ***out_pages)
-{
-	unsigned long len;
-	unsigned long nr_pages;
-	struct page **pages;
-	int locked_pages;
-	unsigned long gup_flags = FOLL_FORCE | FOLL_LONGTERM;
-
-	if (end <= start)
-		return -EINVAL;
-
-	len = end - start;
-	nr_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-
-	pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
-	if (!pages)
-		return -ENOMEM;
-
-	locked_pages = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
-					     pages, NULL);
-
-	if (locked_pages < 0) {
-		pr_err("Deko: Failed to pin pages: %d\n", locked_pages);
-		kvfree(pages);
-		return locked_pages;
-	}
-
-	*out_pages = pages;
-	return locked_pages;
-}
-
-static void bprm_force_load(struct mm_struct *mm)
-{
-	struct page **pages = NULL;
-	int ret;
-
-	mmap_read_lock(mm);
-
-	ret = deko_pin_range(mm, mm->start_code, mm->end_code, &pages);
-
-	mmap_read_unlock(mm);
-
-	if (ret > 0) {
-		pr_info("Deko: Pinned %d code pages at %lx\n", ret,
-			mm->start_code);
-		// unpin_user_pages(pages, ret);
-		// kvfree(pages);
-	}
-}
-
-// #ifdef CONFIG_AMD_MEM_ENCRYPT
-// static unsigned long install_sysret_trampoline(struct mm_struct *mm)
+// static int deko_pin_range(struct mm_struct *mm, unsigned long start,
+// 			  unsigned long end, struct page ***out_pages)
 // {
-// 	unsigned long addr;
-// 	int ret;
+// 	unsigned long len;
+// 	unsigned long nr_pages;
+// 	struct page **pages;
+// 	int locked_pages;
+// 	unsigned long gup_flags = FOLL_FORCE | FOLL_LONGTERM;
 
-// 	if (!deko_trampoline_pages[0])
-// 		deko_init_trampoline_once();
+// 	if (end <= start)
+// 		return -EINVAL;
 
-// 	if (down_write_killable(&mm->mmap_lock))
-// 		return -EINTR;
-// 	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
-// 	if (IS_ERR_VALUE(addr)) {
-// 		up_write(&mm->mmap_lock);
-// 		return addr;
+// 	len = end - start;
+// 	nr_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+
+// 	pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+// 	if (!pages)
+// 		return -ENOMEM;
+
+// 	locked_pages = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
+// 					     pages, NULL);
+
+// 	if (locked_pages < 0) {
+// 		pr_err("Deko: Failed to pin pages: %d\n", locked_pages);
+// 		kvfree(pages);
+// 		return locked_pages;
 // 	}
 
-// 	ret = install_special_mapping(mm, addr, PAGE_SIZE,
-// 				      VM_READ | VM_EXEC | VM_MAYREAD |
-// 					      VM_MAYEXEC | VM_DONTEXPAND,
-// 				      deko_trampoline_pages);
-// 	up_write(&mm->mmap_lock);
-
-// 	if (ret)
-// 		return ret;
-
-// 	return addr;
+// 	*out_pages = pages;
+// 	return locked_pages;
 // }
-// #endif
+
+// static void bprm_force_load(struct mm_struct *mm)
+// {
+// 	struct page **pages = NULL;
+// 	int ret;
+
+// 	mmap_read_lock(mm);
+
+// 	ret = deko_pin_range(mm, mm->start_code, mm->end_code, &pages);
+
+// 	mmap_read_unlock(mm);
+
+// 	if (ret > 0) {
+// 		pr_info("Deko: Pinned %d code pages at %lx\n", ret,
+// 			mm->start_code);
+// 		// unpin_user_pages(pages, ret);
+// 		// kvfree(pages);
+// 	}
+// }
 
 static int load_elf_binary(struct linux_binprm *bprm)
 {
@@ -1079,7 +1049,6 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	unsigned long interp_load_addr = 0;
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long reloc_func_desc __maybe_unused = 0;
-	unsigned long tramp;
 	int executable_stack = EXSTACK_DEFAULT;
 	struct elfhdr *elf_ex = (struct elfhdr *)bprm->buf;
 	struct elfhdr *interp_elf_ex = NULL;
@@ -1607,23 +1576,6 @@ out_free_interp:
 
 	if (!is_app && !is_infra)
 		goto out_deko;
-
-	if (is_app) {
-		pr_info("Deko: Detected Container App! Comm: %s, PID: %d\n",
-			current->comm, current->pid);
-
-		bprm_force_load(current->mm);
-		pr_info("Deko: Force load range %lx - %lx\n",
-			current->mm->start_code, current->mm->end_code);
-
-		// tramp = install_sysret_trampoline(current->mm);
-		// if (IS_ERR_VALUE(tramp)) {
-		// 	pr_err("Deko: Failed to install trampoline: %ld\n",
-		// 	       tramp);
-		// 	force_sig(SIGKILL);
-		// 	return PTR_ERR((void *)tramp);
-		// }
-	}
 
 	if (is_app || is_infra) {
 		pr_info("Deko: Communicating with SVSM for process %s (App=%d)\n",

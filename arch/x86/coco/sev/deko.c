@@ -7,6 +7,9 @@
  * Author: Hiroki Chen <haobchen@iu.edu>
  */
 
+#include "linux/mm.h"
+#include "linux/mm_types.h"
+#include "linux/mmap_lock.h"
 #define CREATE_TRACE_POINTS
 
 #include <trace/events/deko.h>
@@ -22,8 +25,27 @@
 #define DEKO_SERVICE_APP_ENTER_OK 0x0
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
+#define DEKO_RING_CAPACITY 32
 
 extern const sys_call_ptr_t sys_call_table[];
+
+struct deko_syscall_entry {
+	u64 req_id;
+	u64 ax;
+	u64 di, si, dx, r10, r8, r9;
+	u64 ret;
+};
+
+struct deko_ring_buf {
+	u32 head;
+	u32 tail;
+	struct deko_syscall_entry entries[DEKO_RING_CAPACITY];
+};
+
+struct deko_shared_ring_buf {
+	struct deko_ring_buf tx;
+	struct deko_ring_buf rx;
+};
 
 struct deko_syscall_body {
 	u64 ax;
@@ -74,6 +96,81 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	return 0;
 }
 
+static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
+{
+	struct vm_area_struct *vma;
+	unsigned long expected_pages = mm->total_vm;
+	unsigned long total_pinned = 0;
+	unsigned long start, end;
+	unsigned long nr_pages;
+	unsigned int gup_flags;
+	int ret = 0;
+
+	*pages = kvmalloc_array(expected_pages, sizeof(struct page *),
+				GFP_KERNEL);
+	if (!*pages) {
+		pr_err("Deko: Failed to allocate page pointer array\n");
+		return -ENOMEM;
+	}
+
+	mmap_read_lock(mm);
+
+	VMA_ITERATOR(vmi, mm, 0);
+	for_each_vma(vmi, vma) {
+		start = vma->vm_start;
+		end = vma->vm_end;
+		nr_pages = (end - start + PAGE_SIZE - 1) / PAGE_SIZE;
+		gup_flags = FOLL_FORCE | FOLL_LONGTERM;
+
+		/* Handle vDSO and vvar pages. */
+		if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_DONTEXPAND)) {
+			ret = fixup_user_fault(mm, start, FAULT_FLAG_USER, NULL);
+			if (ret < 0) {
+				pr_warn("Deko: Failed to fault in special VMA at 0x%lx, err: %d\n",
+					start, ret);
+			}
+
+			total_pinned += nr_pages;
+
+			continue;
+		}
+
+		if (vma->vm_flags & VM_WRITE)
+			gup_flags |= FOLL_WRITE;
+
+		ret = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
+					    (*pages) + total_pinned, NULL);
+		if (ret < 0) {
+			pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx], err: %d\n",
+			       start, end, ret);
+			goto out_err;
+		}
+
+		pr_info("Deko: Pinned %d pages for VMA [0x%lx-0x%lx]\n", ret,
+			start, end);
+
+		total_pinned += ret;
+	}
+
+	mmap_read_unlock(mm);
+
+	pr_info("Deko: Successfully pinned %lu pages out of total_vm %lu\n",
+		total_pinned, expected_pages);
+
+	return total_pinned;
+
+out_err:
+	mmap_read_unlock(mm);
+
+	if (total_pinned > 0)
+		unpin_user_pages(*pages, total_pinned);
+
+	kvfree(*pages);
+	*pages = NULL;
+
+	return ret;
+}
+
 void deko_proxy_loop(struct callback_head *work)
 {
 	int errno = 0;
@@ -81,13 +178,26 @@ void deko_proxy_loop(struct callback_head *work)
 	struct pt_regs *regs = task_pt_regs(current);
 	pid_t tgid = current->tgid;
 	struct deko_shared_buf *buf;
+	int pinned_count;
+	struct page **pages = NULL;
+
+	/*
+	 * At first we need to pin all the memories of the newly launched
+	 * application to prevent page fault that cannot be handled inside
+	 * VMPL1 and thus the application will crash immediately. This is
+	 * because by default Linux lazily loads the application code.
+	 */
+	if ((pinned_count = deko_pin_pages(current->mm, &pages)) < 0) {
+		errno = pinned_count;
+		goto err_pin;
+	}
 
 	buf = kzalloc(sizeof(struct deko_shared_buf), GFP_KERNEL);
 	if (!buf) {
 		pr_err("Deko: Failed to allocate shared buffer for task %d\n",
 		       current->pid);
 		errno = -ENOMEM;
-		goto out;
+		goto err_buf;
 	}
 
 	pr_info("Allocated buf at %px for task %d\n", buf, current->pid);
@@ -97,7 +207,7 @@ void deko_proxy_loop(struct callback_head *work)
 		pr_err("Deko: Failed to allocate shared buffer for task %d\n",
 		       current->pid);
 		errno = -ENOMEM;
-		goto out_no_buf;
+		goto err_inner_buf;
 	}
 
 	struct deko_task_work *dw =
@@ -132,7 +242,7 @@ void deko_proxy_loop(struct callback_head *work)
 				     &buf->syscall_body)) != 0) {
 				pr_err("Deko: Error handling system calls: %d\n",
 				       errno);
-				goto out;
+				goto err_loop;
 			}
 
 			break;
@@ -140,17 +250,24 @@ void deko_proxy_loop(struct callback_head *work)
 			pr_warn("Deko: Received unknown call return value: 0x%llx\n",
 				call.rax_out);
 			errno = -EINVAL;
-			goto out;
+			goto err_loop;
 		}
 
 		/* Call again the protocol until the application requests exit. */
 		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	}
 
-out_no_buf:
+err_loop:
+	kfree(buf->buf);
+
+err_inner_buf:
 	kfree(buf);
 
-out:
+err_buf:
+	unpin_user_pages(pages, pinned_count);
+	kvfree(pages);
+
+err_pin:
 	kfree(dw);
 
 	do_exit(errno);
