@@ -166,6 +166,14 @@ static bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
 
 bool kvm_can_use_hv_timer(struct kvm_vcpu *vcpu)
 {
+	/*
+	 * VMPL2 can be preempted for long stretches while lower VMPLs run.
+	 * Force software timers there so timer expiration continues even when
+	 * VMPL2 is not currently in guest mode.
+	 */
+	if (vcpu->vmpl == 2)
+		return false;
+
 	return kvm_x86_ops.set_hv_timer
 	       && !(kvm_mwait_in_guest(vcpu->kvm) ||
 		    kvm_can_post_timer_interrupt(vcpu));
@@ -1907,6 +1915,8 @@ static void apic_timer_expired(struct kvm_lapic *apic, bool from_timer_fn)
 {
 	struct kvm_vcpu *vcpu = apic->vcpu;
 	struct kvm_timer *ktimer = &apic->lapic_timer;
+
+	kvm_vmpl_mark_timer_expired(vcpu);
 
 	if (atomic_read(&apic->lapic_timer.pending))
 		return;

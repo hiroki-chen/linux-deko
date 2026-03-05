@@ -491,8 +491,10 @@ static int __sev_guest_init(struct kvm *kvm, struct kvm_sev_cmd *argp,
 	if (sev_snp_enable_guest_intercepts) {
 		sev->vmsa_features[SVM_SEV_VMPL0] |=
 			SVM_SEV_FEAT_GUEST_INTERCEPTS;
+		/* This is a little bit hacky but works for now. */
 		sev->vmsa_features[SVM_SEV_VMPL1] |=
-			SVM_SEV_FEAT_GUEST_INTERCEPTS;
+			SVM_SEV_FEAT_GUEST_INTERCEPTS |
+			SVM_SEV_FEAT_RESTRICTED_INJECTION;
 		sev->vmsa_features[SVM_SEV_VMPL2] |=
 			SVM_SEV_FEAT_GUEST_INTERCEPTS;
 		sev->vmsa_features[SVM_SEV_VMPL3] |=

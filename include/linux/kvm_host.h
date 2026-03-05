@@ -19,6 +19,7 @@
 #include <linux/msi.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/bitops.h>
 #include <linux/rcupdate.h>
 #include <linux/ratelimit.h>
 #include <linux/err.h>
@@ -423,7 +424,45 @@ struct kvm_vcpu_vmpl_state {
 	int max_vmpl;
 	int current_vmpl;
 	int target_vmpl;
+	unsigned long timer_expired_vmpl_mask;
+	int dbg_last_current_vmpl;
+	int dbg_last_target_vmpl;
+	bool dbg_last_vmpl2_marked;
+	unsigned long dbg_last_report_jiffies;
+	u64 dbg_total_loops;
+	u64 dbg_vmpl1_loops;
+	u64 dbg_vmpl2_marked_loops;
+	u64 dbg_blocked_exc;
+	u64 dbg_blocked_irq;
+	u64 dbg_inject_calls;
+	u64 dbg_vmpl2_mark_set_count;
+	u64 dbg_vmpl2_mark_set_last_report;
+	bool dbg_forced_vmpl2_sw_timer;
+	unsigned long dbg_last_vmpl2_restart_jiffies;
+	u64 dbg_vmpl2_restart_count;
+	u64 dbg_vmpl2_restart_last_report;
 };
+
+static inline void kvm_vmpl_mark_timer_expired(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+
+	if (vcpu->vmpl == 2)
+		vcpu_parent->dbg_vmpl2_mark_set_count++;
+	set_bit(vcpu->vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
+
+static inline bool kvm_vmpl_test_and_clear_timer_expired(struct kvm_vcpu_vmpl_state *vcpu_parent,
+							  int vmpl)
+{
+	return test_and_clear_bit(vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
+
+static inline bool kvm_vmpl_test_timer_expired(struct kvm_vcpu_vmpl_state *vcpu_parent,
+						int vmpl)
+{
+	return test_bit(vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
 
 /*
  * Start accounting time towards a guest.

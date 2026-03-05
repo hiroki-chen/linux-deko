@@ -1,3 +1,4 @@
+#include "linux/printk.h"
 #include <linux/kvm_host.h>
 
 #include "irq.h"
@@ -64,7 +65,7 @@ MODULE_DEVICE_TABLE(x86cpu, svm_cpu_id);
 #define SEG_TYPE_LDT 2
 #define SEG_TYPE_BUSY_TSS16 3
 
-#define DEKO_SVM_TIMER_IRQ 0xef
+#define DEKO_SVM_TIMER_IRQ 0xec
 
 static bool erratum_383_found __read_mostly;
 
@@ -478,6 +479,12 @@ static void svm_inject_exception(struct kvm_vcpu *vcpu)
 
 	if (sev_snp_queue_exception(vcpu))
 		return;
+
+	if (vcpu->vmpl == SVM_SEV_VMPL1 ||
+	    vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1) {
+		pr_info("injecting exception: vector %u error_code %u\n",
+			ex->vector, ex->error_code);
+	}
 
 	svm->vmcb->control.event_inj =
 		ex->vector | SVM_EVTINJ_VALID |
@@ -2117,12 +2124,6 @@ static int npf_interception(struct kvm_vcpu *vcpu)
 	u64 fault_address = svm->vmcb->control.exit_info_2;
 	u64 error_code = svm->vmcb->control.exit_info_1;
 
-	if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1 &&
-	    ((error_code & 0x1) !=
-	     0) /* Present page => NPF must be some violation. */)
-		pr_warn("SEV-ES: Nested page fault in VMPL1, address: 0x%llx, error code: 0x%llx, cpu:0x%x\n",
-			fault_address, error_code, vcpu->vcpu_id);
-
 	/*
 	 * WARN if hardware generates a fault with an error code that collides
 	 * with KVM-defined sythentic flags.  Clear the flags and continue on,
@@ -3435,6 +3436,8 @@ static void dump_vmcb(struct kvm_vcpu *vcpu)
 		return;
 	}
 
+	dump_stack();
+
 	pr_err("VMCB %p, last attempted VMRUN on CPU %d\n",
 	       svm->current_vmcb->ptr, vcpu->arch.last_vmentry_cpu);
 	pr_err("VMCB Control Area:\n");
@@ -3667,25 +3670,35 @@ static void pre_svm_run(struct kvm_vcpu *vcpu)
 
 static void svm_inject_timer(struct kvm_vcpu *vcpu)
 {
+	struct vcpu_svm *svm = to_svm(vcpu);
+
 	if (kvm_is_exception_pending(vcpu))
+	{
+		if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
+			trace_kvm_svm_timer_inject_skip(
+				vcpu->vcpu_id, 1, vcpu->arch.interrupt.injected,
+				vcpu->arch.interrupt.nr, svm_get_if_flag(vcpu),
+				svm->vmcb->control.int_state,
+				vcpu->vcpu_parent->current_vmpl);
 		return;
+	}
 
-	if (kvm_cpu_has_interrupt(vcpu))
+	if (kvm_cpu_has_interrupt(vcpu)) {
+		if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
+			trace_kvm_svm_timer_inject_skip(
+				vcpu->vcpu_id, 2, vcpu->arch.interrupt.injected,
+				vcpu->arch.interrupt.nr, svm_get_if_flag(vcpu),
+				svm->vmcb->control.int_state,
+				vcpu->vcpu_parent->current_vmpl);
 		return;
+	}
 
-	/* VMPL 0/1 will not register APICs so we skip. */
+	/* VMPL 3 will not register APICs so we skip. */
 	if (vcpu->vcpu_parent->current_vmpl >= SVM_SEV_VMPL2)
 		return;
 
-	/*
-	 * If the guest has disabled interrupt, we should prvent
-	 * injecting the timer interrupt right now to avoid
-	 * inconsistent state.
-	 */
-	if (!kvm_arch_interrupt_allowed(vcpu)) {
-		kvm_make_request(KVM_REQ_EVENT, vcpu);
-		return;
-	}
+	trace_kvm_svm_timer_inject(vcpu->vcpu_id, DEKO_SVM_TIMER_IRQ,
+				   vcpu->vcpu_parent->current_vmpl);
 
 	kvm_queue_interrupt(vcpu, DEKO_SVM_TIMER_IRQ, false);
 	kvm_make_request(KVM_REQ_EVENT, vcpu);

@@ -362,6 +362,7 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_EXTEND_REPORT_APP 2
 #define SVSM_EXTEND_LAUNCH_APP 3
 #define SVSM_EXTEND_MAP_IFC 4
+#define SVSM_EXTEND_TASK_MIGRATE 5
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

@@ -9,6 +9,7 @@
  * and is included directly into both code-bases.
  */
 
+#include "linux/printk.h"
 #include <asm/setup_data.h>
 
 #ifndef __BOOT_COMPRESSED
@@ -1084,6 +1085,7 @@ static int vc_handle_cpuid_snp(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 
 	leaf.fn = regs->ax;
 	leaf.subfn = regs->cx;
+
 	ret = snp_cpuid(ghcb, ctxt, &leaf);
 	if (!ret) {
 		regs->ax = leaf.eax;

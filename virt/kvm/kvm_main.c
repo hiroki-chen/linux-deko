@@ -4292,6 +4292,10 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, unsigned long id)
 		r = -ENOMEM;
 		goto vcpu_decrement;
 	}
+	vcpu_parent->dbg_last_current_vmpl = -1;
+	vcpu_parent->dbg_last_target_vmpl = -1;
+	vcpu_parent->dbg_last_report_jiffies = jiffies;
+	vcpu_parent->dbg_last_vmpl2_restart_jiffies = jiffies;
 
 	vcpu_parent->max_vmpl = kvm_x86_call(max_vmpl)(kvm);
 	for (vmpl = 0; vmpl <= vcpu_parent->max_vmpl; ++vmpl) {

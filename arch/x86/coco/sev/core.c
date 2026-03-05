@@ -165,6 +165,7 @@ struct svsm_map_ifc_req {
 	u16 req_len;
 	u16 __reserved[3];
 	u64 ghcb_va;
+	u64 db_va;
 	struct svsm_map_ifc_single_req reqs[16];
 } __attribute__((packed, aligned(8)));
 
@@ -976,6 +977,11 @@ int svsm_perform_call_protocol(struct svsm_call *call)
 	unsigned long flags;
 	struct ghcb *ghcb;
 	int ret;
+
+	if (unlikely(!call || !call->caa)) {
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
 
 	/*
 	 * This can be called very early in the boot, use native functions in
@@ -1814,7 +1820,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	size_t i;
 	struct svsm_map_ifc_single_req *cur;
 	int cpu;
-	u64 ghcb_va;
+	u64 ghcb_va, db_va;
 	unsigned long calculated_va;
 
 	for (i = 0; i < req->req_len; i++) {
@@ -1840,7 +1846,9 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	}
 
 	ghcb_va = req->ghcb_va;
+	db_va = req->db_va;
 	make_va_decrypted(ghcb_va);
+	make_va_decrypted(db_va);
 
 	__flush_tlb_all();
 }

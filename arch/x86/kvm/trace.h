@@ -1879,6 +1879,250 @@ TRACE_EVENT(kvm_rmp_fault,
 		  __entry->error_code, __entry->rmp_level, __entry->psmash_ret)
 );
 
+TRACE_EVENT(kvm_vmpl_timer_debug,
+	TP_PROTO(unsigned int vcpu_id, u64 loops, u64 vmpl1_loops,
+		 u64 marked_loops, u64 inject, u64 blocked_exc, u64 blocked_irq,
+		 u64 mark_set_total, u64 mark_set_delta, u64 restart_total,
+		 u64 restart_delta, u32 vmpl_state),
+	TP_ARGS(vcpu_id, loops, vmpl1_loops, marked_loops, inject,
+		blocked_exc, blocked_irq, mark_set_total, mark_set_delta,
+		restart_total, restart_delta, vmpl_state),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(u64, loops)
+		__field(u64, vmpl1_loops)
+		__field(u64, marked_loops)
+		__field(u64, inject)
+		__field(u64, blocked_exc)
+		__field(u64, blocked_irq)
+		__field(u64, mark_set_total)
+		__field(u64, mark_set_delta)
+		__field(u64, restart_total)
+		__field(u64, restart_delta)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->loops = loops;
+		__entry->vmpl1_loops = vmpl1_loops;
+		__entry->marked_loops = marked_loops;
+		__entry->inject = inject;
+		__entry->blocked_exc = blocked_exc;
+		__entry->blocked_irq = blocked_irq;
+		__entry->mark_set_total = mark_set_total;
+		__entry->mark_set_delta = mark_set_delta;
+		__entry->restart_total = restart_total;
+		__entry->restart_delta = restart_delta;
+		__entry->current_vmpl = (int)(vmpl_state >> 16);
+		__entry->target_vmpl = (int)(vmpl_state & 0xffff);
+	),
+
+	TP_printk("vcpu %u loops=%llu vmpl1_loops=%llu marked_loops=%llu inject=%llu blocked_exc=%llu blocked_irq=%llu mark_set_total=%llu mark_set_delta=%llu restart_total=%llu restart_delta=%llu current=%d target=%d",
+		  __entry->vcpu_id, __entry->loops, __entry->vmpl1_loops,
+		  __entry->marked_loops, __entry->inject, __entry->blocked_exc,
+		  __entry->blocked_irq, __entry->mark_set_total,
+		  __entry->mark_set_delta, __entry->restart_total,
+		  __entry->restart_delta, __entry->current_vmpl,
+		  __entry->target_vmpl)
+);
+
+TRACE_EVENT(kvm_vmpl_state_change,
+	TP_PROTO(unsigned int vcpu_id, int current_vmpl, int target_vmpl,
+		 int prev_current_vmpl, int prev_target_vmpl),
+	TP_ARGS(vcpu_id, current_vmpl, target_vmpl, prev_current_vmpl,
+		prev_target_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+		__field(int, prev_current_vmpl)
+		__field(int, prev_target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->current_vmpl = current_vmpl;
+		__entry->target_vmpl = target_vmpl;
+		__entry->prev_current_vmpl = prev_current_vmpl;
+		__entry->prev_target_vmpl = prev_target_vmpl;
+	),
+
+	TP_printk("vcpu %u current=%d target=%d prev_current=%d prev_target=%d",
+		  __entry->vcpu_id, __entry->current_vmpl, __entry->target_vmpl,
+		  __entry->prev_current_vmpl, __entry->prev_target_vmpl)
+);
+
+TRACE_EVENT(kvm_vmpl_timer_mark_change,
+	TP_PROTO(unsigned int vcpu_id, bool marked, int current_vmpl,
+		 int target_vmpl),
+	TP_ARGS(vcpu_id, marked, current_vmpl, target_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(bool, marked)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->marked = marked;
+		__entry->current_vmpl = current_vmpl;
+		__entry->target_vmpl = target_vmpl;
+	),
+
+	TP_printk("vcpu %u marked=%d current=%d target=%d",
+		  __entry->vcpu_id, __entry->marked, __entry->current_vmpl,
+		  __entry->target_vmpl)
+);
+
+TRACE_EVENT(kvm_vmpl_timer_inject,
+	TP_PROTO(unsigned int vcpu_id, bool pre_enter, bool vmpl2_pending,
+		 bool vmpl2_marked, int current_vmpl, int target_vmpl),
+	TP_ARGS(vcpu_id, pre_enter, vmpl2_pending, vmpl2_marked, current_vmpl,
+		target_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(bool, pre_enter)
+		__field(bool, vmpl2_pending)
+		__field(bool, vmpl2_marked)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->pre_enter = pre_enter;
+		__entry->vmpl2_pending = vmpl2_pending;
+		__entry->vmpl2_marked = vmpl2_marked;
+		__entry->current_vmpl = current_vmpl;
+		__entry->target_vmpl = target_vmpl;
+	),
+
+	TP_printk("vcpu %u pre_enter=%d vmpl2_pending=%d vmpl2_marked=%d current=%d target=%d",
+		  __entry->vcpu_id, __entry->pre_enter, __entry->vmpl2_pending,
+		  __entry->vmpl2_marked, __entry->current_vmpl,
+		  __entry->target_vmpl)
+);
+
+TRACE_EVENT(kvm_vmpl_timer_blocked,
+	TP_PROTO(unsigned int vcpu_id, bool exc_pending, bool irq_pending,
+		 bool injected, unsigned int irq_nr, bool intr_allowed,
+		 int current_vmpl, int target_vmpl),
+	TP_ARGS(vcpu_id, exc_pending, irq_pending, injected, irq_nr,
+		intr_allowed, current_vmpl, target_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(bool, exc_pending)
+		__field(bool, irq_pending)
+		__field(bool, injected)
+		__field(unsigned int, irq_nr)
+		__field(bool, intr_allowed)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->exc_pending = exc_pending;
+		__entry->irq_pending = irq_pending;
+		__entry->injected = injected;
+		__entry->irq_nr = irq_nr;
+		__entry->intr_allowed = intr_allowed;
+		__entry->current_vmpl = current_vmpl;
+		__entry->target_vmpl = target_vmpl;
+	),
+
+	TP_printk("vcpu %u exc=%d irq=%d injected=%d nr=%u intr_allowed=%d current=%d target=%d",
+		  __entry->vcpu_id, __entry->exc_pending, __entry->irq_pending,
+		  __entry->injected, __entry->irq_nr, __entry->intr_allowed,
+		  __entry->current_vmpl, __entry->target_vmpl)
+);
+
+TRACE_EVENT(kvm_vmpl_timer_exit_after_inject,
+	TP_PROTO(unsigned int vcpu_id, int r, unsigned int exit_reason,
+		 int current_vmpl, int target_vmpl),
+	TP_ARGS(vcpu_id, r, exit_reason, current_vmpl, target_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(int, r)
+		__field(unsigned int, exit_reason)
+		__field(int, current_vmpl)
+		__field(int, target_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->r = r;
+		__entry->exit_reason = exit_reason;
+		__entry->current_vmpl = current_vmpl;
+		__entry->target_vmpl = target_vmpl;
+	),
+
+	TP_printk("vcpu %u r=%d exit_reason=%u current=%d target=%d",
+		  __entry->vcpu_id, __entry->r, __entry->exit_reason,
+		  __entry->current_vmpl, __entry->target_vmpl)
+);
+
+TRACE_EVENT(kvm_svm_timer_inject_skip,
+	TP_PROTO(unsigned int vcpu_id, unsigned int reason, bool injected,
+		 unsigned int irq_nr, bool if_flag, u32 int_state, int current_vmpl),
+	TP_ARGS(vcpu_id, reason, injected, irq_nr, if_flag, int_state,
+		current_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(unsigned int, reason)
+		__field(bool, injected)
+		__field(unsigned int, irq_nr)
+		__field(bool, if_flag)
+		__field(u32, int_state)
+		__field(int, current_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->reason = reason;
+		__entry->injected = injected;
+		__entry->irq_nr = irq_nr;
+		__entry->if_flag = if_flag;
+		__entry->int_state = int_state;
+		__entry->current_vmpl = current_vmpl;
+	),
+
+	TP_printk("vcpu %u reason=%u injected=%d nr=%u if=%d int_state=%#x current=%d",
+		  __entry->vcpu_id, __entry->reason, __entry->injected,
+		  __entry->irq_nr, __entry->if_flag, __entry->int_state,
+		  __entry->current_vmpl)
+);
+
+TRACE_EVENT(kvm_svm_timer_inject,
+	TP_PROTO(unsigned int vcpu_id, unsigned int vector, int current_vmpl),
+	TP_ARGS(vcpu_id, vector, current_vmpl),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, vcpu_id)
+		__field(unsigned int, vector)
+		__field(int, current_vmpl)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->vector = vector;
+		__entry->current_vmpl = current_vmpl;
+	),
+
+	TP_printk("vcpu %u vector=%u current=%d",
+		  __entry->vcpu_id, __entry->vector, __entry->current_vmpl)
+);
+
 #endif /* _TRACE_KVM_H */
 
 #undef TRACE_INCLUDE_PATH

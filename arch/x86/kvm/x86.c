@@ -16,7 +16,6 @@
  *   Ben-Ami Yassour <benami@il.ibm.com>
  */
 #include "asm/svm.h"
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
 #include "irq.h"
@@ -63,6 +62,7 @@
 #include <linux/entry-kvm.h>
 #include <linux/suspend.h>
 #include <linux/smp.h>
+#include <linux/jiffies.h>
 
 #include <trace/events/ipi.h>
 #include <trace/events/kvm.h>
@@ -11422,10 +11422,137 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 	int r;
 	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
 	int vmpl;
+	bool vmpl2_timer_event;
+	bool vmpl2_timer_pending;
+	bool vmpl2_timer_marked;
 
 	vcpu->common->run->exit_reason = KVM_EXIT_UNKNOWN;
 
 	for (;;) {
+		bool vmpl2_marked_now =
+			kvm_vmpl_test_timer_expired(vcpu_parent, SVM_SEV_VMPL2);
+		bool timer_blocked;
+		bool injected_timer_this_iter = false;
+
+		vcpu_parent->dbg_total_loops++;
+		if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
+			vcpu_parent->dbg_vmpl1_loops++;
+		if (vmpl2_marked_now)
+			vcpu_parent->dbg_vmpl2_marked_loops++;
+
+		if (time_after(jiffies, vcpu_parent->dbg_last_report_jiffies + HZ)) {
+			u64 mark_set_delta =
+				vcpu_parent->dbg_vmpl2_mark_set_count -
+				vcpu_parent->dbg_vmpl2_mark_set_last_report;
+			u64 restart_delta =
+				vcpu_parent->dbg_vmpl2_restart_count -
+				vcpu_parent->dbg_vmpl2_restart_last_report;
+
+			vcpu_parent->dbg_vmpl2_mark_set_last_report =
+				vcpu_parent->dbg_vmpl2_mark_set_count;
+			vcpu_parent->dbg_vmpl2_restart_last_report =
+				vcpu_parent->dbg_vmpl2_restart_count;
+			vcpu_parent->dbg_last_report_jiffies = jiffies;
+			trace_kvm_vmpl_timer_debug(
+				vcpu->vcpu_id, vcpu_parent->dbg_total_loops,
+				vcpu_parent->dbg_vmpl1_loops,
+				vcpu_parent->dbg_vmpl2_marked_loops,
+				vcpu_parent->dbg_inject_calls,
+				vcpu_parent->dbg_blocked_exc,
+				vcpu_parent->dbg_blocked_irq,
+				vcpu_parent->dbg_vmpl2_mark_set_count,
+				mark_set_delta, vcpu_parent->dbg_vmpl2_restart_count,
+				restart_delta,
+				((u32)vcpu_parent->current_vmpl << 16) |
+				 (u32)vcpu_parent->target_vmpl);
+		}
+
+		if (vcpu_parent->dbg_last_current_vmpl != vcpu_parent->current_vmpl ||
+		    vcpu_parent->dbg_last_target_vmpl != vcpu_parent->target_vmpl) {
+			trace_kvm_vmpl_state_change(
+				vcpu->vcpu_id, vcpu_parent->current_vmpl,
+				vcpu_parent->target_vmpl,
+				vcpu_parent->dbg_last_current_vmpl,
+				vcpu_parent->dbg_last_target_vmpl);
+			vcpu_parent->dbg_last_current_vmpl =
+				vcpu_parent->current_vmpl;
+			vcpu_parent->dbg_last_target_vmpl =
+				vcpu_parent->target_vmpl;
+		}
+
+		if (vcpu_parent->dbg_last_vmpl2_marked != vmpl2_marked_now) {
+			trace_kvm_vmpl_timer_mark_change(
+				vcpu->vcpu_id, vmpl2_marked_now,
+				vcpu_parent->current_vmpl,
+				vcpu_parent->target_vmpl);
+			vcpu_parent->dbg_last_vmpl2_marked = vmpl2_marked_now;
+		}
+
+		if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1 &&
+		    vcpu_parent->max_vmpl >= SVM_SEV_VMPL2) {
+			struct kvm_vcpu *vmpl2_vcpu =
+				vcpu_parent->vcpu_vmpl[SVM_SEV_VMPL2];
+			unsigned long restart_interval = 1;
+			s64 period_ns = 0;
+
+			if (vmpl2_vcpu && vmpl2_vcpu->arch.apic)
+				period_ns = READ_ONCE(vmpl2_vcpu->arch.apic->lapic_timer.period);
+			if (period_ns > 0)
+				restart_interval = max_t(unsigned long, 1,
+							 nsecs_to_jiffies((u64)period_ns));
+
+			if (!time_after_eq(jiffies,
+					   vcpu_parent->dbg_last_vmpl2_restart_jiffies +
+					   restart_interval))
+				goto skip_vmpl2_restart;
+
+			/*
+			 * Periodically restart VMPL2 timer while VMPL1 is running.
+			 * With VMPL2 hv timer disabled, this re-arms software timer.
+			 */
+			kvm_lapic_switch_to_hv_timer(vmpl2_vcpu);
+			vcpu_parent->dbg_last_vmpl2_restart_jiffies = jiffies;
+			vcpu_parent->dbg_vmpl2_restart_count++;
+		}
+skip_vmpl2_restart:
+
+		/*
+		 * VMPL1 may run and return with r<=0, which skips the post-exit
+		 * timer handling below.  Check VMPL2 timer expiration before
+		 * entering guest so the synthetic VMPL1 timer interrupt is not
+		 * dropped in that case.
+		 */
+		if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1 &&
+		    kvm_vmpl_test_timer_expired(vcpu_parent, SVM_SEV_VMPL2)) {
+			timer_blocked = kvm_is_exception_pending(vcpu) ||
+					kvm_cpu_has_interrupt(vcpu);
+			if (!timer_blocked) {
+				kvm_vmpl_test_and_clear_timer_expired(vcpu_parent,
+							      SVM_SEV_VMPL2);
+				trace_kvm_vmpl_timer_inject(
+					vcpu->vcpu_id, true, false, true,
+					vcpu_parent->current_vmpl,
+					vcpu_parent->target_vmpl);
+				kvm_x86_call(inject_timer)(vcpu);
+				injected_timer_this_iter = true;
+				vcpu_parent->dbg_inject_calls++;
+			} else {
+				if (kvm_is_exception_pending(vcpu))
+					vcpu_parent->dbg_blocked_exc++;
+				if (kvm_cpu_has_interrupt(vcpu))
+					vcpu_parent->dbg_blocked_irq++;
+				trace_kvm_vmpl_timer_blocked(
+					vcpu->vcpu_id,
+					kvm_is_exception_pending(vcpu),
+					kvm_cpu_has_interrupt(vcpu),
+					vcpu->arch.interrupt.injected,
+					vcpu->arch.interrupt.nr,
+					kvm_arch_interrupt_allowed(vcpu),
+					vcpu_parent->current_vmpl,
+					vcpu_parent->target_vmpl);
+			}
+		}
+
 		/*
 		 * If another guest vCPU requests a PV TLB flush in the middle
 		 * of instruction emulation, the rest of the emulation could
@@ -11433,14 +11560,21 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		 * this point can start executing an instruction.
 		 */
 		vcpu->arch.at_instruction_boundary = false;
-		if (kvm_vcpu_running(vcpu)) {
-			r = vcpu_enter_guest(vcpu);
-		} else {
-			r = vcpu_block(vcpu);
-		}
+			if (kvm_vcpu_running(vcpu)) {
+				r = vcpu_enter_guest(vcpu);
+			} else {
+				r = vcpu_block(vcpu);
+			}
 
-		if (r <= 0)
-			break;
+			if (r <= 0) {
+				if (injected_timer_this_iter)
+					trace_kvm_vmpl_timer_exit_after_inject(
+						vcpu->vcpu_id, r,
+						vcpu->common->run->exit_reason,
+						vcpu_parent->current_vmpl,
+						vcpu_parent->target_vmpl);
+				break;
+			}
 
 		kvm_clear_request(KVM_REQ_UNBLOCK, vcpu);
 		if (kvm_xen_has_pending_events(vcpu))
@@ -11451,26 +11585,48 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		 * will switch to the higher priority VMPL if a pending interrupt
 		 * is ready.
 		 */
+		vmpl2_timer_event = false;
+		vmpl2_timer_pending = false;
 		for (vmpl = 0; vmpl <= vcpu_parent->max_vmpl; ++vmpl) {
 			if (kvm_cpu_has_pending_timer(
 				    vcpu_parent->vcpu_vmpl[vmpl])) {
 				kvm_inject_pending_timer_irqs(
 					vcpu_parent->vcpu_vmpl[vmpl]);
-
-				  /*
-					 * If the vCPU currently running does not match
-					 * the one that has timer expired, we need to
-					 * inject a #HV doorbell for timer notification
-					 * so that the vCPU can decide what to do.
-					 */
-				if (vcpu_parent->current_vmpl != vmpl) {
-					if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
-						pr_info("VMPL1 running!\n");
-
-					// kvm_x86_call(inject_timer)(vcpu);
+				if (vmpl == SVM_SEV_VMPL2) {
+					vmpl2_timer_pending = true;
+					vmpl2_timer_event = true;
 				}
 			}
 		}
+
+		/*
+		 * VMPL2 owns the guest timer setup, and has_pending_timer()
+		 * can miss expiration paths that bypass lapic_timer.pending.
+		 * Consume an explicit VMPL2 expiration marker so VMPL1 can
+		 * still receive the synthetic timer interrupt.
+		 */
+		if (vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
+			vmpl2_timer_marked = kvm_vmpl_test_timer_expired(
+				vcpu_parent, SVM_SEV_VMPL2);
+		else
+			vmpl2_timer_marked = kvm_vmpl_test_timer_expired(
+				vcpu_parent, SVM_SEV_VMPL2);
+		vmpl2_timer_event |= vmpl2_timer_marked;
+			if (vmpl2_timer_event &&
+			    vcpu_parent->current_vmpl == SVM_SEV_VMPL1 &&
+			    !kvm_is_exception_pending(vcpu) &&
+			    !kvm_cpu_has_interrupt(vcpu)) {
+				kvm_vmpl_test_and_clear_timer_expired(vcpu_parent,
+							      SVM_SEV_VMPL2);
+				trace_kvm_vmpl_timer_inject(
+					vcpu->vcpu_id, false, vmpl2_timer_pending,
+					vmpl2_timer_marked, vcpu_parent->current_vmpl,
+					vcpu_parent->target_vmpl);
+				kvm_x86_call(inject_timer)(vcpu);
+				injected_timer_this_iter = true;
+				vcpu_parent->dbg_inject_calls++;
+			}
+
 
 		if (dm_request_for_irq_injection(vcpu) &&
 		    kvm_vcpu_ready_for_interrupt_injection(vcpu)) {
@@ -14250,6 +14406,14 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rmp_fault);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_timer_debug);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_state_change);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_timer_mark_change);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_timer_inject);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_timer_blocked);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmpl_timer_exit_after_inject);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_svm_timer_inject_skip);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_svm_timer_inject);
 
 static int __init kvm_x86_init(void)
 {
