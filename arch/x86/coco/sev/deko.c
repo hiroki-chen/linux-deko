@@ -237,9 +237,6 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 				pr_warn("Deko: Failed to fault in special VMA at 0x%lx, err: %d\n",
 					start, ret);
 			}
-
-			total_pinned += nr_pages;
-
 			continue;
 		}
 
@@ -285,7 +282,7 @@ void deko_proxy_loop(struct callback_head *work)
 	struct svsm_call call = { 0 };
 	struct pt_regs *regs = task_pt_regs(current);
 	pid_t tgid = current->tgid;
-	struct deko_shared_buf *buf;
+	struct deko_shared_buf *buf = NULL;
 	int pinned_count;
 	struct page **pages = NULL;
 
@@ -400,6 +397,6 @@ err_pin:
 	 * the latter case, we should kill the process with the appropriate error code.
 	 * 
 	 */
-	if (!is_exit_syscall(buf->syscall_body.ax))
+	if (!buf || !is_exit_syscall(buf->syscall_body.ax))
 		do_exit(errno);
 }
