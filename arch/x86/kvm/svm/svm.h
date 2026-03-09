@@ -357,6 +357,7 @@ struct vcpu_svm {
 
 	struct hrtimer ri_tick_timer;
 	u64 ri_tick_period_ns;
+	u64 ri_tick_last_inject_ns;
 	bool ri_tick_enabled;
 	atomic_t ri_tick_pending;
 };

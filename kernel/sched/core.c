@@ -3164,29 +3164,6 @@ void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
 	WARN_ON_ONCE(ret);
 }
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-static void notify_monitor(struct task_struct *p, unsigned int old_cpu,
-			   unsigned int new_cpu)
-{
-	enum es_result res = ES_OK;
-	struct svsm_call call = { 0 };
-
-	if (p->is_monitored && old_cpu != new_cpu) {
-		call.caa = svsm_get_caa();
-		if (unlikely(!call.caa))
-			return;
-
-		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
-		call.rdx = old_cpu;
-		call.rcx = new_cpu;
-		call.r9 = p->pid;
-		res = svsm_perform_call_protocol(&call);
-
-		WARN_ON_ONCE(res != ES_OK);
-	}
-}
-#endif
-
 void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
 #ifdef CONFIG_SCHED_DEBUG
@@ -3235,12 +3212,6 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	if (task_cpu(p) != new_cpu) {
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
-
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-			/* Check if we need to notify the monitor. */
-			/* Disabled for stability: do not issue SVSM calls from scheduler migration path. */
-			/* notify_monitor(p, task_cpu(p), new_cpu); */
-#endif
 
 		p->se.nr_migrations++;
 		rseq_migrate(p);

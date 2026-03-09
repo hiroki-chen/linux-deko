@@ -1519,7 +1519,7 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
 	hrtimer_init(&svm->ri_tick_timer, CLOCK_MONOTONIC,
 		     HRTIMER_MODE_REL_PINNED);
 	svm->ri_tick_timer.function = sev_snp_ri_tick;
-	svm->ri_tick_period_ns = 1000000ULL; /* 1ms default */
+	svm->ri_tick_period_ns = 10000000ULL; /* 10ms default */
 	svm->ri_tick_enabled = false;
 	atomic_set(&svm->ri_tick_pending, 0);
 
@@ -3672,8 +3672,10 @@ static void svm_inject_timer(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 
-	if (kvm_is_exception_pending(vcpu))
-	{
+	if (kvm_is_exception_pending(vcpu)) {
+		pr_info_ratelimited("KVM: svm timer skip (pending exception), vcpu=%d vmpl=%d injected=%d nr=%u\n",
+				    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+				    vcpu->arch.interrupt.injected, vcpu->arch.interrupt.nr);
 		if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
 			trace_kvm_svm_timer_inject_skip(
 				vcpu->vcpu_id, 1, vcpu->arch.interrupt.injected,
@@ -3684,6 +3686,9 @@ static void svm_inject_timer(struct kvm_vcpu *vcpu)
 	}
 
 	if (kvm_cpu_has_interrupt(vcpu)) {
+		pr_info_ratelimited("KVM: svm timer skip (pending interrupt), vcpu=%d vmpl=%d injected=%d nr=%u\n",
+				    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+				    vcpu->arch.interrupt.injected, vcpu->arch.interrupt.nr);
 		if (vcpu->vcpu_parent->current_vmpl == SVM_SEV_VMPL1)
 			trace_kvm_svm_timer_inject_skip(
 				vcpu->vcpu_id, 2, vcpu->arch.interrupt.injected,
@@ -3694,11 +3699,17 @@ static void svm_inject_timer(struct kvm_vcpu *vcpu)
 	}
 
 	/* VMPL 3 will not register APICs so we skip. */
-	if (vcpu->vcpu_parent->current_vmpl >= SVM_SEV_VMPL2)
+	if (vcpu->vcpu_parent->current_vmpl >= SVM_SEV_VMPL2) {
+		pr_info_ratelimited("KVM: svm timer skip (vmpl>=2), vcpu=%d vmpl=%d\n",
+				    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl);
 		return;
+	}
 
 	trace_kvm_svm_timer_inject(vcpu->vcpu_id, DEKO_SVM_TIMER_IRQ,
 				   vcpu->vcpu_parent->current_vmpl);
+	pr_info_ratelimited("KVM: svm timer inject, vcpu=%d vmpl=%d irq=%d\n",
+			    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+			    DEKO_SVM_TIMER_IRQ);
 
 	kvm_queue_interrupt(vcpu, DEKO_SVM_TIMER_IRQ, false);
 	kvm_make_request(KVM_REQ_EVENT, vcpu);
@@ -3780,9 +3791,10 @@ static void svm_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
 	trace_kvm_inj_virq(vcpu->arch.interrupt.nr, vcpu->arch.interrupt.soft,
 			   reinjected);
 
-	if (!sev_snp_inject(INJECT_IRQ, vcpu))
+	if (!sev_snp_inject(INJECT_IRQ, vcpu)) {
 		svm->vmcb->control.event_inj = vcpu->arch.interrupt.nr |
 					       SVM_EVTINJ_VALID | type;
+	}
 
 	++vcpu->common->stat.irq_injections;
 }

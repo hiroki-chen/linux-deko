@@ -259,6 +259,7 @@ static inline int svsm_process_result_codes(struct svsm_call *call)
 {
 	switch (call->rax_out) {
 	case SVSM_SUCCESS:
+	case DEKO_TIMER_SERVICE:
 		return 0;
 	case SVSM_ERR_INCOMPLETE:
 	case SVSM_ERR_BUSY:

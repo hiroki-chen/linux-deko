@@ -7,6 +7,7 @@
  * Author: Hiroki Chen <haobchen@iu.edu>
  */
 
+#include "linux/printk.h"
 #include "linux/sched.h"
 #define CREATE_TRACE_POINTS
 
@@ -19,6 +20,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/kernel.h>
 #include <linux/sizes.h>
+#include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/sched/task_stack.h>
 #include <linux/types.h>
@@ -26,9 +28,6 @@
 #include <asm-generic/mman-common.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
-
-#define DEKO_SERVICE_APP_ENTER_OK 0x0
-#define DEKO_SERVICE_TIMER 0x70000001
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
@@ -180,7 +179,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 		pr_warn("Deko: Invalid syscall number %llu from VMPL1\n",
 			syscall_body->ax);
 		syscall_body->ax = -ENOSYS;
-		return 0;
+		return -EINVAL;
 	}
 
 	trace_deko_syscall_entry(syscall_body->ax, syscall_body->di,
@@ -195,6 +194,13 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	tmp_regs.orig_ax = syscall_body->ax;
 
 	syscall_fn = sys_call_table[syscall_body->ax];
+	if (unlikely(!syscall_fn)) {
+		pr_warn("Deko: Missing syscall handler for syscall number %llu\n",
+			syscall_body->ax);
+		syscall_body->ax = -ENOSYS;
+		return -EINVAL;
+	}
+
 	sys_retval = syscall_fn(&tmp_regs);
 
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
@@ -276,6 +282,33 @@ out_err:
 	return ret;
 }
 
+static int deko_notify_monitor_migration(unsigned int old_cpu,
+					 unsigned int new_cpu)
+{
+	enum es_result res = ES_OK;
+	struct svsm_call call = { 0 };
+
+	if (old_cpu == new_cpu || !current->is_monitored)
+		return 0;
+
+	call.caa = svsm_get_caa();
+	if (unlikely(!call.caa))
+		return -ENODEV;
+
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
+	call.rdx = old_cpu;
+	call.rcx = new_cpu;
+	call.r9 = current->pid;
+	res = svsm_perform_call_protocol(&call);
+	if (unlikely(res != ES_OK)) {
+		pr_warn("Deko: Failed to notify monitor for task migration (pid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
+			current->pid, old_cpu, new_cpu, res);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 void deko_proxy_loop(struct callback_head *work)
 {
 	int errno = 0;
@@ -285,6 +318,9 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_shared_buf *buf = NULL;
 	int pinned_count;
 	struct page **pages = NULL;
+	unsigned int monitored_cpu;
+	bool normal_exit = false;
+	enum es_result res;
 
 	/*
 	 * At first we need to pin all the memories of the newly launched
@@ -329,18 +365,34 @@ void deko_proxy_loop(struct callback_head *work)
 	call.rdx = tgid;
 
 	current->is_monitored = true;
+	monitored_cpu = smp_processor_id();
 
 	/* Application main loop. */
 	for (;;) {
-		/*
-     * Special handling of the return value: we discard the MSR's value.
-     * This is because the protocol call involve multiple VMPL switches
-     * that modify the MSR values and the final value might get corrupted.
-     * 
-     * However, since the rax_out will eventually gets modified by VMPL0,
-     * we treat this as the ground truth for the return value.
-     */
-		svsm_perform_msr_protocol(&call);
+		unsigned int current_cpu = smp_processor_id();
+
+		if (unlikely(current_cpu != monitored_cpu)) {
+			pr_info("Deko: Detected CPU migration for task %d, from CPU %u to CPU %u\n",
+				current->pid, monitored_cpu, current_cpu);
+
+			errno = deko_notify_monitor_migration(monitored_cpu,
+							      current_cpu);
+			if (unlikely(errno))
+				goto err_loop;
+			monitored_cpu = current_cpu;
+
+			call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+
+			continue;
+		}
+
+		res = svsm_perform_call_protocol(&call);
+		if (res != ES_OK) {
+			pr_err("Deko: Failed to perform call protocol for task %d, err: %d\n",
+			       current->pid, res);
+			errno = -EINVAL;
+			goto err_loop;
+		}
 
 		switch (call.rax_out) {
 		case DEKO_SERVICE_APP_ENTER_OK:
@@ -354,9 +406,13 @@ void deko_proxy_loop(struct callback_head *work)
 
 			break;
 
-		case DEKO_SERVICE_TIMER:
-			/* A timer. We need to call Linux's scheduler. */
-			schedule();
+		case DEKO_TIMER_SERVICE:
+			pr_info_ratelimited(
+				"Deko: Received timer event from VMPL1 for task %d\n",
+				current->pid);
+			/* Timer is hot-path: avoid log storm and always offer a
+			 * voluntary reschedule point to keep RCU/softirq forward progress. */
+			cond_resched();
 
 			break;
 		default:
@@ -368,6 +424,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 		if (buf->syscall_body.ax == __NR_exit ||
 		    buf->syscall_body.ax == __NR_exit_group) {
+			normal_exit = true;
 			goto err_loop;
 		}
 
@@ -376,7 +433,8 @@ void deko_proxy_loop(struct callback_head *work)
 	}
 
 err_loop:
-	kfree(buf->buf);
+	if (buf)
+		kfree(buf->buf);
 
 err_inner_buf:
 	kfree(buf);
@@ -397,6 +455,6 @@ err_pin:
 	 * the latter case, we should kill the process with the appropriate error code.
 	 * 
 	 */
-	if (!buf || !is_exit_syscall(buf->syscall_body.ax))
+	if (!normal_exit)
 		do_exit(errno);
 }

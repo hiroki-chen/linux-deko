@@ -276,6 +276,10 @@ struct svsm_ca {
 #define SVSM_ERR_BUSY 0x80000007
 #define SVSM_PVALIDATE_FAIL_SIZEMISMATCH 0x80001006
 
+#define DEKO_TIMER_SERVICE 0x70000001
+#define DEKO_SERVICE_APP_ENTER_OK 0x0
+
+
 /*
  * The SVSM PVALIDATE related structures
  */
