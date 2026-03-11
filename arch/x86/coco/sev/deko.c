@@ -113,6 +113,38 @@ static int mmap_post_handler(struct mm_struct *mm, unsigned long start_addr,
 	return 0;
 }
 
+static int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
+			    unsigned long new_brk)
+{
+	unsigned long start_addr = PAGE_ALIGN(old_brk);
+	unsigned long end_addr = PAGE_ALIGN(new_brk);
+	unsigned long addr;
+	int ret;
+
+	if (!mm || new_brk <= old_brk || start_addr >= end_addr)
+		return 0;
+
+	pr_info("Deko: Handling brk post, old_brk: 0x%lx, new_brk: 0x%lx\n",
+		old_brk, new_brk);
+
+	mmap_read_lock(mm);
+
+	for (addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
+		ret = fixup_user_fault(mm, addr,
+				       FAULT_FLAG_USER | FAULT_FLAG_WRITE,
+				       NULL);
+		if (ret < 0) {
+			pr_warn("Deko: Failed to fault in page for brk at 0x%lx, err: %d\n",
+				addr, ret);
+			break;
+		}
+	}
+
+	mmap_read_unlock(mm);
+
+	return 0;
+}
+
 static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 {
 	enum es_result res = ES_OK;
@@ -142,7 +174,8 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 static int
 deko_app_handle_system_calls_post(struct mm_struct *mm,
 				  struct deko_syscall_body *syscall_body,
-				  unsigned long ax)
+				  unsigned long ax,
+				  unsigned long old_brk)
 {
 	int ret;
 
@@ -150,6 +183,11 @@ deko_app_handle_system_calls_post(struct mm_struct *mm,
 	case __NR_mmap:
 		ret = mmap_post_handler(mm, ax, syscall_body->si,
 					syscall_body->dx, ax);
+		if (ret < 0)
+			return ret;
+		break;
+	case __NR_brk:
+		ret = brk_post_handler(mm, old_brk, ax);
 		if (ret < 0)
 			return ret;
 		break;
@@ -174,6 +212,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	struct pt_regs tmp_regs = { 0 };
 	sys_call_ptr_t syscall_fn;
 	unsigned long sys_retval;
+	unsigned long old_brk = 0;
 
 	if (unlikely(syscall_body->ax >= NR_syscalls)) {
 		pr_warn("Deko: Invalid syscall number %llu from VMPL1\n",
@@ -193,6 +232,9 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	tmp_regs.r9 = syscall_body->r9;
 	tmp_regs.orig_ax = syscall_body->ax;
 
+	if (current->mm)
+		old_brk = current->mm->brk;
+
 	syscall_fn = sys_call_table[syscall_body->ax];
 	if (unlikely(!syscall_fn)) {
 		pr_warn("Deko: Missing syscall handler for syscall number %llu\n",
@@ -206,7 +248,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
 
 	return deko_app_handle_system_calls_post(current->mm, syscall_body,
-						 sys_retval);
+						 sys_retval, old_brk);
 }
 
 static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
