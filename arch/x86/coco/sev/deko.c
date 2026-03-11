@@ -130,9 +130,8 @@ static int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
 	mmap_read_lock(mm);
 
 	for (addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
-		ret = fixup_user_fault(mm, addr,
-				       FAULT_FLAG_USER | FAULT_FLAG_WRITE,
-				       NULL);
+		ret = fixup_user_fault(
+			mm, addr, FAULT_FLAG_USER | FAULT_FLAG_WRITE, NULL);
 		if (ret < 0) {
 			pr_warn("Deko: Failed to fault in page for brk at 0x%lx, err: %d\n",
 				addr, ret);
@@ -174,8 +173,7 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 static int
 deko_app_handle_system_calls_post(struct mm_struct *mm,
 				  struct deko_syscall_body *syscall_body,
-				  unsigned long ax,
-				  unsigned long old_brk)
+				  unsigned long ax, unsigned long old_brk)
 {
 	int ret;
 
@@ -258,6 +256,9 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 	unsigned long total_pinned = 0;
 	unsigned long start, end;
 	unsigned long nr_pages;
+	unsigned long remaining;
+	unsigned long cur;
+	unsigned long chunk_pages;
 	unsigned int gup_flags;
 	int ret = 0;
 
@@ -285,24 +286,42 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 				pr_warn("Deko: Failed to fault in special VMA at 0x%lx, err: %d\n",
 					start, ret);
 			}
+			cond_resched();
 			continue;
 		}
 
 		if (vma->vm_flags & VM_WRITE)
 			gup_flags |= FOLL_WRITE;
 
-		ret = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
-					    (*pages) + total_pinned, NULL);
-		if (ret < 0) {
-			pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx], err: %d\n",
-			       start, end, ret);
-			goto out_err;
+		remaining = nr_pages;
+		cur = start;
+
+		while (remaining) {
+			chunk_pages = min(remaining, 256UL);
+			ret = pin_user_pages_remote(mm, cur, chunk_pages,
+						    gup_flags,
+						    (*pages) + total_pinned,
+						    NULL);
+			if (ret < 0) {
+				pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx, err: %d\n",
+				       start, end, cur, ret);
+				goto out_err;
+			}
+			if (!ret) {
+				pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx: zero pages pinned\n",
+				       start, end, cur);
+				ret = -EFAULT;
+				goto out_err;
+			}
+
+			total_pinned += ret;
+			remaining -= ret;
+			cur += (unsigned long)ret * PAGE_SIZE;
+			cond_resched();
 		}
 
-		pr_info("Deko: Pinned %d pages for VMA [0x%lx-0x%lx]\n", ret,
-			start, end);
-
-		total_pinned += ret;
+		pr_info("Deko: Pinned %lu pages for VMA [0x%lx-0x%lx]\n",
+			nr_pages, start, end);
 	}
 
 	mmap_read_unlock(mm);
@@ -325,7 +344,8 @@ out_err:
 }
 
 static int deko_notify_monitor_migration(unsigned int old_cpu,
-					 unsigned int new_cpu)
+					 unsigned int new_cpu,
+					 u64 *migration_version)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
@@ -348,6 +368,24 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 		return -EIO;
 	}
 
+	if (migration_version)
+		*migration_version = call.rdx_out;
+
+	return 0;
+}
+
+static int deko_prepare_launch_app_call(struct svsm_call *call,
+					const struct pt_regs *regs,
+					u64 migration_version)
+{
+	call->caa = svsm_get_caa();
+	if (unlikely(!call->caa))
+		return -ENODEV;
+
+	memcpy(call->caa->svsm_buffer, regs, sizeof(*regs));
+	call->r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	call->r8 = migration_version;
+
 	return 0;
 }
 
@@ -361,6 +399,7 @@ void deko_proxy_loop(struct callback_head *work)
 	int pinned_count;
 	struct page **pages = NULL;
 	unsigned int monitored_cpu;
+	u64 migration_version = 0;
 	bool normal_exit = false;
 	enum es_result res;
 
@@ -398,13 +437,11 @@ void deko_proxy_loop(struct callback_head *work)
 
 	pr_info("Deko: Entering proxy loop for task %d\n", current->pid);
 
-	call.caa = svsm_get_caa();
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
-	memcpy(svsm_get_caa()->svsm_buffer, regs, sizeof(struct pt_regs));
-	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 	/* Shared buffer between VMPL1 and VMPL2. */
 	call.rcx = (u64)buf;
 	call.rdx = tgid;
+	call.r8 = 0;
 
 	current->is_monitored = true;
 	monitored_cpu = smp_processor_id();
@@ -417,9 +454,10 @@ void deko_proxy_loop(struct callback_head *work)
 			pr_info("Deko: Detected CPU migration for task %d, from CPU %u to CPU %u\n",
 				current->pid, monitored_cpu, current_cpu);
 
-			errno = deko_notify_monitor_migration(monitored_cpu,
-							      current_cpu);
-			if (unlikely(errno))
+			/* Read the version number of the migrated CPU. */
+			errno = deko_notify_monitor_migration(
+				monitored_cpu, current_cpu, &migration_version);
+			if (unlikely(errno < 0))
 				goto err_loop;
 			monitored_cpu = current_cpu;
 
@@ -428,13 +466,20 @@ void deko_proxy_loop(struct callback_head *work)
 			continue;
 		}
 
+		errno = deko_prepare_launch_app_call(&call, regs,
+						     migration_version);
+		if (unlikely(errno < 0))
+			goto err_loop;
+
 		res = svsm_perform_call_protocol(&call);
 		if (res != ES_OK) {
-			pr_err("Deko: Failed to perform call protocol for task %d, err: %d\n",
+			pr_err("Deko: Failed to perform call launch protocol for task %d, err: %d\n",
 			       current->pid, res);
 			errno = -EINVAL;
 			goto err_loop;
 		}
+
+		migration_version = 0;
 
 		switch (call.rax_out) {
 		case DEKO_SERVICE_APP_ENTER_OK:
