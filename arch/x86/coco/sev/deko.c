@@ -365,12 +365,14 @@ out_err:
 
 static int deko_notify_monitor_migration(unsigned int old_cpu,
 					 unsigned int new_cpu,
+					 const struct pt_regs *regs,
 					 u64 *migration_version)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
 	unsigned long old_user_rsp;
+	unsigned long user_rsp;
 	unsigned long flags;
 
 	if (old_cpu == new_cpu || !current->is_monitored)
@@ -387,7 +389,8 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 
 	req = (struct deko_migration_req *)call.caa->svsm_buffer;
 	old_user_rsp = per_cpu(pcpu_hot.user_rsp, old_cpu);
-	this_cpu_write(pcpu_hot.user_rsp, old_user_rsp);
+	user_rsp = old_user_rsp ? old_user_rsp : regs->sp;
+	this_cpu_write(pcpu_hot.user_rsp, user_rsp);
 
 	req->old_cpu = old_cpu;
 	req->new_cpu = new_cpu;
@@ -487,6 +490,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 	current->is_monitored = true;
 	monitored_cpu = smp_processor_id();
+	this_cpu_write(pcpu_hot.user_rsp, regs->sp);
 
 	/* Application main loop. */
 	for (;;) {
@@ -501,7 +505,8 @@ void deko_proxy_loop(struct callback_head *work)
 				current->pid, monitored_cpu, current_cpu);
 			/* Read the version number of the migrated CPU. */
 			errno = deko_notify_monitor_migration(
-				monitored_cpu, current_cpu, &migration_version);
+				monitored_cpu, current_cpu, regs,
+				&migration_version);
 
 			if (unlikely(errno < 0)) {
 				goto err_loop;
@@ -515,6 +520,7 @@ void deko_proxy_loop(struct callback_head *work)
 			continue;
 		}
 
+		this_cpu_write(pcpu_hot.user_rsp, regs->sp);
 		errno = deko_prepare_launch_app_call(&call, regs,
 						     migration_version);
 		if (unlikely(errno < 0)) {
