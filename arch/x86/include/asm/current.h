@@ -22,6 +22,8 @@ struct pcpu_hot {
 			u64			call_depth;
 #endif
 			unsigned long		top_of_stack;
+			unsigned long		user_rsp;
+			unsigned long		vmpl1_rsp;
 			void			*hardirq_stack_ptr;
 			u16			softirq_pending;
 #ifdef CONFIG_X86_64

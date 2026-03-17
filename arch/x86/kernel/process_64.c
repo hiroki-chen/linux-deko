@@ -54,6 +54,7 @@
 #include <asm/xen/hypervisor.h>
 #include <asm/vdso.h>
 #include <asm/resctrl.h>
+#include <asm/sev.h>
 #include <asm/unistd.h>
 #include <asm/fsgsbase.h>
 #include <asm/fred.h>
@@ -669,7 +670,11 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 * Switch the PDA and FPU contexts.
 	 */
 	raw_cpu_write(pcpu_hot.current_task, next_p);
+	prev->kernel_vmpl1_rsp = raw_cpu_read(pcpu_hot.vmpl1_rsp);
 	raw_cpu_write(pcpu_hot.top_of_stack, task_top_of_stack(next_p));
+	raw_cpu_write(pcpu_hot.vmpl1_rsp, next->kernel_vmpl1_rsp);
+	this_cpu_write(deko_kernel_vmpl1_rsp,
+		       (u64)next->kernel_vmpl1_rsp);
 
 	switch_fpu_finish(next_p);
 

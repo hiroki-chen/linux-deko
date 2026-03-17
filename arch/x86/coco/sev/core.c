@@ -38,6 +38,7 @@
 #include <asm/stacktrace.h>
 #include <asm/sev.h>
 #include <asm/insn-eval.h>
+#include <asm/fsgsbase.h>
 #include <asm/fpu/xcr.h>
 #include <asm/processor.h>
 #include <asm/realmode.h>
@@ -119,6 +120,7 @@ static const char *const sev_status_feat_names[] = {
 };
 
 DEFINE_PER_CPU(u64, deko_sysret_trampoline);
+DEFINE_PER_CPU(u64, deko_kernel_vmpl1_rsp);
 
 /* For early boot hypervisor communication in SEV-ES enabled guests */
 static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
@@ -1710,6 +1712,26 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	struct svsm_call call = { 0 };
 	u64 stack_size = 0;
 	struct vm_area_struct *vma;
+	unsigned long flags;
+
+	unsigned long start_code = 0;
+  unsigned long end_code = 0;
+  unsigned long user_stack = 0;
+
+	if (task->mm) {
+    start_code = task->mm->start_code;
+    end_code = task->mm->end_code;
+    user_stack = task->mm->start_stack;
+
+    mmap_read_lock(task->mm);
+    vma = find_vma(task->mm, task->mm->start_stack);
+    if (vma && vma->vm_start <= task->mm->start_stack) {
+      stack_size = vma->vm_end - vma->vm_start;
+    }
+    mmap_read_unlock(task->mm);
+  }
+
+	local_irq_save(flags);
 
 	/* Re-use the SVSM buffer for allocating the request body. */
 	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
@@ -1720,30 +1742,15 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
 	req->mnt_ns_id = 0;
-
-	if (task->mm) {
-		req->start_code = task->mm->start_code;
-		req->end_code = task->mm->end_code;
-		req->user_stack = task->mm->start_stack;
-
-		mmap_read_lock(task->mm);
-
-		vma = find_vma(task->mm, task->mm->start_stack);
-
-		if (vma && vma->vm_start <= task->mm->start_stack) {
-			stack_size = vma->vm_end - vma->vm_start;
-		}
-
-		mmap_read_unlock(task->mm);
-	} else {
-		req->start_code = 0;
-		req->end_code = 0;
-		req->user_stack = 0;
-	}
-
-	req->user_stack_size = stack_size;
-
-	req->app_type = ty;
+	req->start_code = start_code;
+  req->end_code = end_code;
+  req->user_stack = user_stack;
+  req->user_stack_size = stack_size;
+  
+  req->fs_base = x86_fsbase_read_task(task);
+  req->gs_base = x86_gsbase_read_task(task);
+  req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task));
+  req->app_type = ty;
 
 	strscpy(req->comm, task->comm, sizeof(req->comm));
 
@@ -1759,9 +1766,11 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 		ret = ES_UNSUPPORTED;
 
 	if (creation && ty == DEKO_DOCKER_APPS) {
-		*token_low = req->token_low;
-		*token_high = req->token_high;
+		*token_low = req->kernel_vmpl1_rsp;
+		*token_high = 0;
 	}
+
+	local_irq_restore(flags);
 
 	return ret;
 }

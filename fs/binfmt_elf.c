@@ -52,6 +52,7 @@
 #include <asm/page.h>
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/current.h>
 #include <asm/sev.h>
 #include "mount.h"
 #endif
@@ -1590,6 +1591,13 @@ out_free_interp:
 		if (res != ES_OK) {
 			pr_err("Deko: SVSM rejected process %s (App=%d)\n",
 			       current->comm, is_app);
+		} else if (is_app) {
+			current->thread.kernel_vmpl1_rsp = regs->cx;
+			this_cpu_write(pcpu_hot.vmpl1_rsp, current->thread.kernel_vmpl1_rsp);
+			this_cpu_write(deko_kernel_vmpl1_rsp, current->thread.kernel_vmpl1_rsp);
+
+			pr_info("the rsp is set to %llx for process %s (App=%d)\n",
+				current->thread.kernel_vmpl1_rsp, current->comm, is_app);
 		}
 	}
 

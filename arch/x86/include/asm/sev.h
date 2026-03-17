@@ -45,8 +45,10 @@ struct deko_new_app_req {
 	u64 user_stack;
 	u64 user_stack_size;
 	char comm[16];
-	u64 token_low;
-	u64 token_high;
+	u64 kernel_vmpl1_rsp;
+	u64 fs_base;
+	u64 gs_base;
+	u64 kernel_gs_base;
 	enum deko_new_app_type app_type;
 } __attribute__((aligned(8)));
 
@@ -147,6 +149,7 @@ struct rmp_state {
 #define RMPADJUST_VMSA_PAGE_BIT BIT(16)
 
 DECLARE_PER_CPU(u64, deko_sysret_trampoline);
+DECLARE_PER_CPU(u64, deko_kernel_vmpl1_rsp);
 
 /* SNP Guest message request */
 struct snp_req_data {

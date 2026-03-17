@@ -7,6 +7,8 @@
  * Author: Hiroki Chen <haobchen@iu.edu>
  */
 
+#define pr_fmt(fmt) "Deko: CPU%u: " fmt, raw_smp_processor_id()
+
 #include "linux/printk.h"
 #include "linux/sched.h"
 #define CREATE_TRACE_POINTS
@@ -28,6 +30,7 @@
 #include <asm-generic/mman-common.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
+#include <asm/current.h>
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
@@ -65,6 +68,15 @@ struct deko_syscall_body {
 	u64 __reserved;
 };
 
+struct deko_migration_req {
+	u32 old_cpu;
+	u32 new_cpu;
+	u32 pid;
+	u32 _reserved;
+	u64 kernel_gs_base; /*  Linux Per-CPU  */
+	u64 user_gs_base; /*  TLS  */
+};
+
 struct deko_shared_buf {
 	struct deko_syscall_body syscall_body;
 	void *buf;
@@ -84,7 +96,7 @@ static int mmap_post_handler(struct mm_struct *mm, unsigned long start_addr,
 	unsigned int fault_flags = FAULT_FLAG_USER;
 	int ret;
 
-	pr_info("Deko: Handling mmap post, start_addr: 0x%lx, length: 0x%lx, prot: 0x%lx, ax: 0x%lx\n",
+	pr_info("Handling mmap post, start_addr: 0x%lx, length: 0x%lx, prot: 0x%lx, ax: 0x%lx\n",
 		start_addr, length, prot, ax);
 
 	/* For mmap calls, we do an eager mapping to prevent page faults. */
@@ -100,7 +112,7 @@ static int mmap_post_handler(struct mm_struct *mm, unsigned long start_addr,
 				ret = fixup_user_fault(mm, addr, fault_flags,
 						       NULL);
 				if (ret < 0) {
-					pr_warn("Deko: Failed to fault in page for mmap at 0x%lx, err: %d\n",
+					pr_warn("Failed to fault in page for mmap at 0x%lx, err: %d\n",
 						start_addr, ret);
 					break;
 				}
@@ -124,8 +136,8 @@ static int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
 	if (!mm || new_brk <= old_brk || start_addr >= end_addr)
 		return 0;
 
-	pr_info("Deko: Handling brk post, old_brk: 0x%lx, new_brk: 0x%lx\n",
-		old_brk, new_brk);
+	pr_info("Handling brk post, old_brk: 0x%lx, new_brk: 0x%lx\n", old_brk,
+		new_brk);
 
 	mmap_read_lock(mm);
 
@@ -133,7 +145,7 @@ static int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
 		ret = fixup_user_fault(
 			mm, addr, FAULT_FLAG_USER | FAULT_FLAG_WRITE, NULL);
 		if (ret < 0) {
-			pr_warn("Deko: Failed to fault in page for brk at 0x%lx, err: %d\n",
+			pr_warn("Failed to fault in page for brk at 0x%lx, err: %d\n",
 				addr, ret);
 			break;
 		}
@@ -148,20 +160,28 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
-	struct deko_new_app_req *req =
-		(struct deko_new_app_req *)svsm_get_caa()->svsm_buffer;
+	struct deko_new_app_req *req;
+	unsigned long flags;
+
+	local_irq_save(flags);
+
+	req = (struct deko_new_app_req *)svsm_get_caa()->svsm_buffer;
 
 	req->tgid = current->tgid;
-	req->pid = current->pid;
+	req->pid = current->tgid;
 	req->ppid = current->real_parent->pid;
 	req->app_type = DEKO_DOCKER_APPS;
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 	call.r8 = 0; /* Not a creation event */
+
 	res = svsm_perform_call_protocol(&call);
+
+	local_irq_restore(flags);
+
 	if (res != ES_OK) {
-		pr_err("Deko: Failed to report app exit to SVSM for process %s (pid: %d), err: %d\n",
+		pr_err("Failed to report app exit to SVSM for process %s (pid: %d), err: %d\n",
 		       current->comm, current->pid, res);
 
 		return -EINVAL;
@@ -213,7 +233,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	unsigned long old_brk = 0;
 
 	if (unlikely(syscall_body->ax >= NR_syscalls)) {
-		pr_warn("Deko: Invalid syscall number %llu from VMPL1\n",
+		pr_warn("Invalid syscall number %llu from VMPL1\n",
 			syscall_body->ax);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
@@ -235,7 +255,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 
 	syscall_fn = sys_call_table[syscall_body->ax];
 	if (unlikely(!syscall_fn)) {
-		pr_warn("Deko: Missing syscall handler for syscall number %llu\n",
+		pr_warn("Missing syscall handler for syscall number %llu\n",
 			syscall_body->ax);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
@@ -265,7 +285,7 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 	*pages = kvmalloc_array(expected_pages, sizeof(struct page *),
 				GFP_KERNEL);
 	if (!*pages) {
-		pr_err("Deko: Failed to allocate page pointer array\n");
+		pr_err("Failed to allocate page pointer array\n");
 		return -ENOMEM;
 	}
 
@@ -283,7 +303,7 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 			ret = fixup_user_fault(mm, start, FAULT_FLAG_USER,
 					       NULL);
 			if (ret < 0) {
-				pr_warn("Deko: Failed to fault in special VMA at 0x%lx, err: %d\n",
+				pr_warn("Failed to fault in special VMA at 0x%lx, err: %d\n",
 					start, ret);
 			}
 			cond_resched();
@@ -303,12 +323,12 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 						    (*pages) + total_pinned,
 						    NULL);
 			if (ret < 0) {
-				pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx, err: %d\n",
+				pr_err("Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx, err: %d\n",
 				       start, end, cur, ret);
 				goto out_err;
 			}
 			if (!ret) {
-				pr_err("Deko: Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx: zero pages pinned\n",
+				pr_err("Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx: zero pages pinned\n",
 				       start, end, cur);
 				ret = -EFAULT;
 				goto out_err;
@@ -320,13 +340,13 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 			cond_resched();
 		}
 
-		pr_info("Deko: Pinned %lu pages for VMA [0x%lx-0x%lx]\n",
-			nr_pages, start, end);
+		pr_info("Pinned %lu pages for VMA [0x%lx-0x%lx]\n", nr_pages,
+			start, end);
 	}
 
 	mmap_read_unlock(mm);
 
-	pr_info("Deko: Successfully pinned %lu pages out of total_vm %lu\n",
+	pr_info("Successfully pinned %lu pages out of total_vm %lu\n",
 		total_pinned, expected_pages);
 
 	return total_pinned;
@@ -349,22 +369,43 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
+	struct deko_migration_req *req;
+	unsigned long old_user_rsp;
+	unsigned long flags;
 
 	if (old_cpu == new_cpu || !current->is_monitored)
 		return 0;
 
+	local_irq_save(flags);
+
 	call.caa = svsm_get_caa();
-	if (unlikely(!call.caa))
+	if (unlikely(!call.caa)) {
+		local_irq_restore(flags);
+
 		return -ENODEV;
+	}
+
+	req = (struct deko_migration_req *)call.caa->svsm_buffer;
+	old_user_rsp = per_cpu(pcpu_hot.user_rsp, old_cpu);
+	this_cpu_write(pcpu_hot.user_rsp, old_user_rsp);
+
+	req->old_cpu = old_cpu;
+	req->new_cpu = new_cpu;
+	req->pid = current->tgid;
+
+	req->kernel_gs_base = (u64)cpu_kernelmode_gs_base(new_cpu);
+	req->user_gs_base = x86_gsbase_read_task(current);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
-	call.rdx = old_cpu;
-	call.rcx = new_cpu;
-	call.r9 = current->pid;
+	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+
 	res = svsm_perform_call_protocol(&call);
+
+	local_irq_restore(flags);
+
 	if (unlikely(res != ES_OK)) {
-		pr_warn("Deko: Failed to notify monitor for task migration (pid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
-			current->pid, old_cpu, new_cpu, res);
+		pr_warn("Failed to notify monitor for task migration (app_id=%d, pid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
+			current->tgid, current->pid, old_cpu, new_cpu, res);
 		return -EIO;
 	}
 
@@ -402,6 +443,10 @@ void deko_proxy_loop(struct callback_head *work)
 	u64 migration_version = 0;
 	bool normal_exit = false;
 	enum es_result res;
+	unsigned long flags;
+
+	struct deko_task_work *dw =
+		container_of(work, struct deko_task_work, work);
 
 	/*
 	 * At first we need to pin all the memories of the newly launched
@@ -416,7 +461,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 	buf = kzalloc(sizeof(struct deko_shared_buf), GFP_KERNEL);
 	if (!buf) {
-		pr_err("Deko: Failed to allocate shared buffer for task %d\n",
+		pr_err("Failed to allocate shared buffer for task %d\n",
 		       current->pid);
 		errno = -ENOMEM;
 		goto err_buf;
@@ -426,16 +471,13 @@ void deko_proxy_loop(struct callback_head *work)
 
 	buf->buf = kzalloc(DEKO_DEFAULT_SHARED_BUF_SIZE, GFP_KERNEL);
 	if (!buf->buf) {
-		pr_err("Deko: Failed to allocate shared buffer for task %d\n",
+		pr_err("Failed to allocate shared buffer for task %d\n",
 		       current->pid);
 		errno = -ENOMEM;
 		goto err_inner_buf;
 	}
 
-	struct deko_task_work *dw =
-		container_of(work, struct deko_task_work, work);
-
-	pr_info("Deko: Entering proxy loop for task %d\n", current->pid);
+	pr_info("Entering proxy loop for task %d\n", current->pid);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	/* Shared buffer between VMPL1 and VMPL2. */
@@ -448,19 +490,26 @@ void deko_proxy_loop(struct callback_head *work)
 
 	/* Application main loop. */
 	for (;;) {
+		local_irq_save(flags);
+
 		unsigned int current_cpu = smp_processor_id();
 
 		if (unlikely(current_cpu != monitored_cpu)) {
-			pr_info("Deko: Detected CPU migration for task %d, from CPU %u to CPU %u\n",
-				current->pid, monitored_cpu, current_cpu);
+			local_irq_restore(flags);
 
+			pr_info("Detected CPU migration for task %d, from CPU %u to CPU %u\n",
+				current->pid, monitored_cpu, current_cpu);
 			/* Read the version number of the migrated CPU. */
 			errno = deko_notify_monitor_migration(
 				monitored_cpu, current_cpu, &migration_version);
-			if (unlikely(errno < 0))
-				goto err_loop;
-			monitored_cpu = current_cpu;
 
+			if (unlikely(errno < 0)) {
+				goto err_loop;
+			}
+
+			pr_info("Notified monitor about migration for task %d, new migration version: %llu\n",
+				current->pid, migration_version);
+			monitored_cpu = current_cpu;
 			call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 
 			continue;
@@ -468,16 +517,26 @@ void deko_proxy_loop(struct callback_head *work)
 
 		errno = deko_prepare_launch_app_call(&call, regs,
 						     migration_version);
-		if (unlikely(errno < 0))
-			goto err_loop;
+		if (unlikely(errno < 0)) {
+			local_irq_restore(flags);
 
+			goto err_loop;
+		}
+
+		pr_info("Performing call protocol for task %d, call.rax: 0x%llx, call.rdx: 0x%llx\n",
+			current->pid, call.rax, call.rdx);
 		res = svsm_perform_call_protocol(&call);
+		local_irq_restore(flags);
+
 		if (res != ES_OK) {
-			pr_err("Deko: Failed to perform call launch protocol for task %d, err: %d\n",
+			pr_err("Failed to perform call launch protocol for task %d, err: %d\n",
 			       current->pid, res);
 			errno = -EINVAL;
 			goto err_loop;
 		}
+
+		pr_info("Completed call protocol for task %d, call.rax_out: 0x%llx, call.rdx_out: 0x%llx\n",
+			current->pid, call.rax_out, call.rdx_out);
 
 		migration_version = 0;
 
@@ -486,7 +545,7 @@ void deko_proxy_loop(struct callback_head *work)
 			/* Handle system calls; if any. */
 			if ((errno = deko_app_handle_system_calls(
 				     &buf->syscall_body)) != 0) {
-				pr_err("Deko: Error handling system calls: %d\n",
+				pr_err("Error handling system calls: %d\n",
 				       errno);
 				goto err_loop;
 			}
@@ -495,7 +554,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 		case DEKO_TIMER_SERVICE:
 			pr_info_ratelimited(
-				"Deko: Received timer event from VMPL1 for task %d\n",
+				"Received timer event from VMPL1 for task %d\n",
 				current->pid);
 			/* Timer is hot-path: avoid log storm and always offer a
 			 * voluntary reschedule point to keep RCU/softirq forward progress. */
@@ -503,7 +562,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 			break;
 		default:
-			pr_warn("Deko: Received unknown call return value: 0x%llx\n",
+			pr_warn("Received unknown call return value: 0x%llx\n",
 				call.rax_out);
 			errno = -EINVAL;
 			goto err_loop;
