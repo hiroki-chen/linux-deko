@@ -85,73 +85,82 @@ static inline bool is_exit_syscall(u64 syscall_num)
 	return syscall_num == __NR_exit || syscall_num == __NR_exit_group;
 }
 
-static int mmap_post_handler(struct mm_struct *mm, unsigned long start_addr,
-			     unsigned long length, unsigned long prot,
-			     unsigned long ax)
+static int eager_fault_user_range(struct mm_struct *mm,
+				  unsigned long start_addr,
+				  unsigned long length, unsigned long prot,
+				  const char *reason)
 {
-	unsigned long end_addr = PAGE_ALIGN(start_addr + length);
-	unsigned long addr;
-	unsigned int fault_flags = FAULT_FLAG_USER;
+	unsigned long end_addr;
 	int ret;
 
-	pr_info("Handling mmap post, start_addr: 0x%lx, length: 0x%lx, prot: 0x%lx, ax: 0x%lx\n",
-		start_addr, length, prot, ax);
+	if (!mm || !length || !prot)
+		return 0;
 
-	/* For mmap calls, we do an eager mapping to prevent page faults. */
-	if (!IS_ERR_VALUE(ax)) {
-		if (prot & PROT_WRITE)
-			fault_flags |= FAULT_FLAG_WRITE;
+	if (check_add_overflow(start_addr, length, &end_addr))
+		return -EINVAL;
 
-		if (likely(mm)) {
-			mmap_read_lock(mm);
+	end_addr = PAGE_ALIGN(end_addr);
+	start_addr = PAGE_ALIGN_DOWN(start_addr);
 
-			for (addr = start_addr; addr < end_addr;
-			     addr += PAGE_SIZE) {
-				ret = fixup_user_fault(mm, addr, fault_flags,
-						       NULL);
-				if (ret < 0) {
-					pr_warn("Failed to fault in page for mmap at 0x%lx, err: %d\n",
-						start_addr, ret);
-					break;
-				}
-			}
+	if (start_addr >= end_addr)
+		return 0;
 
-			mmap_read_unlock(mm);
-		}
-	}
+	trace_deko_eager_paging(reason, start_addr, length, prot);
+
+	ret = __mm_populate(start_addr, end_addr - start_addr, 0);
+	if (ret < 0)
+		pr_warn("Failed to populate range for %s at 0x%lx len 0x%lx, err: %d\n",
+			reason, start_addr, end_addr - start_addr, ret);
 
 	return 0;
 }
 
-static int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
-			    unsigned long new_brk)
+static inline int mmap_post_handler(struct mm_struct *mm,
+				    unsigned long start_addr,
+				    unsigned long length, unsigned long prot,
+				    unsigned long ax)
 {
-	unsigned long start_addr = PAGE_ALIGN(old_brk);
-	unsigned long end_addr = PAGE_ALIGN(new_brk);
-	unsigned long addr;
-	int ret;
-
-	if (!mm || new_brk <= old_brk || start_addr >= end_addr)
+	if (IS_ERR_VALUE(ax))
 		return 0;
 
-	pr_info("Handling brk post, old_brk: 0x%lx, new_brk: 0x%lx\n", old_brk,
-		new_brk);
+	return eager_fault_user_range(mm, start_addr, length, prot, "mmap");
+}
 
-	mmap_read_lock(mm);
+static inline int brk_post_handler(struct mm_struct *mm, unsigned long old_brk,
+				   unsigned long new_brk)
+{
+	if (!mm || new_brk <= old_brk)
+		return 0;
 
-	for (addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
-		ret = fixup_user_fault(
-			mm, addr, FAULT_FLAG_USER | FAULT_FLAG_WRITE, NULL);
-		if (ret < 0) {
-			pr_warn("Failed to fault in page for brk at 0x%lx, err: %d\n",
-				addr, ret);
-			break;
-		}
-	}
+	return eager_fault_user_range(mm, old_brk, new_brk - old_brk,
+				      PROT_READ | PROT_WRITE, "brk");
+}
 
-	mmap_read_unlock(mm);
+static inline int mremap_post_handler(struct mm_struct *mm,
+				      unsigned long ret_addr,
+				      unsigned long old_length,
+				      unsigned long new_length)
+{
+	unsigned long start_addr;
 
-	return 0;
+	if (!mm || IS_ERR_VALUE(ret_addr) || new_length <= old_length)
+		return 0;
+
+	start_addr = ret_addr + old_length;
+
+	return eager_fault_user_range(mm, start_addr, new_length - old_length,
+				      PROT_READ | PROT_WRITE, "mremap");
+}
+
+static inline int mprotect_post_handler(struct mm_struct *mm,
+					unsigned long start_addr,
+					unsigned long length,
+					unsigned long prot)
+{
+	if (!mm || !length || !(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
+		return 0;
+
+	return eager_fault_user_range(mm, start_addr, length, prot, "mprotect");
 }
 
 static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
@@ -204,6 +213,19 @@ deko_app_handle_system_calls_post(struct mm_struct *mm,
 		break;
 	case __NR_brk:
 		ret = brk_post_handler(mm, old_brk, ax);
+		if (ret < 0)
+			return ret;
+		break;
+	case __NR_mremap:
+		ret = mremap_post_handler(mm, ax, syscall_body->si,
+					  syscall_body->dx);
+		if (ret < 0)
+			return ret;
+		break;
+	case __NR_mprotect:
+	case __NR_pkey_mprotect:
+		ret = mprotect_post_handler(mm, syscall_body->di,
+					    syscall_body->si, syscall_body->dx);
 		if (ret < 0)
 			return ret;
 		break;
@@ -542,9 +564,8 @@ void deko_proxy_loop(struct callback_head *work)
 			break;
 
 		case DEKO_TIMER_SERVICE:
-			pr_info_ratelimited(
-				"Received timer event from VMPL1 for task %d\n",
-				current->pid);
+			trace_deko_timer_service(current->pid);
+
 			/* Timer is hot-path: avoid log storm and always offer a
 			 * voluntary reschedule point to keep RCU/softirq forward progress. */
 			cond_resched();

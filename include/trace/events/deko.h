@@ -75,6 +75,39 @@ TRACE_EVENT(deko_monitor_migration_detected,
 		      __entry->old_cpu, __entry->new_cpu)
 );
 
+TRACE_EVENT(deko_timer_service,
+	    TP_PROTO(pid_t pid),
+
+	    TP_ARGS(pid),
+
+	    TP_STRUCT__entry(__field(pid_t, pid)),
+
+	    TP_fast_assign(__entry->pid = pid;),
+
+	    TP_printk("pid=%d", __entry->pid)
+);
+
+TRACE_EVENT(deko_eager_paging,
+	    TP_PROTO(const char *reason, unsigned long start_addr,
+		     unsigned long length, unsigned long prot),
+
+	    TP_ARGS(reason, start_addr, length, prot),
+
+	    TP_STRUCT__entry(__string(reason, reason)
+			     __field(unsigned long, start_addr)
+			     __field(unsigned long, length)
+			     __field(unsigned long, prot)),
+
+	    TP_fast_assign(__assign_str(reason);
+			   __entry->start_addr = start_addr;
+			   __entry->length = length;
+			   __entry->prot = prot;),
+
+	    TP_printk("reason=%s start_addr=0x%lx length=0x%lx prot=0x%lx",
+		      __get_str(reason), __entry->start_addr,
+		      __entry->length, __entry->prot)
+);
+
 #endif
 
 #include <trace/define_trace.h>
