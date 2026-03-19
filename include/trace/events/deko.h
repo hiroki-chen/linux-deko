@@ -43,6 +43,38 @@ TRACE_EVENT(deko_syscall_exit,
 	    TP_printk("syscall=%llu ret=0x%llx", __entry->ax, __entry->ret)
 );
 
+TRACE_EVENT(deko_monitor_migration_notified,
+	    TP_PROTO(pid_t pid, u64 migration_version),
+
+	    TP_ARGS(pid, migration_version),
+
+	    TP_STRUCT__entry(__field(pid_t, pid)
+			     __field(u64, migration_version)),
+
+	    TP_fast_assign(__entry->pid = pid;
+			   __entry->migration_version = migration_version;),
+
+	    TP_printk("pid=%d migration_version=%llu", __entry->pid,
+		      __entry->migration_version)
+);
+
+TRACE_EVENT(deko_monitor_migration_detected,
+	    TP_PROTO(pid_t pid, unsigned int old_cpu, unsigned int new_cpu),
+
+	    TP_ARGS(pid, old_cpu, new_cpu),
+
+	    TP_STRUCT__entry(__field(pid_t, pid)
+			     __field(unsigned int, old_cpu)
+			     __field(unsigned int, new_cpu)),
+
+	    TP_fast_assign(__entry->pid = pid;
+			   __entry->old_cpu = old_cpu;
+			   __entry->new_cpu = new_cpu;),
+
+	    TP_printk("pid=%d old_cpu=%u new_cpu=%u", __entry->pid,
+		      __entry->old_cpu, __entry->new_cpu)
+);
+
 #endif
 
 #include <trace/define_trace.h>

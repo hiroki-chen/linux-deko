@@ -9,8 +9,6 @@
 
 #define pr_fmt(fmt) "Deko: CPU%u: " fmt, raw_smp_processor_id()
 
-#include "linux/printk.h"
-#include "linux/sched.h"
 #define CREATE_TRACE_POINTS
 
 #include <trace/events/deko.h>
@@ -365,14 +363,12 @@ out_err:
 
 static int deko_notify_monitor_migration(unsigned int old_cpu,
 					 unsigned int new_cpu,
-					 const struct pt_regs *regs,
 					 u64 *migration_version)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
 	unsigned long old_user_rsp;
-	unsigned long user_rsp;
 	unsigned long flags;
 
 	if (old_cpu == new_cpu || !current->is_monitored)
@@ -389,8 +385,7 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 
 	req = (struct deko_migration_req *)call.caa->svsm_buffer;
 	old_user_rsp = per_cpu(pcpu_hot.user_rsp, old_cpu);
-	user_rsp = old_user_rsp ? old_user_rsp : regs->sp;
-	this_cpu_write(pcpu_hot.user_rsp, user_rsp);
+	this_cpu_write(pcpu_hot.user_rsp, old_user_rsp);
 
 	req->old_cpu = old_cpu;
 	req->new_cpu = new_cpu;
@@ -470,8 +465,6 @@ void deko_proxy_loop(struct callback_head *work)
 		goto err_buf;
 	}
 
-	pr_info("Allocated buf at %px for task %d\n", buf, current->pid);
-
 	buf->buf = kzalloc(DEKO_DEFAULT_SHARED_BUF_SIZE, GFP_KERNEL);
 	if (!buf->buf) {
 		pr_err("Failed to allocate shared buffer for task %d\n",
@@ -479,8 +472,6 @@ void deko_proxy_loop(struct callback_head *work)
 		errno = -ENOMEM;
 		goto err_inner_buf;
 	}
-
-	pr_info("Entering proxy loop for task %d\n", current->pid);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	/* Shared buffer between VMPL1 and VMPL2. */
@@ -490,7 +481,6 @@ void deko_proxy_loop(struct callback_head *work)
 
 	current->is_monitored = true;
 	monitored_cpu = smp_processor_id();
-	this_cpu_write(pcpu_hot.user_rsp, regs->sp);
 
 	/* Application main loop. */
 	for (;;) {
@@ -501,18 +491,17 @@ void deko_proxy_loop(struct callback_head *work)
 		if (unlikely(current_cpu != monitored_cpu)) {
 			local_irq_restore(flags);
 
-			pr_info("Detected CPU migration for task %d, from CPU %u to CPU %u\n",
+			trace_deko_monitor_migration_detected(
 				current->pid, monitored_cpu, current_cpu);
 			/* Read the version number of the migrated CPU. */
 			errno = deko_notify_monitor_migration(
-				monitored_cpu, current_cpu, regs,
-				&migration_version);
+				monitored_cpu, current_cpu, &migration_version);
 
 			if (unlikely(errno < 0)) {
 				goto err_loop;
 			}
 
-			pr_info("Notified monitor about migration for task %d, new migration version: %llu\n",
+			trace_deko_monitor_migration_notified(
 				current->pid, migration_version);
 			monitored_cpu = current_cpu;
 			call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
@@ -520,7 +509,6 @@ void deko_proxy_loop(struct callback_head *work)
 			continue;
 		}
 
-		this_cpu_write(pcpu_hot.user_rsp, regs->sp);
 		errno = deko_prepare_launch_app_call(&call, regs,
 						     migration_version);
 		if (unlikely(errno < 0)) {
@@ -529,8 +517,6 @@ void deko_proxy_loop(struct callback_head *work)
 			goto err_loop;
 		}
 
-		pr_info("Performing call protocol for task %d, call.rax: 0x%llx, call.rdx: 0x%llx\n",
-			current->pid, call.rax, call.rdx);
 		res = svsm_perform_call_protocol(&call);
 		local_irq_restore(flags);
 
@@ -540,9 +526,6 @@ void deko_proxy_loop(struct callback_head *work)
 			errno = -EINVAL;
 			goto err_loop;
 		}
-
-		pr_info("Completed call protocol for task %d, call.rax_out: 0x%llx, call.rdx_out: 0x%llx\n",
-			current->pid, call.rax_out, call.rdx_out);
 
 		migration_version = 0;
 
