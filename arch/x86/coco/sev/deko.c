@@ -15,10 +15,12 @@
 
 #undef CREATE_TRACE_POINTS
 
+#include <linux/hashtable.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/mmap_lock.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/sizes.h>
 #include <linux/smp.h>
 #include <linux/slab.h>
@@ -32,6 +34,107 @@
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
+#define DEKO_DOMAIN_BITS 8
+
+struct deko_domain_entry {
+	u64 mnt_ns_id;
+	u32 domain_id;
+	struct hlist_node node;
+};
+
+static DEFINE_HASHTABLE(deko_domain_table, DEKO_DOMAIN_BITS);
+static DEFINE_MUTEX(deko_domain_lock);
+
+static struct deko_domain_entry *deko_domain_find_locked(u64 mnt_ns_id)
+{
+	struct deko_domain_entry *entry;
+
+	hash_for_each_possible(deko_domain_table, entry, node, mnt_ns_id) {
+		if (entry->mnt_ns_id == mnt_ns_id)
+			return entry;
+	}
+
+	return NULL;
+}
+
+int deko_domain_bind(u64 mnt_ns_id, u32 domain_id)
+{
+	struct deko_domain_entry *entry;
+
+	if (!mnt_ns_id || !domain_id)
+		return -EINVAL;
+
+	mutex_lock(&deko_domain_lock);
+
+	entry = deko_domain_find_locked(mnt_ns_id);
+	if (entry) {
+		int ret = (entry->domain_id == domain_id) ? 0 : -EEXIST;
+
+		mutex_unlock(&deko_domain_lock);
+		return ret;
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		mutex_unlock(&deko_domain_lock);
+		return -ENOMEM;
+	}
+
+	entry->mnt_ns_id = mnt_ns_id;
+	entry->domain_id = domain_id;
+	hash_add(deko_domain_table, &entry->node, entry->mnt_ns_id);
+
+	mutex_unlock(&deko_domain_lock);
+
+	pr_info("bind mnt_ns_id=%llu domain_id=%u\n", mnt_ns_id, domain_id);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(deko_domain_bind);
+
+int deko_domain_lookup(u64 mnt_ns_id, u32 *domain_id)
+{
+	struct deko_domain_entry *entry;
+	int ret = -ENOENT;
+
+	if (!mnt_ns_id || !domain_id)
+		return -EINVAL;
+
+	mutex_lock(&deko_domain_lock);
+	entry = deko_domain_find_locked(mnt_ns_id);
+	if (entry) {
+		*domain_id = entry->domain_id;
+		ret = 0;
+	}
+	mutex_unlock(&deko_domain_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(deko_domain_lookup);
+
+int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id)
+{
+	struct deko_domain_entry *entry;
+
+	if (!mnt_ns_id)
+		return -EINVAL;
+
+	mutex_lock(&deko_domain_lock);
+	entry = deko_domain_find_locked(mnt_ns_id);
+	if (!entry) {
+		mutex_unlock(&deko_domain_lock);
+		return -ENOENT;
+	}
+	if (domain_id && entry->domain_id != domain_id) {
+		mutex_unlock(&deko_domain_lock);
+		return -EEXIST;
+	}
+	hash_del(&entry->node);
+	mutex_unlock(&deko_domain_lock);
+	pr_info("unbind mnt_ns_id=%llu domain_id=%u\n", entry->mnt_ns_id, entry->domain_id);
+	kfree(entry);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(deko_domain_unbind);
 
 extern const sys_call_ptr_t sys_call_table[];
 
@@ -199,12 +302,13 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 
 static int
 deko_app_handle_system_calls_post(struct mm_struct *mm,
-				  struct deko_syscall_body *syscall_body,
-				  unsigned long ax, unsigned long old_brk)
+			  struct deko_syscall_body *syscall_body,
+			  unsigned long syscall_nr, unsigned long ax,
+			  unsigned long old_brk)
 {
 	int ret;
 
-	switch (syscall_body->ax) {
+	switch (syscall_nr) {
 	case __NR_mmap:
 		ret = mmap_post_handler(mm, ax, syscall_body->si,
 					syscall_body->dx, ax);
@@ -249,17 +353,20 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 {
 	struct pt_regs tmp_regs = { 0 };
 	sys_call_ptr_t syscall_fn;
+	unsigned long syscall_nr;
 	unsigned long sys_retval;
 	unsigned long old_brk = 0;
 
-	if (unlikely(syscall_body->ax >= NR_syscalls)) {
+	syscall_nr = syscall_body->ax;
+
+	if (unlikely(syscall_nr >= NR_syscalls)) {
 		pr_warn("Invalid syscall number %llu from VMPL1\n",
-			syscall_body->ax);
+			syscall_nr);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
 	}
 
-	trace_deko_syscall_entry(syscall_body->ax, syscall_body->di,
+	trace_deko_syscall_entry(syscall_nr, syscall_body->di,
 				 syscall_body->si, syscall_body->dx);
 
 	tmp_regs.di = syscall_body->di;
@@ -268,25 +375,26 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	tmp_regs.r10 = syscall_body->r10;
 	tmp_regs.r8 = syscall_body->r8;
 	tmp_regs.r9 = syscall_body->r9;
-	tmp_regs.orig_ax = syscall_body->ax;
+	tmp_regs.orig_ax = syscall_nr;
 
 	if (current->mm)
 		old_brk = current->mm->brk;
 
-	syscall_fn = sys_call_table[syscall_body->ax];
+	syscall_fn = sys_call_table[syscall_nr];
 	if (unlikely(!syscall_fn)) {
 		pr_warn("Missing syscall handler for syscall number %llu\n",
-			syscall_body->ax);
+			syscall_nr);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
 	}
 
 	sys_retval = syscall_fn(&tmp_regs);
 
+
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
 
 	return deko_app_handle_system_calls_post(current->mm, syscall_body,
-						 sys_retval, old_brk);
+					 syscall_nr, sys_retval, old_brk);
 }
 
 static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
@@ -461,6 +569,7 @@ void deko_proxy_loop(struct callback_head *work)
 	struct page **pages = NULL;
 	unsigned int monitored_cpu;
 	u64 migration_version = 0;
+	u64 handled_syscall_nr = 0;
 	bool normal_exit = false;
 	enum es_result res;
 	unsigned long flags;
@@ -530,7 +639,6 @@ void deko_proxy_loop(struct callback_head *work)
 
 			continue;
 		}
-
 		errno = deko_prepare_launch_app_call(&call, regs,
 						     migration_version);
 		if (unlikely(errno < 0)) {
@@ -538,10 +646,8 @@ void deko_proxy_loop(struct callback_head *work)
 
 			goto err_loop;
 		}
-
 		res = svsm_perform_call_protocol(&call);
 		local_irq_restore(flags);
-
 		if (res != ES_OK) {
 			pr_err("Failed to perform call launch protocol for task %d, err: %d\n",
 			       current->pid, res);
@@ -550,10 +656,10 @@ void deko_proxy_loop(struct callback_head *work)
 		}
 
 		migration_version = 0;
-
 		switch (call.rax_out) {
 		case DEKO_SERVICE_APP_ENTER_OK:
 			/* Handle system calls; if any. */
+			handled_syscall_nr = buf->syscall_body.ax;
 			if ((errno = deko_app_handle_system_calls(
 				     &buf->syscall_body)) != 0) {
 				pr_err("Error handling system calls: %d\n",
@@ -578,8 +684,7 @@ void deko_proxy_loop(struct callback_head *work)
 			goto err_loop;
 		}
 
-		if (buf->syscall_body.ax == __NR_exit ||
-		    buf->syscall_body.ax == __NR_exit_group) {
+		if (is_exit_syscall(handled_syscall_nr)) {
 			normal_exit = true;
 			goto err_loop;
 		}

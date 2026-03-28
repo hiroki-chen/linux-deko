@@ -1701,6 +1701,45 @@ int __init alloc_isolated_trampoline(void)
 	return 0;
 }
 
+int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
+{
+	struct svsm_call call = { 0 };
+	struct deko_load_policy_req *req;
+	phys_addr_t req_pa;
+	unsigned long flags;
+	u64 max_blob_len;
+	int ret = 0;
+
+	if (!domain_id || !buf || !len)
+		return -EINVAL;
+
+	max_blob_len = sizeof_field(struct svsm_ca, svsm_buffer) - sizeof(*req);
+	if (len > max_blob_len)
+		return -E2BIG;
+
+	local_irq_save(flags);
+
+	req = (struct deko_load_policy_req *)(svsm_get_caa()->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+
+	req->domain_id = domain_id;
+	req->reserved = 0;
+	req->blob_gpa = req_pa + sizeof(*req);
+	req->blob_len = len;
+	memcpy(req + 1, buf, len);
+
+	call.caa = svsm_get_caa();
+	call.r9 = req_pa;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LOAD_POLICY);
+
+	if (svsm_perform_call_protocol(&call))
+		ret = -EOPNOTSUPP;
+
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
+
 enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 				     bool creation, unsigned long *token_low,
 				     unsigned long *token_high,
@@ -1741,6 +1780,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->ppid = task->real_parent->pid;
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
+	req->domain_id = 0;
 	req->mnt_ns_id = 0;
 	req->start_code = start_code;
   req->end_code = end_code;
@@ -1756,6 +1796,13 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 	if (task->nsproxy && task->nsproxy->mnt_ns)
 		req->mnt_ns_id = ns_id;
+
+	if (ty == DEKO_DOCKER_APPS) {
+		if (deko_domain_lookup(req->mnt_ns_id, &req->domain_id)) {
+			local_irq_restore(flags);
+			return ES_UNSUPPORTED;
+		}
+	}
 
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
@@ -2536,40 +2583,10 @@ static enum es_result vc_handle_mwait(struct ghcb *ghcb,
 	return ES_OK;
 }
 
-static enum es_result vc_handle_vmmcall_user(struct ghcb *ghcb,
-					     struct es_em_ctxt *ctxt)
-{
-	enum es_result ret;
-	struct svsm_call call = { 0 };
-	struct pt_regs *regs = ctxt->regs;
-
-	/* Begin svsm call. */
-	call.caa = svsm_get_caa();
-	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
-
-	/* Fill in the caa buffer region with user register context */
-	memcpy(svsm_get_caa()->svsm_buffer, regs, sizeof(struct pt_regs));
-	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
-
-	ret = svsm_perform_call_protocol(&call);
-
-	if (ret)
-		return ret;
-
-	return ES_OK;
-}
-
 static enum es_result vc_handle_vmmcall(struct ghcb *ghcb,
 					struct es_em_ctxt *ctxt)
 {
 	enum es_result ret;
-
-	/*
-	 * We place a trampoline vmmcall to the user space to
-	 * jump to the SVSM handler.
-	 */
-	if (user_mode(ctxt->regs))
-		return vc_handle_vmmcall_user(ghcb, ctxt);
 
 	ghcb_set_rax(ghcb, ctxt->regs->ax);
 	ghcb_set_cpl(ghcb, user_mode(ctxt->regs) ? 3 : 0);

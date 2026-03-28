@@ -50,6 +50,14 @@ struct deko_new_app_req {
 	u64 gs_base;
 	u64 kernel_gs_base;
 	enum deko_new_app_type app_type;
+	u32 domain_id;
+} __attribute__((aligned(8)));
+
+struct deko_load_policy_req {
+	u32 domain_id;
+	u32 reserved;
+	u64 blob_gpa;
+	u64 blob_len;
 } __attribute__((aligned(8)));
 
 enum es_result {
@@ -111,6 +119,11 @@ extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    unsigned long *token_low,
 					    unsigned long *token_high,
 					    enum deko_new_app_type ty);
+
+extern int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len);
+extern int deko_domain_bind(u64 mnt_ns_id, u32 domain_id);
+extern int deko_domain_lookup(u64 mnt_ns_id, u32 *domain_id);
+extern int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id);
 
 /* Early IDT entry points for #VC handler */
 extern void vc_no_ghcb(void);
@@ -370,6 +383,7 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_EXTEND_LAUNCH_APP 3
 #define SVSM_EXTEND_MAP_IFC 4
 #define SVSM_EXTEND_TASK_MIGRATE 5
+#define SVSM_EXTEND_LOAD_POLICY 8
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

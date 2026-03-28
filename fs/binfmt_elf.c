@@ -117,46 +117,6 @@ static struct linux_binfmt elf_format = {
 #endif
 };
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
-static struct page *deko_trampoline_pages[2] = { NULL, NULL };
-
-static void deko_init_trampoline_once(void)
-{
-	struct page *p;
-	unsigned long tramp;
-	void *vaddr;
-
-	if (deko_trampoline_pages[0])
-		return;
-
-	p = alloc_page(GFP_KERNEL);
-	if (!p) {
-		pr_err("Deko: Failed to allocate trampoline page\n");
-		return;
-	}
-
-	SetPageReserved(p);
-
-	vaddr = page_address(p);
-	tramp = this_cpu_read(deko_sysret_trampoline);
-
-	pr_info("Deko: Initializing trampoline page at %p; copying from %lx\n",
-		vaddr, tramp);
-
-	print_hex_dump(KERN_INFO, "Deko: Trampoline code: ", DUMP_PREFIX_OFFSET,
-		       16, 1, (void *)tramp, 64, false);
-
-	memset(vaddr, 0, PAGE_SIZE);
-	memcpy(vaddr, (void *)tramp, 0x100);
-
-	deko_trampoline_pages[0] = p;
-	deko_trampoline_pages[1] = NULL;
-
-	pr_info("Deko: Trampoline page initialized at %p\n", vaddr);
-}
-
-#endif
-
 #define BAD_ADDR(x) (unlikely((unsigned long)(x) >= TASK_SIZE))
 
 /*
@@ -864,177 +824,6 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 	return ret == -ENOENT ? 0 : ret;
 }
 
-static inline bool comm_starts_with(const char *filename, const char *prefix)
-{
-	return strncmp(filename, prefix,
-		       min(strlen(prefix), (size_t)TASK_COMM_LEN - 1)) == 0;
-}
-
-static bool is_docker_infrastructure(struct linux_binprm *bprm)
-{
-	struct task_struct *task = current;
-	struct task_struct *parent;
-	int depth = 0;
-	const char *f = bprm->filename;
-
-	if (strstr(f, "runc"))
-		return true;
-	if (strstr(f, "docker-init"))
-		return true;
-	if (strstr(f, "containerd-shim"))
-		return true;
-	if (strstr(f, "conmon"))
-		return true;
-
-	if (strstr(f, "/proc/self/fd")) {
-		rcu_read_lock();
-
-		parent = rcu_dereference(task->real_parent);
-		while (parent && parent->pid > 1 && depth < 6) {
-			if (comm_starts_with(parent->comm,
-					     "containerd-shim") || // Docker/K8s
-			    comm_starts_with(parent->comm,
-					     "docker-init") || // Docker --init
-			    comm_starts_with(parent->comm,
-					     "conmon") || // Podman
-			    comm_starts_with(parent->comm,
-					     "crun") || // RedHat/Fedora
-			    comm_starts_with(parent->comm,
-					     "runsc") || // gVisor
-			    comm_starts_with(parent->comm,
-					     "lxc-") || // LXC
-			    comm_starts_with(parent->comm, "runc")) {
-				rcu_read_unlock();
-				return true;
-			}
-
-			parent = rcu_dereference(parent->real_parent);
-			depth++;
-		}
-
-		rcu_read_unlock();
-	}
-
-	return false;
-}
-
-static bool is_spawned_by_container_runtime(struct linux_binprm *bprm)
-{
-	struct task_struct *task = current;
-	struct task_struct *parent;
-	int depth = 0;
-	bool found_runtime_parent = false;
-	bool is_isolated_ns = false;
-
-	rcu_read_lock();
-
-	if (is_docker_infrastructure(bprm)) {
-		rcu_read_unlock();
-		return false;
-	}
-
-	if (task_active_pid_ns(task) != &init_pid_ns) {
-		is_isolated_ns = true;
-	}
-
-	while (task && task->pid > 1 && depth < 6) {
-		parent = rcu_dereference(task->real_parent);
-
-		if (!parent || parent == task)
-			break;
-
-		if (comm_starts_with(parent->comm,
-				     "containerd-shim") || // Docker/K8s
-		    comm_starts_with(parent->comm,
-				     "docker-init") || // Docker --init
-		    comm_starts_with(parent->comm,
-				     "conmon") || // Podman
-		    comm_starts_with(parent->comm,
-				     "crun") || // RedHat/Fedora
-		    comm_starts_with(parent->comm, "runsc") || // gVisor
-		    comm_starts_with(parent->comm, "lxc-") || // LXC
-		    comm_starts_with(parent->comm, "runc")) {
-			found_runtime_parent = true;
-			break;
-		}
-
-		task = parent;
-		depth++;
-	}
-
-	rcu_read_unlock();
-
-	if (is_isolated_ns) {
-		pr_info("Deko: Detected namespace isolation (PID NS != Init)\n");
-		return true;
-	}
-
-	if (found_runtime_parent) {
-		return true;
-	}
-
-	return false;
-}
-
-static bool is_target_app(struct linux_binprm *bprm)
-{
-	if (is_docker_infrastructure(bprm))
-		return false;
-
-	return is_spawned_by_container_runtime(bprm);
-}
-
-// static int deko_pin_range(struct mm_struct *mm, unsigned long start,
-// 			  unsigned long end, struct page ***out_pages)
-// {
-// 	unsigned long len;
-// 	unsigned long nr_pages;
-// 	struct page **pages;
-// 	int locked_pages;
-// 	unsigned long gup_flags = FOLL_FORCE | FOLL_LONGTERM;
-
-// 	if (end <= start)
-// 		return -EINVAL;
-
-// 	len = end - start;
-// 	nr_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-
-// 	pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
-// 	if (!pages)
-// 		return -ENOMEM;
-
-// 	locked_pages = pin_user_pages_remote(mm, start, nr_pages, gup_flags,
-// 					     pages, NULL);
-
-// 	if (locked_pages < 0) {
-// 		pr_err("Deko: Failed to pin pages: %d\n", locked_pages);
-// 		kvfree(pages);
-// 		return locked_pages;
-// 	}
-
-// 	*out_pages = pages;
-// 	return locked_pages;
-// }
-
-// static void bprm_force_load(struct mm_struct *mm)
-// {
-// 	struct page **pages = NULL;
-// 	int ret;
-
-// 	mmap_read_lock(mm);
-
-// 	ret = deko_pin_range(mm, mm->start_code, mm->end_code, &pages);
-
-// 	mmap_read_unlock(mm);
-
-// 	if (ret > 0) {
-// 		pr_info("Deko: Pinned %d code pages at %lx\n", ret,
-// 			mm->start_code);
-// 		// unpin_user_pages(pages, ret);
-// 		// kvfree(pages);
-// 	}
-// }
-
 static int load_elf_binary(struct linux_binprm *bprm)
 {
 	struct file *interpreter = NULL; /* to shut gcc up */
@@ -1057,8 +846,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct mm_struct *mm;
 	struct pt_regs *regs;
 	bool is_app = false;
-	bool is_infra = false;
-	enum es_result res;
+	enum es_result res = ES_OK;
 	struct deko_task_work *dw;
 
 	retval = -ENOEXEC;
@@ -1565,58 +1353,58 @@ out_free_interp:
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 	regs = current_pt_regs();
 	is_app = false;
-	is_infra = false;
+	{
+		u32 deko_domain_id = 0;
 
-	if (current->flags & PF_KTHREAD)
-		goto out_deko;
+		if (current->flags & PF_KTHREAD)
+			goto out_deko;
 
-	is_app = is_target_app(bprm);
-	if (!is_app) {
-		is_infra = is_docker_infrastructure(bprm);
-	}
+		if (sysctl_enable_vmpl_tramp && current->nsproxy &&
+		    current->nsproxy->mnt_ns &&
+		    !deko_domain_lookup(current->nsproxy->mnt_ns->ns.inum,
+					&deko_domain_id))
+			is_app = true;
 
-	if (!is_app && !is_infra)
-		goto out_deko;
+		if (!is_app)
+			goto out_deko;
 
-	if (is_app || is_infra) {
-		pr_info("Deko: Communicating with SVSM for process %s (App=%d)\n",
-			current->comm, is_app);
+		if (is_app) {
+			res = svsm_deko_new_app_req(
+				current, current->nsproxy->mnt_ns->ns.inum,
+				true, &regs->cx,
+				&regs->dx, /* Do not use ax as it will gets cleared */
+				DEKO_DOCKER_APPS);
 
-		res = svsm_deko_new_app_req(
-			current, current->nsproxy->mnt_ns->ns.inum, true,
-			&regs->cx,
-			&regs->dx, /* Do not use ax as it will gets cleared */
-			is_app ? DEKO_DOCKER_APPS : DEKO_DOCKER_INFRA);
-
-		if (res != ES_OK) {
-			pr_err("Deko: SVSM rejected process %s (App=%d)\n",
-			       current->comm, is_app);
-		} else if (is_app) {
-			current->thread.kernel_vmpl1_rsp = regs->cx;
-			this_cpu_write(pcpu_hot.vmpl1_rsp, current->thread.kernel_vmpl1_rsp);
-			this_cpu_write(deko_kernel_vmpl1_rsp, current->thread.kernel_vmpl1_rsp);
-
-			pr_info("the rsp is set to %llx for process %s (App=%d)\n",
-				current->thread.kernel_vmpl1_rsp, current->comm, is_app);
-		}
-	}
-
-	if (is_app && sysctl_enable_vmpl_tramp) {
-		regs->bx = elf_entry;
-		regs->r12 = bprm->p;
-
-		dw = kzalloc(sizeof(*dw), GFP_KERNEL);
-		if (!dw) {
-			pr_err("Deko: Failed to allocate task work for process %s\n",
-			       current->comm);
-			force_sig(SIGKILL);
-			return -ENOMEM;
+			if (res != ES_OK) {
+				pr_err("Deko: SVSM rejected process %s (App=%d)\n",
+				       current->comm, is_app);
+			} else {
+				current->thread.kernel_vmpl1_rsp = regs->cx;
+				this_cpu_write(
+					pcpu_hot.vmpl1_rsp,
+					current->thread.kernel_vmpl1_rsp);
+				this_cpu_write(
+					deko_kernel_vmpl1_rsp,
+					current->thread.kernel_vmpl1_rsp);
+			}
 		}
 
-		init_task_work(&dw->work, deko_proxy_loop);
-		task_work_add(current, &dw->work, TWA_RESUME);
-	}
+		if (res == ES_OK && is_app && sysctl_enable_vmpl_tramp) {
+			regs->bx = elf_entry;
+			regs->r12 = bprm->p;
 
+			dw = kzalloc(sizeof(*dw), GFP_KERNEL);
+			if (!dw) {
+				pr_err("Deko: Failed to allocate task work for process %s\n",
+				       current->comm);
+				force_sig(SIGKILL);
+				return -ENOMEM;
+			}
+
+			init_task_work(&dw->work, deko_proxy_loop);
+			task_work_add(current, &dw->work, TWA_RESUME);
+		}
+	}
 out_deko:
 #endif
 	retval = 0;

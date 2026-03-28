@@ -5685,21 +5685,23 @@ int sev_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn)
 static void prepare_hv_injection(struct vcpu_svm *svm, struct hvdb *hvdb)
 {
 	if (hvdb->events.no_further_signal) {
-		pr_info_ratelimited("KVM: hvdb skip inject vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u no_further=%u\n",
-				    svm->vcpu.vcpu_id, svm->vcpu.vcpu_parent->current_vmpl,
-				    hvdb->events.pending_events, hvdb->events.vector,
-				    hvdb->events.nmi, hvdb->events.mce,
-				    hvdb->events.no_further_signal);
+		pr_info_ratelimited(
+			"KVM: hvdb skip inject vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u no_further=%u\n",
+			svm->vcpu.vcpu_id, svm->vcpu.vcpu_parent->current_vmpl,
+			hvdb->events.pending_events, hvdb->events.vector,
+			hvdb->events.nmi, hvdb->events.mce,
+			hvdb->events.no_further_signal);
 		return;
 	}
 
 	svm->vmcb->control.event_inj = HV_VECTOR | SVM_EVTINJ_TYPE_EXEPT |
 				       SVM_EVTINJ_VALID;
 	svm->vmcb->control.event_inj_err = 0;
-	pr_info_ratelimited("KVM: hvdb arm inject vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u\n",
-			    svm->vcpu.vcpu_id, svm->vcpu.vcpu_parent->current_vmpl,
-			    hvdb->events.pending_events, hvdb->events.vector,
-			    hvdb->events.nmi, hvdb->events.mce);
+	pr_info_ratelimited(
+		"KVM: hvdb arm inject vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u\n",
+		svm->vcpu.vcpu_id, svm->vcpu.vcpu_parent->current_vmpl,
+		hvdb->events.pending_events, hvdb->events.vector,
+		hvdb->events.nmi, hvdb->events.mce);
 
 	hvdb->events.no_further_signal = 1;
 }
@@ -5817,9 +5819,10 @@ void sev_snp_cancel_injection(struct kvm_vcpu *vcpu)
 	if ((svm->vmcb->control.event_inj & SVM_EVTINJ_VEC_MASK) != HV_VECTOR)
 		return;
 
-	pr_info_ratelimited("KVM: hvdb cancel enter vcpu=%d vmpl=%d event_inj=0x%x\n",
-			    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
-			    svm->vmcb->control.event_inj);
+	pr_info_ratelimited(
+		"KVM: hvdb cancel enter vcpu=%d vmpl=%d event_inj=0x%x\n",
+		vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+		svm->vmcb->control.event_inj);
 
 	/*
 	 * Copy the information in the doorbell page into the event injection
@@ -5831,9 +5834,10 @@ void sev_snp_cancel_injection(struct kvm_vcpu *vcpu)
 
 	if (!hvdb->events.pending_events) {
 		/* No pending events, then event_inj field should be 0 */
-		pr_info_ratelimited("KVM: hvdb cancel no-pending vcpu=%d vmpl=%d event_inj=0x%x\n",
-				    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
-				    svm->vmcb->control.event_inj);
+		pr_info_ratelimited(
+			"KVM: hvdb cancel no-pending vcpu=%d vmpl=%d event_inj=0x%x\n",
+			vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+			svm->vmcb->control.event_inj);
 		WARN_ON_ONCE(svm->vmcb->control.event_inj);
 		goto out;
 	}
@@ -5856,12 +5860,12 @@ void sev_snp_cancel_injection(struct kvm_vcpu *vcpu)
 		svm->vmcb->control.event_inj |= MC_VECTOR |
 						SVM_EVTINJ_TYPE_EXEPT;
 
-	pr_info_ratelimited("KVM: hvdb cancel rebuild vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u no_further=%u new_event_inj=0x%x\n",
-			    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
-			    hvdb->events.pending_events, hvdb->events.vector,
-			    hvdb->events.nmi, hvdb->events.mce,
-			    hvdb->events.no_further_signal,
-			    svm->vmcb->control.event_inj);
+	pr_info_ratelimited(
+		"KVM: hvdb cancel rebuild vcpu=%d vmpl=%d pending=0x%x vec=%u nmi=%u mce=%u no_further=%u new_event_inj=0x%x\n",
+		vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
+		hvdb->events.pending_events, hvdb->events.vector,
+		hvdb->events.nmi, hvdb->events.mce,
+		hvdb->events.no_further_signal, svm->vmcb->control.event_inj);
 
 	hvdb->events.pending_events = 0;
 

@@ -10674,12 +10674,6 @@ out_except:
 		}
 		if (kvm_cpu_has_injectable_intr(vcpu))
 			kvm_x86_call(enable_irq_window)(vcpu);
-	} else if (kvm_cpu_has_interrupt(vcpu)) {
-		pr_info_ratelimited("KVM: irq pending but not injectable vcpu=%d vmpl=%d can_inject=%d intr_nr=%u injected=%d int_allowed=%d\n",
-				    vcpu->vcpu_id, vcpu->vcpu_parent->current_vmpl,
-				    can_inject, vcpu->arch.interrupt.nr,
-				    vcpu->arch.interrupt.injected,
-				    kvm_arch_interrupt_allowed(vcpu));
 	}
 
 	if (is_guest_mode(vcpu) && kvm_x86_ops.nested_ops->has_events &&
