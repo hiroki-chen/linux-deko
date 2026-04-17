@@ -2300,6 +2300,10 @@ EXPORT_PER_CPU_SYMBOL(__preempt_count);
 DEFINE_PER_CPU_CACHE_HOT(unsigned long,
 			 cpu_current_top_of_stack) = TOP_OF_INIT_STACK;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+DEFINE_PER_CPU_CACHE_HOT(u64, deko_kernel_vmpl1_rsp) = TOP_OF_INIT_STACK;
+#endif
+
 #ifdef CONFIG_X86_64
 /*
  * Note: Do not make this dependant on CONFIG_MITIGATION_CALL_DEPTH_TRACKING
@@ -2322,13 +2326,8 @@ static void wrmsrq_cstar(unsigned long val)
 
 static inline void idt_syscall_init(void)
 {
-	alloc_isolated_trampoline();
-
-	svsm_map_vmpl1();
-
 	wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
 
-	svsm_handle_trampoline_setup((u64)entry_SYSCALL_64);
 	if (ia32_enabled()) {
 		wrmsrq_cstar((unsigned long)entry_SYSCALL_compat);
 		/*

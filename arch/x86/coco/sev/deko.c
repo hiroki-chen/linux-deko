@@ -464,7 +464,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	syscall_nr = syscall_body->ax;
 
 	if (unlikely(syscall_nr >= NR_syscalls)) {
-		pr_warn("Invalid syscall number %llu from VMPL1\n", syscall_nr);
+		pr_warn("Invalid syscall number %lu from VMPL1\n", syscall_nr);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
 	}
@@ -485,7 +485,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 
 	syscall_fn = sys_call_table[syscall_nr];
 	if (unlikely(!syscall_fn)) {
-		pr_warn("Missing syscall handler for syscall number %llu\n",
+		pr_warn("Missing syscall handler for syscall number %lu\n",
 			syscall_nr);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
@@ -602,7 +602,6 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
-	unsigned long old_user_rsp;
 	unsigned long flags;
 
 	if (old_cpu == new_cpu || !current->is_monitored)
@@ -682,9 +681,9 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
 
-	pr_info("launch app CR3 snapshot pid=%d hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx mm_pgd=%px\n",
-		current->pid, read_cr3_pa(),
-		current->mm ? __sme_pa(current->mm->pgd) : 0UL,
+	pr_info("launch app CR3 snapshot pid=%d hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px\n",
+		current->pid, (unsigned long long)read_cr3_pa(),
+		current->mm ? (unsigned long long)__sme_pa(current->mm->pgd) : 0ULL,
 		current->mm ? current->mm->pgd : NULL);
 
 	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
@@ -825,7 +824,6 @@ err_inner_buf:
 err_alias:
 	kfree(buf);
 
-err_buf:
 	unpin_user_pages(pages, pinned_count);
 	kvfree(pages);
 
@@ -846,4 +844,34 @@ err_pin:
 	 */
 	if (!normal_exit)
 		do_exit(errno);
+}
+
+int deko_bootstrap(void)
+{
+	int ret;
+	enum es_result res;
+
+	pr_info("Bootstrapping Deko once\n");
+
+	ret = alloc_isolated_trampoline();
+	if (ret) {
+		pr_err("Failed to allocate isolated trampoline, err: %d\n", ret);
+		return ret;
+	}
+
+	res = svsm_handle_trampoline_setup((u64)entry_SYSCALL_64);
+	if (res != ES_OK) {
+		pr_err("Failed to set up VMPL1 trampoline, err: %d\n", res);
+		return -EIO;
+	}
+
+	pr_info("Mapping VMPL1 once and syncing page tables\n");
+
+	res = svsm_map_vmpl1();
+	if (res != ES_OK) {
+		pr_err("Failed to map VMPL1 trampoline, err: %d\n", res);
+		return -EIO;
+	}
+
+	return 0;
 }

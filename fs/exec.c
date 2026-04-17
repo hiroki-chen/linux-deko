@@ -88,6 +88,10 @@ int suid_dumpable = 0;
 static LIST_HEAD(formats);
 static DEFINE_RWLOCK(binfmt_lock);
 
+int sysctl_enable_vmpl_tramp = 0;
+
+module_param_named(vmpl_tramp, sysctl_enable_vmpl_tramp, int, 0644);
+
 void __register_binfmt(struct linux_binfmt * fmt, int insert)
 {
 	write_lock(&binfmt_lock);

@@ -76,6 +76,8 @@ extern int sysctl_enable_vmpl_tramp;
 
 static int load_elf_binary(struct linux_binprm *bprm);
 
+extern int sysctl_enable_vmpl_tramp;
+
 /*
  * If we don't support core dumping, then supply a NULL so we
  * don't even try.

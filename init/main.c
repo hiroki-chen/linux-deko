@@ -10,6 +10,7 @@
  *  Simplified starting of init:  Michael A. Griffith <grif@acm.org>
  */
 
+#include "asm/sev.h"
 #define DEBUG		/* Enable initcall_debug */
 
 #include <linux/types.h>
@@ -1586,6 +1587,9 @@ static int __ref kernel_init(void *unused)
 	exit_boot_config();
 	free_initmem();
 	mark_readonly();
+	ret = deko_bootstrap();
+	if (ret)
+		pr_err("DEKO bootstrap failed, err: %d\n", ret);
 
 	/*
 	 * Kernel mappings are now finalized - update the userspace page-table

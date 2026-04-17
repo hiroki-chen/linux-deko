@@ -52,6 +52,7 @@
 #include <asm/switch_to.h>
 #include <asm/vm86.h>
 #include <asm/resctrl.h>
+#include <asm/sev.h>
 #include <asm/proto.h>
 
 #include "process.h"
@@ -195,9 +196,15 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 */
 	update_task_stack(next_p);
 	refresh_sysenter_cs(next);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	prev->kernel_vmpl1_rsp = this_cpu_read(deko_kernel_vmpl1_rsp);
+#endif
 	this_cpu_write(cpu_current_top_of_stack,
 		       (unsigned long)task_stack_page(next_p) +
 		       THREAD_SIZE);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	this_cpu_write(deko_kernel_vmpl1_rsp, next->kernel_vmpl1_rsp);
+#endif
 
 	/*
 	 * Restore %gs if needed (which is common)

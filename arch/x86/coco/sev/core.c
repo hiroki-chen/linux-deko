@@ -62,10 +62,11 @@ SYM_PIC_ALIAS(boot_svsm_ca_page);
 static phys_addr_t page_l3 = 0, page_l2, page_l1 = 0;
 
 /* The reserved memory for the IFC policy engine. */
-static phys_addr_t deko_ifc_policy_engine_mem __ro_after_init = 0;
+static phys_addr_t deko_ifc_policy_engine_mem = 0;
 
 /* The base address for the trampoline code's physical address. */
 static phys_addr_t trampoline_pa_base = 0;
+static unsigned long trampoline_va_base = 0;
 
 /*
  * SVSM related information:
@@ -112,9 +113,6 @@ u64 svsm_get_caa_pa(void)
 #define AP_INIT_X87_FCW_DEFAULT 0x0040
 #define AP_INIT_CR0_DEFAULT 0x60000010
 #define AP_INIT_MXCSR_DEFAULT 0x1f80
-
-#define TRAMPOLINE_PGD_INDEX 466
-#define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
 
 #define SVSM_PERCPU_BASE 0xffffffff00000000UL
 
@@ -204,33 +202,95 @@ static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
  */
 struct ghcb *boot_ghcb __section(".data");
 
-static __init phys_addr_t alloc_stolen_mem(unsigned long size)
+static phys_addr_t alloc_stolen_mem(unsigned long size)
 {
-	phys_addr_t pa;
+	struct page *pages;
+	unsigned long nr_pages;
+	unsigned int order;
 
-	pa = memblock_phys_alloc(size, PMD_SIZE);
-	if (!pa)
-		return 0;
+	size = PAGE_ALIGN(size);
+	nr_pages = size >> PAGE_SHIFT;
+	order = get_order(size);
+	if (order <= MAX_PAGE_ORDER) {
+		pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+		if (!pages)
+			return 0;
+	} else {
+		pages = alloc_contig_pages(nr_pages, GFP_KERNEL, numa_node_id(),
+					   NULL);
+		if (!pages)
+			return 0;
 
-	memblock_reserve(pa, size);
+		memset(page_address(pages), 0, size);
+	}
 
-	return pa;
+	return page_to_phys(pages);
 }
 
-static __init int set_up_deko_ifc_policy_engine_mapping(void)
+static unsigned long find_empty_pgd_slot(unsigned long start, unsigned long end)
+{
+	unsigned long addr;
+
+	start = ALIGN(start, PGDIR_SIZE);
+	end &= PGDIR_MASK;
+	if (start >= end)
+		return 0;
+
+	for (addr = end - PGDIR_SIZE;; addr -= PGDIR_SIZE) {
+		pgd_t *pgd = pgd_offset_k(addr);
+		p4d_t *p4d = p4d_offset(pgd, addr);
+
+		if (pgtable_l5_enabled()) {
+			if (pgd_none(*pgd))
+				return addr;
+		} else if (p4d_none(*p4d)) {
+			return addr;
+		}
+
+		if (addr == start)
+			break;
+	}
+
+	return 0;
+}
+
+static unsigned long choose_trampoline_va_base(void)
+{
+	unsigned long addr;
+
+	/*
+	 * Prefer the fixed 2 TB hole immediately below cpu_entry_area.
+	 * Unlike the vmalloc/vmemmap gaps, this space is not shuffled by the
+	 * x86 memory-layout randomization.
+	 */
+	addr = find_empty_pgd_slot(CPU_ENTRY_AREA_BASE - (4UL * P4D_SIZE),
+				   CPU_ENTRY_AREA_BASE);
+	if (addr)
+		return addr;
+
+	/*
+	 * Fall back to the entropy gap before the direct map if KASLR left one.
+	 * That range is also outside Linux-managed regions once boot layout is
+	 * finalized.
+	 */
+	return find_empty_pgd_slot(LDT_END_ADDR, page_offset_base);
+}
+
+static int set_up_deko_ifc_policy_engine_mapping(void)
 {
 	int ret = 0;
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
-	unsigned long va_start = TRAMPOLINE_VA_BASE + PMD_SIZE;
+	unsigned long va_start = trampoline_va_base + PMD_SIZE;
 	unsigned long cur_va;
 	phys_addr_t cur_pa;
 	int i;
 
 	if (!deko_ifc_policy_engine_mem ||
-	    !IS_ALIGNED(deko_ifc_policy_engine_mem, PAGE_SIZE))
+	    !IS_ALIGNED(deko_ifc_policy_engine_mem, PAGE_SIZE) ||
+	    !trampoline_va_base)
 		return -EINVAL;
 
 	pgd = pgd_offset_k(va_start);
@@ -271,7 +331,7 @@ static __init int set_up_deko_ifc_policy_engine_mapping(void)
 	return ret;
 }
 
-static __init int claim_whole_pgd_entry(void)
+static int claim_whole_pgd_entry(void)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -284,10 +344,16 @@ static __init int claim_whole_pgd_entry(void)
 	if (!trampoline_pa_base || !IS_ALIGNED(trampoline_pa_base, PMD_SIZE))
 		return -EINVAL;
 
-	pgd = pgd_offset_k(TRAMPOLINE_VA_BASE);
-	if (!pgd_none(*pgd)) {
-		pgd_clear(pgd);
-		__flush_tlb_all();
+	if (!trampoline_va_base)
+		return -EINVAL;
+
+	pgd = pgd_offset_k(trampoline_va_base);
+	p4d = p4d_offset(pgd, trampoline_va_base);
+	if (pgtable_l5_enabled()) {
+		if (!pgd_none(*pgd))
+			return -EBUSY;
+	} else if (!p4d_none(*p4d)) {
+		return -EBUSY;
 	}
 
 	/* --- Level 3 (PUD Table) --- */
@@ -300,7 +366,7 @@ static __init int claim_whole_pgd_entry(void)
 
 	set_pgd(pgd, __pgd((page_l3 | 0x67 | _ENC)));
 
-	p4d = p4d_offset(pgd, TRAMPOLINE_VA_BASE);
+	p4d = p4d_offset(pgd, trampoline_va_base);
 
 	/* --- Level 2 (PMD Table) --- */
 	page_l2 = alloc_stolen_mem(PAGE_SIZE);
@@ -310,7 +376,7 @@ static __init int claim_whole_pgd_entry(void)
 	}
 	memset(__va(page_l2), 0, PAGE_SIZE);
 
-	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
+	pud = pud_offset(p4d, trampoline_va_base);
 	set_pud(pud, __pud((page_l2 | 0x63 | _ENC)));
 
 	page_l1 = alloc_stolen_mem(PAGE_SIZE);
@@ -320,10 +386,10 @@ static __init int claim_whole_pgd_entry(void)
 	}
 	memset(__va(page_l1), 0, PAGE_SIZE);
 
-	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
+	pmd = pmd_offset(pud, trampoline_va_base);
 
 	set_pmd(pmd, __pmd((page_l1 | 0x67 | _ENC)));
-	pte = pte_offset_kernel(pmd, TRAMPOLINE_VA_BASE);
+	pte = pte_offset_kernel(pmd, trampoline_va_base);
 
 	for (i = 0; i < PTRS_PER_PTE; i++) {
 		phys_addr_t slice_pa = trampoline_pa_base + (i * PAGE_SIZE);
@@ -337,11 +403,11 @@ static __init int claim_whole_pgd_entry(void)
 free_pages:
 	if (ret < 0) {
 		if (page_l1)
-			memblock_add(page_l1, PAGE_SIZE);
+			free_pages((unsigned long)__va(page_l1), 0);
 		if (page_l2)
-			memblock_add(page_l2, PAGE_SIZE);
+			free_pages((unsigned long)__va(page_l2), 0);
 		if (page_l3)
-			memblock_add(page_l3, PAGE_SIZE);
+			free_pages((unsigned long)__va(page_l3), 0);
 		if (pgd)
 			pgd_clear(pgd);
 	}
@@ -1155,29 +1221,17 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 {
 	size_t i;
 	struct svsm_map_ifc_single_req *cur;
-	int cpu;
 	u64 ghcb_va, db_va;
-	unsigned long calculated_va;
 
 	for (i = 0; i < req->req_len; i++) {
 		cur = &req->reqs[i];
 
-		if (!cur->is_per_cpu) {
-			if (smp_processor_id() == 0) {
-				force_map_va_range(cur->va_start, cur->va_end,
-						   cur->pa_start, 0x163);
-			}
-		} else {
-			cpu = smp_processor_id();
-			calculated_va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
-
-			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
-				cpu, calculated_va, cur->pa_start);
-
-			if (force_map_va_range(calculated_va,
-					       calculated_va + PAGE_SIZE,
-					       cur->pa_start, 0x163))
-				pr_err("Mapping PER-CPU failed.");
+		if (force_map_va_range(cur->va_start, cur->va_end, cur->pa_start,
+				       0x163)) {
+			pr_err("Mapping %s IFC range failed: VA [%#llx-%#llx) -> PA [%#llx-%#llx)\n",
+			       cur->is_per_cpu ? "per-CPU" : "shared",
+			       cur->va_start, cur->va_end,
+			       cur->pa_start, cur->pa_end);
 		}
 	}
 
@@ -1186,7 +1240,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	make_va_decrypted(ghcb_va);
 	make_va_decrypted(db_va);
 
-	__flush_tlb_all();
+	flush_tlb_all();
 }
 
 /*
@@ -1196,7 +1250,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
  * but it can help us manage the mapping in its kernel space so that we can utilize
  * the GHCB protocol for SVSM calls when VMPL1 is active.
  */
-enum es_result __init svsm_map_vmpl1(void)
+enum es_result svsm_map_vmpl1(void)
 {
 	struct svsm_call call = { 0 };
 
@@ -1465,23 +1519,26 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	call.r8 = creation ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
-	pr_info("report app live CR3 pid=%d comm=%s hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx mm_pgd=%px creation=%u\n",
-		task->pid, task->comm, read_cr3_pa(),
-		task->mm ? __sme_pa(task->mm->pgd) : 0UL,
+	pr_info("report app live CR3 pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px creation=%u\n",
+		task->pid, task->comm, (unsigned long long)read_cr3_pa(),
+		task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) : 0ULL,
 		task->mm ? task->mm->pgd : NULL, creation ? 1 : 0);
 
 	{
 		int call_ret = svsm_perform_call_protocol(&call);
 
 		if (call_ret) {
-			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx\n",
+			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx\n",
 			       task->pid, task->comm, req->launch_identity,
 			       creation ? 1 : 0, call_ret, call.rax_out,
 			       call.rcx_out, call.rdx_out, call.r8_out,
 			       call.r9_out, req->domain_id,
 			       (unsigned long long)req->mnt_ns_id, req->version,
-			       req->req_size, req->region_count, read_cr3_pa(),
-			       task->mm ? __sme_pa(task->mm->pgd) : 0UL);
+			       req->req_size, req->region_count,
+			       (unsigned long long)read_cr3_pa(),
+			       task->mm ? (unsigned long long)__sme_pa(
+						  task->mm->pgd) :
+					  0ULL);
 			ret = ES_UNSUPPORTED;
 		}
 	}
@@ -1646,34 +1703,44 @@ static void shutdown_all_aps(void)
  * any other code is trying to R/W the data/code that coincidentally share
  * the same intermedate page translation paths.
  */
-int __init alloc_isolated_trampoline(void)
+int alloc_isolated_trampoline(void)
 {
-	void *target_va;
-	int cpu;
 	char *cpu_trampoline_va;
+	int ret;
 
 	if (!trampoline_pa_base) {
 		trampoline_pa_base = alloc_stolen_mem(PMD_SIZE);
-		if (!trampoline_pa_base)
+		if (!trampoline_pa_base) {
+			pr_err("Failed to allocate trampoline backing memory\n");
 			return -ENOMEM;
+		}
 	}
 
 	if (!deko_ifc_policy_engine_mem) {
 		deko_ifc_policy_engine_mem =
 			alloc_stolen_mem(DEKO_IFC_POLICY_ENGINE_MEM_SIZE);
-		if (!deko_ifc_policy_engine_mem)
+		if (!deko_ifc_policy_engine_mem) {
+			pr_err("Failed to allocate IFC policy engine memory\n");
 			/*
-		 * Need to free the memory but returning this eventually panics the system
-		 * so should be fine.
-		 */
+			 * Need to free the memory but returning this eventually
+			 * panics the system so should be fine.
+			 */
 			return -ENOMEM;
+		}
 	}
 
-	target_va = __va(trampoline_pa_base);
+	if (!trampoline_va_base) {
+		trampoline_va_base = choose_trampoline_va_base();
+		if (!trampoline_va_base) {
+			pr_err("Failed to find an empty trampoline PGD slot\n");
+			return -ENOMEM;
+		}
 
-	/* Now copy the magic number. */
-	cpu = smp_processor_id();
-	cpu_trampoline_va = (char *)(target_va + (cpu * PAGE_SIZE));
+		pr_info("Selected trampoline VA base: 0x%lx\n",
+			trampoline_va_base);
+	}
+
+	cpu_trampoline_va = __va(trampoline_pa_base);
 
 	/* Copy the trampoline code to the allocated region. */
 	memcpy(cpu_trampoline_va, trampoline_init_magic,
@@ -1685,9 +1752,18 @@ int __init alloc_isolated_trampoline(void)
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
-	if (!cpu && (claim_whole_pgd_entry() ||
-		     set_up_deko_ifc_policy_engine_mapping()))
-		return -EINVAL;
+	ret = claim_whole_pgd_entry();
+	if (ret) {
+		pr_err("Failed to claim trampoline PGD slot @ 0x%lx, err: %d\n",
+		       trampoline_va_base, ret);
+		return ret;
+	}
+
+	ret = set_up_deko_ifc_policy_engine_mapping();
+	if (ret) {
+		pr_err("Failed to map IFC policy engine memory, err: %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -2012,27 +2088,25 @@ enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr)
 	struct svsm_sev_trampoline_setup_req *req;
 	struct svsm_call call = { 0 };
 	phys_addr_t req_pa;
-	int cpu_id;
 
-	cpu_id = smp_processor_id();
+	if (!trampoline_va_base || !trampoline_pa_base)
+		return ES_UNSUPPORTED;
+
 	call.caa = svsm_get_caa();
 
-	if (!cpu_id) {
-		/* Re-use the SVSM buffer for allocating the request body. */
-		req = (struct svsm_sev_trampoline_setup_req *)(call.caa->svsm_buffer);
-		req_pa = svsm_get_caa_pa() +
-			 offsetof(struct svsm_ca, svsm_buffer);
-		call.r9 = req_pa;
-		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TRAMPOLINE_SETUP);
+	/* Re-use the SVSM buffer for allocating the request body. */
+	req = (struct svsm_sev_trampoline_setup_req *)(call.caa->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	call.r9 = req_pa;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TRAMPOLINE_SETUP);
 
-		req->syscall_enter_addr = sysenter_addr;
-		req->trampoline_gva = TRAMPOLINE_VA_BASE;
-		req->trampoline_gpa = trampoline_pa_base;
+	req->syscall_enter_addr = sysenter_addr;
+	req->trampoline_gva = trampoline_va_base;
+	req->trampoline_gpa = trampoline_pa_base;
 
-		if (svsm_perform_call_protocol(&call)) {
-			ret = ES_UNSUPPORTED;
-			goto out;
-		}
+	if (svsm_perform_call_protocol(&call)) {
+		ret = ES_UNSUPPORTED;
+		goto out;
 	}
 
 out:

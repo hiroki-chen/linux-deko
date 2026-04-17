@@ -55,6 +55,7 @@
 #include <asm/xen/hypervisor.h>
 #include <asm/vdso.h>
 #include <asm/resctrl.h>
+#include <asm/sev.h>
 #include <asm/unistd.h>
 #include <asm/fsgsbase.h>
 #include <asm/fred.h>
@@ -668,7 +669,13 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 * Switch the PDA and FPU contexts.
 	 */
 	raw_cpu_write(current_task, next_p);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	prev->kernel_vmpl1_rsp = raw_cpu_read(deko_kernel_vmpl1_rsp);
+#endif
 	raw_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	raw_cpu_write(deko_kernel_vmpl1_rsp, next->kernel_vmpl1_rsp);
+#endif
 
 	/* Reload sp0. */
 	update_task_stack(next_p);
