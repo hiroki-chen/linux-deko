@@ -1799,6 +1799,9 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 	if (ty == DEKO_DOCKER_APPS) {
 		if (deko_domain_lookup(req->mnt_ns_id, &req->domain_id)) {
+			pr_err("report_app domain lookup failed: pid=%d comm=%s mnt_ns_id=%llu creation=%u\n",
+			       task->pid, task->comm,
+			       (unsigned long long)req->mnt_ns_id, creation ? 1 : 0);
 			local_irq_restore(flags);
 			return ES_UNSUPPORTED;
 		}
@@ -1809,8 +1812,18 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	call.r8 = creation ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
-	if (svsm_perform_call_protocol(&call))
-		ret = ES_UNSUPPORTED;
+	{
+		int call_ret = svsm_perform_call_protocol(&call);
+
+		if (call_ret) {
+			pr_err("report_app rejected: pid=%d comm=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu\n",
+			       task->pid, task->comm, creation ? 1 : 0, call_ret,
+			       call.rax_out, call.rcx_out, call.rdx_out,
+			       call.r8_out, call.r9_out, req->domain_id,
+			       (unsigned long long)req->mnt_ns_id);
+			ret = ES_UNSUPPORTED;
+		}
+	}
 
 	if (creation && ty == DEKO_DOCKER_APPS) {
 		*token_low = req->kernel_vmpl1_rsp;
