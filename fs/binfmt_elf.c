@@ -45,10 +45,18 @@
 #include <linux/types.h>
 #include <linux/cred.h>
 #include <linux/dax.h>
+#include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/rseq.h>
 #include <asm/param.h>
 #include <asm/page.h>
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#include "mount.h"
+
+extern int sysctl_enable_vmpl_tramp;
+#endif
 
 #ifndef ELF_COMPAT
 #define ELF_COMPAT 0
@@ -851,6 +859,11 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct arch_elf_state arch_state = INIT_ARCH_ELF_STATE;
 	struct mm_struct *mm;
 	struct pt_regs *regs;
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	bool is_app = false;
+	enum es_result res = ES_OK;
+	struct deko_task_work *dw;
+#endif
 
 	retval = -ENOEXEC;
 	/* First of all, some simple consistency checks */
@@ -1377,6 +1390,57 @@ out_free_interp:
 
 	finalize_exec(bprm);
 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	regs = current_pt_regs();
+	is_app = false;
+	{
+		u32 deko_domain_id = 0;
+
+		if (current->flags & PF_KTHREAD)
+			goto out_deko;
+
+		if (sysctl_enable_vmpl_tramp && current->nsproxy &&
+		    current->nsproxy->mnt_ns &&
+		    !deko_domain_lookup(current->nsproxy->mnt_ns->ns.inum,
+					&deko_domain_id))
+			is_app = true;
+
+		if (!is_app)
+			goto out_deko;
+
+		res = svsm_deko_new_app_req(current,
+					    current->nsproxy->mnt_ns->ns.inum,
+					    true, &regs->cx, &regs->dx,
+					    DEKO_DOCKER_APPS);
+		if (res != ES_OK) {
+			pr_err("Deko: SVSM rejected process %s (App=%d, res=%d, mnt_ns_id=%llu, domain_id=%u)\n",
+			       current->comm, is_app, res,
+			       (unsigned long long)current->nsproxy->mnt_ns->ns.inum,
+			       deko_domain_id);
+			goto out_deko;
+		}
+
+		current->thread.kernel_vmpl1_rsp = regs->cx;
+
+		if (sysctl_enable_vmpl_tramp) {
+			regs->bx = elf_entry;
+			regs->r12 = bprm->p;
+
+			dw = kzalloc(sizeof(*dw), GFP_KERNEL);
+			if (!dw) {
+				pr_err("Deko: Failed to allocate task work for process %s\n",
+				       current->comm);
+				force_sig(SIGKILL);
+				return -ENOMEM;
+			}
+
+			init_task_work(&dw->work, deko_proxy_loop);
+			task_work_add(current, &dw->work, TWA_RESUME);
+		}
+	}
+out_deko:
+#endif
 	retval = 0;
 out:
 	return retval;
