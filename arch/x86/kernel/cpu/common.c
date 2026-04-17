@@ -2033,6 +2033,7 @@ static inline void idt_syscall_init(void)
 	svsm_map_vmpl1();
 
 	wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+	svsm_handle_trampoline_setup((u64)entry_SYSCALL_64);
 
 	if (ia32_enabled()) {
 		wrmsrl_cstar((unsigned long)entry_SYSCALL_compat);

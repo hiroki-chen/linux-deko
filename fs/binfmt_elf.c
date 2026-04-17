@@ -1375,12 +1375,12 @@ out_free_interp:
 				&regs->dx, /* Do not use ax as it will gets cleared */
 				DEKO_DOCKER_APPS);
 
-			if (res != ES_OK) {
-				pr_err("Deko: SVSM rejected process %s (App=%d, res=%d, mnt_ns_id=%llu, domain_id=%u)\n",
-				       current->comm, is_app, res,
-				       (unsigned long long)current->nsproxy->mnt_ns->ns.inum,
-				       deko_domain_id);
-			} else {
+				if (res != ES_OK) {
+					pr_err("Deko: SVSM rejected process %s (App=%d, res=%d, mnt_ns_id=%llu, domain_id=%u)\n",
+					       current->comm, is_app, res,
+					       (unsigned long long)current->nsproxy->mnt_ns->ns.inum,
+					       deko_domain_id);
+				} else {
 				current->thread.kernel_vmpl1_rsp = regs->cx;
 				this_cpu_write(
 					pcpu_hot.vmpl1_rsp,

@@ -80,26 +80,6 @@
  */
 #define DEKO_IFC_POLICY_ENGINE_MEM_SIZE ((SZ_64M))
 
-/*
- * SEV-SNP guest MSR intercepts
- * 
- * The use of these MSRs in a SEV-SNP guest running at VMPL1 / VMPL2
- * will trigger a #VC exception that should be instead forward to the
- * VMPL0 monitor for proper handling.
- * 
- * Simply forwarding these MSR accesses to the hypervisor is insecure
- * as the raw register values are copied into the GHCB and may cause
- * information leaks or integrity issues. For example, if the LSTAR
- * address is leaked then the attacker may be able to infer the
- * location of sensitive code sequences in the guest and launch side-
- * channel attacks.
- */
-static const u64 sev_snp_guest_msr_intercepts[] = {
-	MSR_STAR,
-	MSR_LSTAR,
-	MSR_CSTAR,
-};
-
 static const char *const sev_status_feat_names[] = {
 	[MSR_AMD64_SEV_ENABLED_BIT] = "SEV",
 	[MSR_AMD64_SEV_ES_ENABLED_BIT] = "SEV-ES",
@@ -146,13 +126,10 @@ static phys_addr_t page_l3 = 0, page_l2, page_l1 = 0;
 /* The reserved memory for the IFC policy engine. */
 static phys_addr_t deko_ifc_policy_engine_mem __ro_after_init = 0;
 
-struct svsm_sev_guest_lstar_req {
+struct svsm_sev_trampoline_setup_req {
 	u64 syscall_enter_addr;
-	u64 trampoline_va;
-	u64 trampoline_pa;
-	u64 blob_pa;
-	u64 page_offset_base;
-	u64 sysret_trampoline;
+	u64 trampoline_gva;
+	u64 trampoline_gpa;
 } __attribute__((aligned(8)));
 
 struct svsm_map_ifc_single_req {
@@ -1690,7 +1667,7 @@ int __init alloc_isolated_trampoline(void)
 
 	/*
 	 * Now we utilize the "hole" for placing the trampoline code.
-	 * 
+	 *
 	 * This avoids interference with other kernel functionalities and ensure
 	 * no potential #PF will occur.
 	 */
@@ -1704,6 +1681,8 @@ int __init alloc_isolated_trampoline(void)
 int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 {
 	struct svsm_call call = { 0 };
+
+	call.caa = svsm_get_caa();
 	struct deko_load_policy_req *req;
 	phys_addr_t req_pa;
 	unsigned long flags;
@@ -1740,6 +1719,167 @@ int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 }
 EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
 
+static u16 deko_region_perm_from_vma(const struct vm_area_struct *vma)
+{
+	u16 perm = 0;
+
+	if (vma->vm_flags & VM_READ)
+		perm |= DEKO_REGION_R;
+	if (vma->vm_flags & VM_WRITE)
+		perm |= DEKO_REGION_W;
+	if (vma->vm_flags & VM_EXEC)
+		perm |= DEKO_REGION_X;
+
+	return perm;
+}
+
+static void deko_append_region(struct deko_new_app_req *req, u16 kind,
+				      u16 perm, u32 flags,
+				      unsigned long mapped_start,
+				      unsigned long mapped_end,
+				      unsigned long exact_start,
+				      unsigned long exact_end)
+{
+	struct deko_base_region_desc *prev;
+	u16 idx;
+
+	if (mapped_start >= mapped_end || exact_start >= exact_end)
+		return;
+
+	if (req->region_count > 0) {
+		prev = &req->regions[req->region_count - 1];
+		if (prev->kind == kind && prev->perm == perm &&
+		    prev->flags == flags && prev->mapped_end == mapped_start &&
+		    prev->exact_end == exact_start) {
+			prev->mapped_end = mapped_end;
+			prev->exact_end = exact_end;
+			return;
+		}
+	}
+
+	if (req->region_count >= DEKO_MAX_BASE_REGIONS)
+		return;
+
+	idx = req->region_count;
+	req->regions[idx].kind = kind;
+	req->regions[idx].perm = perm;
+	req->regions[idx].flags = flags;
+	req->regions[idx].mapped_start = mapped_start;
+	req->regions[idx].mapped_end = mapped_end;
+	req->regions[idx].exact_start = exact_start;
+	req->regions[idx].exact_end = exact_end;
+	req->region_count = idx + 1;
+}
+
+static void deko_fill_req_regions(struct deko_new_app_req *req,
+				  struct task_struct *task)
+{
+	struct mm_struct *mm = task->mm;
+	struct vm_area_struct *vma;
+	unsigned long data_exact_lo;
+	unsigned long data_exact_hi;
+	unsigned long data_mapped_hi;
+	unsigned long heap_exact_lo;
+	unsigned long heap_exact_hi;
+	unsigned long heap_mapped_lo;
+	unsigned long heap_mapped_hi;
+	struct vma_iterator vmi;
+
+	if (!mm)
+		return;
+
+	vma_iter_init(&vmi, mm, 0);
+	data_exact_lo = mm->start_data;
+	data_exact_hi = mm->end_data;
+	data_mapped_hi = PAGE_ALIGN(mm->end_data);
+	heap_exact_lo = mm->start_brk;
+	heap_exact_hi = mm->brk;
+	heap_mapped_lo = heap_exact_lo & PAGE_MASK;
+	heap_mapped_hi = PAGE_ALIGN(heap_exact_hi);
+
+	for_each_vma(vmi, vma) {
+		u16 perm = deko_region_perm_from_vma(vma);
+		u32 flags = 0;
+		unsigned long start = vma->vm_start;
+		unsigned long end = vma->vm_end;
+
+		if (vma_is_initial_stack(vma)) {
+			if (vma->vm_flags & VM_GROWSDOWN)
+				flags |= DEKO_REGION_F_GROWSDOWN;
+			deko_append_region(req, DEKO_BASE_REGION_STACK, perm,
+					   flags, start, end, start, end);
+			continue;
+		}
+
+		if (vma->vm_flags & VM_EXEC) {
+			deko_append_region(req, DEKO_BASE_REGION_CODE, perm, 0,
+					   start, end, start, end);
+			continue;
+		}
+
+		if ((vma->vm_flags & VM_READ) && !(vma->vm_flags & VM_WRITE) &&
+		    !(vma->vm_flags & VM_EXEC) && vma->vm_file) {
+			deko_append_region(req, DEKO_BASE_REGION_RODATA, perm, 0,
+					   start, end, start, end);
+			continue;
+		}
+
+		if ((vma->vm_flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE) {
+			unsigned long exact_lo;
+			unsigned long exact_hi;
+
+			exact_lo = max(start, data_exact_lo);
+			exact_hi = min(end, data_exact_hi);
+			if (exact_lo < exact_hi) {
+				deko_append_region(req, DEKO_BASE_REGION_DATA, perm,
+						   DEKO_REGION_F_TEMPLATE_RW,
+						   start, min(end, data_mapped_hi),
+						   exact_lo, exact_hi);
+			}
+
+			if (!vma->vm_file && data_mapped_hi < heap_exact_lo) {
+				unsigned long bss_mapped_lo;
+				unsigned long bss_mapped_hi;
+				unsigned long bss_exact_lo;
+				unsigned long bss_exact_hi;
+
+				bss_mapped_lo = max(start, data_mapped_hi);
+				bss_mapped_hi = min(end, heap_mapped_lo);
+				bss_exact_lo = bss_mapped_lo;
+				bss_exact_hi = min(end, heap_exact_lo);
+				if (bss_mapped_lo < bss_mapped_hi &&
+				    bss_exact_lo < bss_exact_hi) {
+					deko_append_region(req, DEKO_BASE_REGION_BSS, perm,
+							   DEKO_REGION_F_ZERO_INIT |
+							   DEKO_REGION_F_TEMPLATE_RW,
+							   bss_mapped_lo, bss_mapped_hi,
+							   bss_exact_lo, bss_exact_hi);
+				}
+			}
+		}
+
+		{
+			unsigned long heap_exact_vma_lo;
+			unsigned long heap_exact_vma_hi;
+			unsigned long heap_mapped_vma_lo;
+			unsigned long heap_mapped_vma_hi;
+
+			heap_exact_vma_lo = max(start, heap_exact_lo);
+			heap_exact_vma_hi = min(end, heap_exact_hi);
+			heap_mapped_vma_lo = max(start, heap_mapped_lo);
+			heap_mapped_vma_hi = min(end, heap_mapped_hi);
+			if (heap_mapped_vma_lo < heap_mapped_vma_hi &&
+			    heap_exact_vma_lo < heap_exact_vma_hi) {
+				deko_append_region(req, DEKO_BASE_REGION_HEAP, perm, 0,
+						   heap_mapped_vma_lo,
+						   heap_mapped_vma_hi,
+						   heap_exact_vma_lo,
+						   heap_exact_vma_hi);
+			}
+		}
+	}
+}
+
 enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 				     bool creation, unsigned long *token_low,
 				     unsigned long *token_high,
@@ -1749,50 +1889,35 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	phys_addr_t req_pa;
 	struct deko_new_app_req *req;
 	struct svsm_call call = { 0 };
-	u64 stack_size = 0;
-	struct vm_area_struct *vma;
+
+	call.caa = svsm_get_caa();
 	unsigned long flags;
-
-	unsigned long start_code = 0;
-  unsigned long end_code = 0;
-  unsigned long user_stack = 0;
-
-	if (task->mm) {
-    start_code = task->mm->start_code;
-    end_code = task->mm->end_code;
-    user_stack = task->mm->start_stack;
-
-    mmap_read_lock(task->mm);
-    vma = find_vma(task->mm, task->mm->start_stack);
-    if (vma && vma->vm_start <= task->mm->start_stack) {
-      stack_size = vma->vm_end - vma->vm_start;
-    }
-    mmap_read_unlock(task->mm);
-  }
 
 	local_irq_save(flags);
 
 	/* Re-use the SVSM buffer for allocating the request body. */
 	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
 	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	memset(req, 0, sizeof(*req));
 
+	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
+	req->req_size = sizeof(*req);
 	req->pid = task->pid;
 	req->ppid = task->real_parent->pid;
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
 	req->domain_id = 0;
 	req->mnt_ns_id = 0;
-	req->start_code = start_code;
-  req->end_code = end_code;
-  req->user_stack = user_stack;
-  req->user_stack_size = stack_size;
-  
-  req->fs_base = x86_fsbase_read_task(task);
-  req->gs_base = x86_gsbase_read_task(task);
-  req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task));
-  req->app_type = ty;
+	req->start_brk = task->mm ? task->mm->start_brk : 0;
+	req->brk = task->mm ? task->mm->brk : 0;
+
+	req->fs_base = x86_fsbase_read_task(task);
+	req->gs_base = x86_gsbase_read_task(task);
+	req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task));
+	req->app_type = ty;
 
 	strscpy(req->comm, task->comm, sizeof(req->comm));
+	strscpy(req->launch_identity, task->comm, sizeof(req->launch_identity));
 
 	if (task->nsproxy && task->nsproxy->mnt_ns)
 		req->mnt_ns_id = ns_id;
@@ -1807,20 +1932,35 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 		}
 	}
 
+	if (task->mm) {
+		mmap_read_lock(task->mm);
+		deko_fill_req_regions(req, task);
+		mmap_read_unlock(task->mm);
+	}
+
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
 	call.r8 = creation ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
+	pr_info("report app live CR3 pid=%d comm=%s hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx mm_pgd=%px creation=%u\n",
+		task->pid, task->comm, read_cr3_pa(),
+		task->mm ? __sme_pa(task->mm->pgd) : 0UL,
+		task->mm ? task->mm->pgd : NULL, creation ? 1 : 0);
+
 	{
 		int call_ret = svsm_perform_call_protocol(&call);
 
 		if (call_ret) {
-			pr_err("report_app rejected: pid=%d comm=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu\n",
-			       task->pid, task->comm, creation ? 1 : 0, call_ret,
+			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx\n",
+			       task->pid, task->comm, req->launch_identity,
+			       creation ? 1 : 0, call_ret,
 			       call.rax_out, call.rcx_out, call.rdx_out,
 			       call.r8_out, call.r9_out, req->domain_id,
-			       (unsigned long long)req->mnt_ns_id);
+			       (unsigned long long)req->mnt_ns_id,
+			       req->version, req->req_size, req->region_count,
+			       read_cr3_pa(),
+			       task->mm ? __sme_pa(task->mm->pgd) : 0UL);
 			ret = ES_UNSUPPORTED;
 		}
 	}
@@ -1939,7 +2079,7 @@ phys_addr_t get_anything_pa(void *vaddr)
 
 /*
  * Leverage Linux's support for mapping the VMPL1 GHCB within it.
- * 
+ *
  * The kernel cannot see the content nor write to the GHCB due to RMP protections
  * but it can help us manage the mapping in its kernel space so that we can utilize
  * the GHCB protocol for SVSM calls when VMPL1 is active.
@@ -1947,6 +2087,8 @@ phys_addr_t get_anything_pa(void *vaddr)
 enum es_result __init svsm_map_vmpl1(void)
 {
 	struct svsm_call call = { 0 };
+
+	call.caa = svsm_get_caa();
 	struct svsm_map_ifc_req req = { 0 };
 	unsigned long pa = get_anything_pa(&req);
 
@@ -1963,58 +2105,43 @@ enum es_result __init svsm_map_vmpl1(void)
 }
 
 /*
- * This function notifies the monitor that we are writing to
- * LSTAR and it should set up the syscall interception accordingly.
+ * Sets up the syscall entry point for the SVSM. This is needed for the SVSM to be able
+ * to handle syscalls when running at VMPL1.
+ *
+ * The trampolien replaces the original syscall's body with a jump to the IFC engine, and
+ * then re-uses the entry point to handle the syscalls.
  */
-static enum es_result svsm_handle_lstar(struct es_em_ctxt *ctxt,
-					struct svsm_call *call)
+enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr)
 {
 	enum es_result ret = ES_OK;
-	struct svsm_sev_guest_lstar_req *req;
+	struct svsm_sev_trampoline_setup_req *req;
+	struct svsm_call call = { 0 };
 	phys_addr_t req_pa;
 	int cpu_id;
 
 	cpu_id = smp_processor_id();
+	call.caa = svsm_get_caa();
 
-	/* Re-use the SVSM buffer for allocating the request body. */
-	req = (struct svsm_sev_guest_lstar_req *)(call->caa->svsm_buffer);
-	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
-	call->r9 = req_pa;
-	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MSR_INTERCEPT);
+	if (!cpu_id) {
+		/* Re-use the SVSM buffer for allocating the request body. */
+		req = (struct svsm_sev_trampoline_setup_req *)(call.caa->svsm_buffer);
+		req_pa = svsm_get_caa_pa() +
+			 offsetof(struct svsm_ca, svsm_buffer);
+		call.r9 = req_pa;
+		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TRAMPOLINE_SETUP);
 
-	req->syscall_enter_addr = (ctxt->regs->dx << 32) |
-				  (ctxt->regs->ax & 0xffffffff);
-	req->blob_pa = deko_ifc_policy_engine_mem;
-	req->trampoline_va = TRAMPOLINE_VA_BASE + (cpu_id * PAGE_SIZE);
-	req->trampoline_pa = trampoline_pa_base + (cpu_id * PAGE_SIZE);
-	req->page_offset_base = page_offset_base;
+		req->syscall_enter_addr = sysenter_addr;
+		req->trampoline_gva = TRAMPOLINE_VA_BASE;
+		req->trampoline_gpa = trampoline_pa_base;
 
-	if (svsm_perform_call_protocol(call)) {
-		ret = ES_UNSUPPORTED;
-		goto out;
+		if (svsm_perform_call_protocol(&call)) {
+			ret = ES_UNSUPPORTED;
+			goto out;
+		}
 	}
-
-	this_cpu_write(deko_sysret_trampoline,
-		       req->sysret_trampoline + TRAMPOLINE_VA_BASE);
 
 out:
 	return ret;
-}
-
-static enum es_result svsm_handle_msr(struct es_em_ctxt *ctxt)
-{
-	struct svsm_call call = { 0 };
-
-	call.caa = svsm_get_caa();
-	call.rcx = ctxt->regs->cx;
-	call.rdx = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
-
-	switch ((unsigned int)(ctxt->regs->cx)) {
-	case MSR_LSTAR:
-		return svsm_handle_lstar(ctxt, &call);
-	default:
-		return ES_UNSUPPORTED;
-	}
 }
 
 static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
@@ -2022,19 +2149,6 @@ static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 	struct pt_regs *regs = ctxt->regs;
 	enum es_result ret;
 	u64 exit_info_1;
-	bool msr_intercepted = false;
-	int i;
-
-	/* Check if MSRs are within the intercept list. */
-	for (i = 0; i < ARRAY_SIZE(sev_snp_guest_msr_intercepts); i++) {
-		if (regs->cx == sev_snp_guest_msr_intercepts[i]) {
-			msr_intercepted = true;
-			break;
-		}
-	}
-
-	if (msr_intercepted)
-		return svsm_handle_msr(ctxt);
 
 	/* Is it a WRMSR? */
 	exit_info_1 = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
@@ -2248,6 +2362,8 @@ void __init sev_es_init_vc_handling(void)
 
 	/* Initialize per-cpu GHCB pages */
 	for_each_possible_cpu(cpu) {
+		pr_info("SVSM CPU map: logical_cpu=%d apic_id=%u\n",
+			cpu, cpu_physical_id(cpu));
 		alloc_runtime_data(cpu);
 		init_ghcb(cpu);
 	}

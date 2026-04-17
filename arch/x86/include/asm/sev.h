@@ -33,24 +33,62 @@ enum deko_new_app_type {
 	DEKO_DOCKER_APPS = 1,
 };
 
+#define DEKO_NEW_APP_REQ_VERSION_V3 3
+#define DEKO_MAX_BASE_REGIONS 16
+
+enum deko_base_region_kind {
+	DEKO_BASE_REGION_CODE = 1,
+	DEKO_BASE_REGION_RODATA = 2,
+	DEKO_BASE_REGION_DATA = 3,
+	DEKO_BASE_REGION_BSS = 4,
+	DEKO_BASE_REGION_HEAP = 5,
+	DEKO_BASE_REGION_STACK = 6,
+};
+
+enum deko_region_perm {
+	DEKO_REGION_R = 1u << 0,
+	DEKO_REGION_W = 1u << 1,
+	DEKO_REGION_X = 1u << 2,
+};
+
+enum deko_region_flags {
+	DEKO_REGION_F_ZERO_INIT = 1u << 0,
+	DEKO_REGION_F_GROWSDOWN = 1u << 1,
+	DEKO_REGION_F_TEMPLATE_RW = 1u << 2,
+};
+
+struct deko_base_region_desc {
+	u16 kind;
+	u16 perm;
+	u32 flags;
+	u64 mapped_start;
+	u64 mapped_end;
+	u64 exact_start;
+	u64 exact_end;
+} __attribute__((aligned(8)));
+
 struct deko_new_app_req {
+	u16 version;
+	u16 region_count;
+	u32 req_size;
+
 	u32 pid;
 	u32 tgid;
 	u32 ppid;
 	u32 uid;
 
 	u64 mnt_ns_id;
-	u64 start_code;
-	u64 end_code;
-	u64 user_stack;
-	u64 user_stack_size;
+	u64 start_brk;
+	u64 brk;
 	char comm[16];
+	char launch_identity[64];
 	u64 kernel_vmpl1_rsp;
 	u64 fs_base;
 	u64 gs_base;
 	u64 kernel_gs_base;
 	enum deko_new_app_type app_type;
 	u32 domain_id;
+	struct deko_base_region_desc regions[DEKO_MAX_BASE_REGIONS];
 } __attribute__((aligned(8)));
 
 struct deko_load_policy_req {
@@ -119,6 +157,7 @@ extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    unsigned long *token_low,
 					    unsigned long *token_high,
 					    enum deko_new_app_type ty);
+extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
 extern int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len);
 extern int deko_domain_bind(u64 mnt_ns_id, u32 domain_id);
@@ -377,7 +416,7 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_ATTEST_SINGLE_SERVICE 1
 
 #define SVSM_EXTEND_CALL(x) ((4ULL << 32) | (x))
-#define SVSM_EXTEND_MSR_INTERCEPT 0
+#define SVSM_EXTEND_TRAMPOLINE_SETUP 0
 #define SVSM_EXTEND_SYSCALL_ANALYSIS 1
 #define SVSM_EXTEND_REPORT_APP 2
 #define SVSM_EXTEND_LAUNCH_APP 3

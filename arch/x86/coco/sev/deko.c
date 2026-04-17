@@ -17,6 +17,7 @@
 
 #include <linux/hashtable.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/mm_types.h>
 #include <linux/mmap_lock.h>
 #include <linux/kernel.h>
@@ -28,6 +29,8 @@
 #include <linux/types.h>
 #include <linux/syscalls.h>
 #include <asm-generic/mman-common.h>
+#include <asm/mem_encrypt.h>
+#include <asm/processor.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
 #include <asm/current.h>
@@ -55,6 +58,67 @@ static struct deko_domain_entry *deko_domain_find_locked(u64 mnt_ns_id)
 	}
 
 	return NULL;
+}
+
+static bool deko_skip_pte_log(unsigned long addr)
+{
+	return addr >= 0x700000000000UL && addr < 0x800000000000UL;
+}
+
+static void deko_log_vaddr_pte(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	unsigned long pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw, pte_val_raw;
+
+	if (deko_skip_pte_log(addr))
+		return;
+
+	pgd = pgd_offset(mm, addr);
+	pgd_val_raw = pgd_val(*pgd);
+	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+		pr_info("PTE walk addr 0x%lx: pgd=0x%lx\n", addr, pgd_val_raw);
+		return;
+	}
+
+	p4d = p4d_offset(pgd, addr);
+	p4d_val_raw = p4d_val(*p4d);
+	if (p4d_none(*p4d) || p4d_bad(*p4d)) {
+		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx\n",
+			addr, pgd_val_raw, p4d_val_raw);
+		return;
+	}
+
+	pud = pud_offset(p4d, addr);
+	pud_val_raw = pud_val(*pud);
+	if (pud_none(*pud) || pud_bad(*pud) || pud_leaf(*pud)) {
+		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx\n",
+			addr, pgd_val_raw, p4d_val_raw, pud_val_raw);
+		return;
+	}
+
+	pmd = pmd_offset(pud, addr);
+	pmd_val_raw = pmd_val(*pmd);
+	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_leaf(*pmd)) {
+		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx\n",
+			addr, pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw);
+		return;
+	}
+
+	pte = pte_offset_map(pmd, addr);
+	if (!pte) {
+		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx pte=<null>\n",
+			addr, pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw);
+		return;
+	}
+
+	pte_val_raw = pte_val(*pte);
+	pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx pte=0x%lx\n",
+		addr, pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw, pte_val_raw);
+	pte_unmap(pte);
 }
 
 int deko_domain_bind(u64 mnt_ns_id, u32 domain_id)
@@ -130,7 +194,8 @@ int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id)
 	}
 	hash_del(&entry->node);
 	mutex_unlock(&deko_domain_lock);
-	pr_info("unbind mnt_ns_id=%llu domain_id=%u\n", entry->mnt_ns_id, entry->domain_id);
+	pr_info("unbind mnt_ns_id=%llu domain_id=%u\n", entry->mnt_ns_id,
+		entry->domain_id);
 	kfree(entry);
 	return 0;
 }
@@ -181,7 +246,41 @@ struct deko_migration_req {
 struct deko_shared_buf {
 	struct deko_syscall_body syscall_body;
 	void *buf;
+	void *alias_buf;
+	u64 alias_len;
 };
+
+/* Allocate a hidden reserced user VMA not visible to the application
+ * provided as a communication channel between VMPL1 and VMPL2.
+ */
+static int deko_alloc_hidden_user_alias(struct mm_struct *mm,
+					unsigned long *alias_addr,
+					unsigned long len)
+{
+	unsigned long addr;
+
+	if (!mm || !alias_addr || !len)
+		return -EINVAL;
+
+	addr = vm_mmap(NULL, 0, len, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	if (IS_ERR_VALUE(addr))
+		return (int)addr;
+
+	mm_populate(addr, len);
+	*alias_addr = addr;
+
+	return 0;
+}
+
+static void deko_free_hidden_user_alias(unsigned long alias_addr,
+					unsigned long len)
+{
+	if (!alias_addr || !len)
+		return;
+
+	vm_munmap(alias_addr, len);
+}
 
 static inline bool is_exit_syscall(u64 syscall_num)
 {
@@ -276,6 +375,9 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 	local_irq_save(flags);
 
 	req = (struct deko_new_app_req *)svsm_get_caa()->svsm_buffer;
+	memset(req, 0, sizeof(*req));
+	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
+	req->req_size = sizeof(*req);
 
 	req->tgid = current->tgid;
 	req->pid = current->tgid;
@@ -300,11 +402,9 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 	return 0;
 }
 
-static int
-deko_app_handle_system_calls_post(struct mm_struct *mm,
-			  struct deko_syscall_body *syscall_body,
-			  unsigned long syscall_nr, unsigned long ax,
-			  unsigned long old_brk)
+static int deko_app_handle_system_calls_post(
+	struct mm_struct *mm, struct deko_syscall_body *syscall_body,
+	unsigned long syscall_nr, unsigned long ax, unsigned long old_brk)
 {
 	int ret;
 
@@ -360,14 +460,13 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	syscall_nr = syscall_body->ax;
 
 	if (unlikely(syscall_nr >= NR_syscalls)) {
-		pr_warn("Invalid syscall number %llu from VMPL1\n",
-			syscall_nr);
+		pr_warn("Invalid syscall number %llu from VMPL1\n", syscall_nr);
 		syscall_body->ax = -ENOSYS;
 		return -EINVAL;
 	}
 
-	trace_deko_syscall_entry(syscall_nr, syscall_body->di,
-				 syscall_body->si, syscall_body->dx);
+	trace_deko_syscall_entry(syscall_nr, syscall_body->di, syscall_body->si,
+				 syscall_body->dx);
 
 	tmp_regs.di = syscall_body->di;
 	tmp_regs.si = syscall_body->si;
@@ -390,11 +489,10 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 
 	sys_retval = syscall_fn(&tmp_regs);
 
-
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
 
-	return deko_app_handle_system_calls_post(current->mm, syscall_body,
-					 syscall_nr, sys_retval, old_brk);
+	return deko_app_handle_system_calls_post(
+		current->mm, syscall_body, syscall_nr, sys_retval, old_brk);
 }
 
 static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
@@ -470,6 +568,8 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 
 		pr_info("Pinned %lu pages for VMA [0x%lx-0x%lx]\n", nr_pages,
 			start, end);
+		for (cur = start; cur < end; cur += PAGE_SIZE)
+			deko_log_vaddr_pte(mm, cur);
 	}
 
 	mmap_read_unlock(mm);
@@ -567,6 +667,7 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_shared_buf *buf = NULL;
 	int pinned_count;
 	struct page **pages = NULL;
+	unsigned long alias_addr = 0;
 	unsigned int monitored_cpu;
 	u64 migration_version = 0;
 	u64 handled_syscall_nr = 0;
@@ -577,15 +678,31 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
 
+	pr_info("launch app CR3 snapshot pid=%d hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx mm_pgd=%px\n",
+		current->pid, read_cr3_pa(),
+		current->mm ? __sme_pa(current->mm->pgd) : 0UL,
+		current->mm ? current->mm->pgd : NULL);
+
+	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
+					     DEKO_DEFAULT_SHARED_BUF_SIZE);
+	if (errno < 0) {
+		pr_err("Failed to allocate hidden alias VMA for task %d, err: %d\n",
+		       current->pid, errno);
+		goto err_pin;
+	}
+
 	/*
 	 * At first we need to pin all the memories of the newly launched
 	 * application to prevent page fault that cannot be handled inside
 	 * VMPL1 and thus the application will crash immediately. This is
 	 * because by default Linux lazily loads the application code.
+	 *
+	 * The hidden alias VMA must already exist here so it is included in
+	 * the pinned user range visible to VMPL1.
 	 */
 	if ((pinned_count = deko_pin_pages(current->mm, &pages)) < 0) {
 		errno = pinned_count;
-		goto err_pin;
+		goto err_alias_vma;
 	}
 
 	buf = kzalloc(sizeof(struct deko_shared_buf), GFP_KERNEL);
@@ -593,7 +710,7 @@ void deko_proxy_loop(struct callback_head *work)
 		pr_err("Failed to allocate shared buffer for task %d\n",
 		       current->pid);
 		errno = -ENOMEM;
-		goto err_buf;
+		goto err_alias;
 	}
 
 	buf->buf = kzalloc(DEKO_DEFAULT_SHARED_BUF_SIZE, GFP_KERNEL);
@@ -603,6 +720,9 @@ void deko_proxy_loop(struct callback_head *work)
 		errno = -ENOMEM;
 		goto err_inner_buf;
 	}
+
+	buf->alias_buf = (void *)alias_addr;
+	buf->alias_len = DEKO_DEFAULT_SHARED_BUF_SIZE;
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	/* Shared buffer between VMPL1 and VMPL2. */
@@ -698,11 +818,15 @@ err_loop:
 		kfree(buf->buf);
 
 err_inner_buf:
+err_alias:
 	kfree(buf);
 
 err_buf:
 	unpin_user_pages(pages, pinned_count);
 	kvfree(pages);
+
+err_alias_vma:
+	deko_free_hidden_user_alias(alias_addr, DEKO_DEFAULT_SHARED_BUF_SIZE);
 
 err_pin:
 	kfree(dw);
@@ -711,10 +835,10 @@ err_pin:
 	 * Exit can also cause end of loop so we need to check if this is a "normal" exit, which
 	 * will enter this path with an exit syscall; or an error that happens during the loop and
 	 * the loop is exited by a non-exit syscall.
-	 * 
+	 *
 	 * In the former case, we should not treat it as an error and just exit normally; while in
 	 * the latter case, we should kill the process with the appropriate error code.
-	 * 
+	 *
 	 */
 	if (!normal_exit)
 		do_exit(errno);
