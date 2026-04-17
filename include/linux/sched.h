@@ -1631,6 +1631,11 @@ struct task_struct {
 	struct user_event_mm		*user_event_mm;
 #endif
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+ /* Whether this application is currently running inside VMPL1. */
+	bool is_monitored;
+#endif
+
 #ifdef CONFIG_UNWIND_USER
 	struct unwind_task_info		unwind_info;
 #endif

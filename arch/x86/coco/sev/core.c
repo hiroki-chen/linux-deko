@@ -7,9 +7,9 @@
  * Author: Joerg Roedel <jroedel@suse.de>
  */
 
-#define pr_fmt(fmt)	"SEV: " fmt
+#define pr_fmt(fmt) "SEV: " fmt
 
-#include <linux/sched/debug.h>	/* For show_regs() */
+#include <linux/sched/debug.h> /* For show_regs() */
 #include <linux/percpu-defs.h>
 #include <linux/cc_platform.h>
 #include <linux/printk.h>
@@ -58,6 +58,15 @@ SYM_PIC_ALIAS(sev_secrets_pa);
 struct svsm_ca boot_svsm_ca_page __aligned(PAGE_SIZE);
 SYM_PIC_ALIAS(boot_svsm_ca_page);
 
+/* The reserved pages for re-constructing the page table later. */
+static phys_addr_t page_l3 = 0, page_l2, page_l1 = 0;
+
+/* The reserved memory for the IFC policy engine. */
+static phys_addr_t deko_ifc_policy_engine_mem __ro_after_init = 0;
+
+/* The base address for the trampoline code's physical address. */
+static phys_addr_t trampoline_pa_base = 0;
+
 /*
  * SVSM related information:
  *   During boot, the page tables are set up as identity mapped and later
@@ -72,7 +81,7 @@ SYM_PIC_ALIAS(boot_svsm_caa_pa);
 DEFINE_PER_CPU(struct svsm_ca *, svsm_caa);
 DEFINE_PER_CPU(u64, svsm_caa_pa);
 
-static inline struct svsm_ca *svsm_get_caa(void)
+struct svsm_ca *svsm_get_caa(void)
 {
 	if (sev_cfg.use_cas)
 		return this_cpu_read(svsm_caa);
@@ -80,7 +89,7 @@ static inline struct svsm_ca *svsm_get_caa(void)
 		return rip_rel_ptr(&boot_svsm_ca_page);
 }
 
-static inline u64 svsm_get_caa_pa(void)
+u64 svsm_get_caa_pa(void)
 {
 	if (sev_cfg.use_cas)
 		return this_cpu_read(svsm_caa_pa);
@@ -89,39 +98,48 @@ static inline u64 svsm_get_caa_pa(void)
 }
 
 /* AP INIT values as documented in the APM2  section "Processor Initialization State" */
-#define AP_INIT_CS_LIMIT		0xffff
-#define AP_INIT_DS_LIMIT		0xffff
-#define AP_INIT_LDTR_LIMIT		0xffff
-#define AP_INIT_GDTR_LIMIT		0xffff
-#define AP_INIT_IDTR_LIMIT		0xffff
-#define AP_INIT_TR_LIMIT		0xffff
-#define AP_INIT_RFLAGS_DEFAULT		0x2
-#define AP_INIT_DR6_DEFAULT		0xffff0ff0
-#define AP_INIT_GPAT_DEFAULT		0x0007040600070406ULL
-#define AP_INIT_XCR0_DEFAULT		0x1
-#define AP_INIT_X87_FTW_DEFAULT		0x5555
-#define AP_INIT_X87_FCW_DEFAULT		0x0040
-#define AP_INIT_CR0_DEFAULT		0x60000010
-#define AP_INIT_MXCSR_DEFAULT		0x1f80
+#define AP_INIT_CS_LIMIT 0xffff
+#define AP_INIT_DS_LIMIT 0xffff
+#define AP_INIT_LDTR_LIMIT 0xffff
+#define AP_INIT_GDTR_LIMIT 0xffff
+#define AP_INIT_IDTR_LIMIT 0xffff
+#define AP_INIT_TR_LIMIT 0xffff
+#define AP_INIT_RFLAGS_DEFAULT 0x2
+#define AP_INIT_DR6_DEFAULT 0xffff0ff0
+#define AP_INIT_GPAT_DEFAULT 0x0007040600070406ULL
+#define AP_INIT_XCR0_DEFAULT 0x1
+#define AP_INIT_X87_FTW_DEFAULT 0x5555
+#define AP_INIT_X87_FCW_DEFAULT 0x0040
+#define AP_INIT_CR0_DEFAULT 0x60000010
+#define AP_INIT_MXCSR_DEFAULT 0x1f80
 
-static const char * const sev_status_feat_names[] = {
-	[MSR_AMD64_SEV_ENABLED_BIT]		= "SEV",
-	[MSR_AMD64_SEV_ES_ENABLED_BIT]		= "SEV-ES",
-	[MSR_AMD64_SEV_SNP_ENABLED_BIT]		= "SEV-SNP",
-	[MSR_AMD64_SNP_VTOM_BIT]		= "vTom",
-	[MSR_AMD64_SNP_REFLECT_VC_BIT]		= "ReflectVC",
-	[MSR_AMD64_SNP_RESTRICTED_INJ_BIT]	= "RI",
-	[MSR_AMD64_SNP_ALT_INJ_BIT]		= "AI",
-	[MSR_AMD64_SNP_DEBUG_SWAP_BIT]		= "DebugSwap",
-	[MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT]	= "NoHostIBS",
-	[MSR_AMD64_SNP_BTB_ISOLATION_BIT]	= "BTBIsol",
-	[MSR_AMD64_SNP_VMPL_SSS_BIT]		= "VmplSSS",
-	[MSR_AMD64_SNP_SECURE_TSC_BIT]		= "SecureTSC",
-	[MSR_AMD64_SNP_VMGEXIT_PARAM_BIT]	= "VMGExitParam",
-	[MSR_AMD64_SNP_IBS_VIRT_BIT]		= "IBSVirt",
-	[MSR_AMD64_SNP_VMSA_REG_PROT_BIT]	= "VMSARegProt",
-	[MSR_AMD64_SNP_SMT_PROT_BIT]		= "SMTProt",
-	[MSR_AMD64_SNP_SECURE_AVIC_BIT]		= "SecureAVIC",
+#define TRAMPOLINE_PGD_INDEX 466
+#define TRAMPOLINE_VA_BASE 0xffffe90000000000UL
+
+#define SVSM_PERCPU_BASE 0xffffffff00000000UL
+
+#define DEKO_IFC_POLICY_ENGINE_MEM_SIZE ((SZ_64M))
+
+static const char trampoline_init_magic[] __read_mostly = "TRAMPOLINE_INIT";
+
+static const char *const sev_status_feat_names[] = {
+	[MSR_AMD64_SEV_ENABLED_BIT] = "SEV",
+	[MSR_AMD64_SEV_ES_ENABLED_BIT] = "SEV-ES",
+	[MSR_AMD64_SEV_SNP_ENABLED_BIT] = "SEV-SNP",
+	[MSR_AMD64_SNP_VTOM_BIT] = "vTom",
+	[MSR_AMD64_SNP_REFLECT_VC_BIT] = "ReflectVC",
+	[MSR_AMD64_SNP_RESTRICTED_INJ_BIT] = "RI",
+	[MSR_AMD64_SNP_ALT_INJ_BIT] = "AI",
+	[MSR_AMD64_SNP_DEBUG_SWAP_BIT] = "DebugSwap",
+	[MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT] = "NoHostIBS",
+	[MSR_AMD64_SNP_BTB_ISOLATION_BIT] = "BTBIsol",
+	[MSR_AMD64_SNP_VMPL_SSS_BIT] = "VmplSSS",
+	[MSR_AMD64_SNP_SECURE_TSC_BIT] = "SecureTSC",
+	[MSR_AMD64_SNP_VMGEXIT_PARAM_BIT] = "VMGExitParam",
+	[MSR_AMD64_SNP_IBS_VIRT_BIT] = "IBSVirt",
+	[MSR_AMD64_SNP_VMSA_REG_PROT_BIT] = "VMSARegProt",
+	[MSR_AMD64_SNP_SMT_PROT_BIT] = "SMTProt",
+	[MSR_AMD64_SNP_SECURE_AVIC_BIT] = "SecureAVIC",
 };
 
 /*
@@ -133,8 +151,30 @@ static u64 snp_tsc_scale __ro_after_init;
 static u64 snp_tsc_offset __ro_after_init;
 static unsigned long snp_tsc_freq_khz __ro_after_init;
 
-DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
+DEFINE_PER_CPU(struct sev_es_runtime_data *, runtime_data);
 DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
+
+struct svsm_sev_trampoline_setup_req {
+	u64 syscall_enter_addr;
+	u64 trampoline_gva;
+	u64 trampoline_gpa;
+} __attribute__((aligned(8)));
+
+struct svsm_map_ifc_single_req {
+	u64 va_start;
+	u64 va_end;
+	u64 pa_start;
+	u64 pa_end;
+	bool is_per_cpu;
+} __attribute__((aligned(8)));
+
+struct svsm_map_ifc_req {
+	u16 req_len;
+	u16 __reserved[3];
+	u64 ghcb_va;
+	u64 db_va;
+	struct svsm_map_ifc_single_req reqs[16];
+} __attribute__((packed, aligned(8)));
 
 /*
  * SVSM related information:
@@ -163,6 +203,152 @@ static struct ghcb boot_ghcb_page __bss_decrypted __aligned(PAGE_SIZE);
  * cleared
  */
 struct ghcb *boot_ghcb __section(".data");
+
+static __init phys_addr_t alloc_stolen_mem(unsigned long size)
+{
+	phys_addr_t pa;
+
+	pa = memblock_phys_alloc(size, PMD_SIZE);
+	if (!pa)
+		return 0;
+
+	memblock_reserve(pa, size);
+
+	return pa;
+}
+
+static __init int set_up_deko_ifc_policy_engine_mapping(void)
+{
+	int ret = 0;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	unsigned long va_start = TRAMPOLINE_VA_BASE + PMD_SIZE;
+	unsigned long cur_va;
+	phys_addr_t cur_pa;
+	int i;
+
+	if (!deko_ifc_policy_engine_mem ||
+	    !IS_ALIGNED(deko_ifc_policy_engine_mem, PAGE_SIZE))
+		return -EINVAL;
+
+	pgd = pgd_offset_k(va_start);
+	if (pgd_none(*pgd))
+		return -ENOMEM;
+	p4d = p4d_offset(pgd, va_start);
+
+	if (p4d_none(*p4d)) {
+		unsigned long new_pud = alloc_stolen_mem(PAGE_SIZE);
+		if (!new_pud)
+			return -ENOMEM;
+
+		set_p4d(p4d, __p4d(__pa(new_pud) | 0x67 | _ENC));
+	}
+
+	pud = pud_offset(p4d, va_start);
+	if (pud_none(*pud)) {
+		unsigned long new_pmd = alloc_stolen_mem(PAGE_SIZE);
+		if (!new_pmd)
+			return -ENOMEM;
+		set_pud(pud, __pud(__pa(new_pmd) | 0x63 | _ENC));
+	}
+
+	cur_pa = deko_ifc_policy_engine_mem;
+	cur_va = va_start;
+	for (i = 0; i < (DEKO_IFC_POLICY_ENGINE_MEM_SIZE / PMD_SIZE); i++) {
+		pmd = pmd_offset(pud, cur_va);
+		pgprot_t prot = __pgprot(_PAGE_PRESENT | _PAGE_RW |
+					 _PAGE_GLOBAL | _PAGE_PSE | _ENC);
+		set_pmd(pmd, pfn_pmd(cur_pa >> PAGE_SHIFT, prot));
+
+		cur_pa += PMD_SIZE;
+		cur_va += PMD_SIZE;
+	}
+
+	__flush_tlb_all();
+
+	return ret;
+}
+
+static __init int claim_whole_pgd_entry(void)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	int i;
+	int ret = 0;
+
+	if (!trampoline_pa_base || !IS_ALIGNED(trampoline_pa_base, PMD_SIZE))
+		return -EINVAL;
+
+	pgd = pgd_offset_k(TRAMPOLINE_VA_BASE);
+	if (!pgd_none(*pgd)) {
+		pgd_clear(pgd);
+		__flush_tlb_all();
+	}
+
+	/* --- Level 3 (PUD Table) --- */
+	page_l3 = alloc_stolen_mem(PAGE_SIZE);
+	if (!page_l3) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+	memset(__va(page_l3), 0, PAGE_SIZE);
+
+	set_pgd(pgd, __pgd((page_l3 | 0x67 | _ENC)));
+
+	p4d = p4d_offset(pgd, TRAMPOLINE_VA_BASE);
+
+	/* --- Level 2 (PMD Table) --- */
+	page_l2 = alloc_stolen_mem(PAGE_SIZE);
+	if (!page_l2) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+	memset(__va(page_l2), 0, PAGE_SIZE);
+
+	pud = pud_offset(p4d, TRAMPOLINE_VA_BASE);
+	set_pud(pud, __pud((page_l2 | 0x63 | _ENC)));
+
+	page_l1 = alloc_stolen_mem(PAGE_SIZE);
+	if (!page_l1) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
+	memset(__va(page_l1), 0, PAGE_SIZE);
+
+	pmd = pmd_offset(pud, TRAMPOLINE_VA_BASE);
+
+	set_pmd(pmd, __pmd((page_l1 | 0x67 | _ENC)));
+	pte = pte_offset_kernel(pmd, TRAMPOLINE_VA_BASE);
+
+	for (i = 0; i < PTRS_PER_PTE; i++) {
+		phys_addr_t slice_pa = trampoline_pa_base + (i * PAGE_SIZE);
+		set_pte(&pte[i], __pte(slice_pa | 0x163 | _ENC));
+	}
+
+	// __flush_tlb_all();
+
+	goto out;
+
+free_pages:
+	if (ret < 0) {
+		if (page_l1)
+			memblock_add(page_l1, PAGE_SIZE);
+		if (page_l2)
+			memblock_add(page_l2, PAGE_SIZE);
+		if (page_l3)
+			memblock_add(page_l3, PAGE_SIZE);
+		if (pgd)
+			pgd_clear(pgd);
+	}
+
+out:
+	return ret;
+}
 
 static u64 __init get_snp_jump_table_addr(void)
 {
@@ -229,7 +415,7 @@ static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 	 * in the boot, so use rip-relative references as needed.
 	 */
 	ghcb->protocol_version = ghcb_version;
-	ghcb->ghcb_usage       = GHCB_DEFAULT_USAGE;
+	ghcb->ghcb_usage = GHCB_DEFAULT_USAGE;
 
 	ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_SNP_RUN_VMPL);
 	ghcb_set_sw_exit_info_1(ghcb, 0);
@@ -255,7 +441,7 @@ static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 	return svsm_process_result_codes(call);
 }
 
-static int svsm_perform_call_protocol(struct svsm_call *call)
+int svsm_perform_call_protocol(struct svsm_call *call)
 {
 	struct ghcb_state state;
 	unsigned long flags;
@@ -272,8 +458,8 @@ static int svsm_perform_call_protocol(struct svsm_call *call)
 		ghcb = NULL;
 
 	do {
-		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call)
-			   : __pi_svsm_perform_msr_protocol(call);
+		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call) :
+			     __pi_svsm_perform_msr_protocol(call);
 	} while (ret == -EAGAIN);
 
 	if (sev_cfg.ghcbs_initialized)
@@ -284,16 +470,19 @@ static int svsm_perform_call_protocol(struct svsm_call *call)
 	return ret;
 }
 
-static inline void __pval_terminate(u64 pfn, bool action, unsigned int page_size,
-				    int ret, u64 svsm_ret)
+static inline void __pval_terminate(u64 pfn, bool action,
+				    unsigned int page_size, int ret,
+				    u64 svsm_ret)
 {
-	WARN(1, "PVALIDATE failure: pfn: 0x%llx, action: %u, size: %u, ret: %d, svsm_ret: 0x%llx\n",
+	WARN(1,
+	     "PVALIDATE failure: pfn: 0x%llx, action: %u, size: %u, ret: %d, svsm_ret: 0x%llx\n",
 	     pfn, action, page_size, ret, svsm_ret);
 
 	sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
 }
 
-static void svsm_pval_terminate(struct svsm_pvalidate_call *pc, int ret, u64 svsm_ret)
+static void svsm_pval_terminate(struct svsm_pvalidate_call *pc, int ret,
+				u64 svsm_ret)
 {
 	unsigned int page_size;
 	bool action;
@@ -328,13 +517,15 @@ static void pval_pages(struct snp_psc_desc *desc)
 		if (!rc)
 			continue;
 
-		if (rc == PVALIDATE_FAIL_SIZEMISMATCH && size == RMP_PG_SIZE_2M) {
+		if (rc == PVALIDATE_FAIL_SIZEMISMATCH &&
+		    size == RMP_PG_SIZE_2M) {
 			unsigned long vaddr_end = vaddr + PMD_SIZE;
 
 			for (; vaddr < vaddr_end; vaddr += PAGE_SIZE, pfn++) {
 				rc = pvalidate(vaddr, RMP_PG_SIZE_4K, validate);
 				if (rc)
-					__pval_terminate(pfn, validate, RMP_PG_SIZE_4K, rc, 0);
+					__pval_terminate(pfn, validate,
+							 RMP_PG_SIZE_4K, rc, 0);
 			}
 		} else {
 			__pval_terminate(pfn, validate, size, rc, 0);
@@ -349,16 +540,16 @@ static u64 svsm_build_ca_from_pfn_range(u64 pfn, u64 pfn_end, bool action,
 
 	/* Nothing in the CA yet */
 	pc->num_entries = 0;
-	pc->cur_index   = 0;
+	pc->cur_index = 0;
 
 	pe = &pc->entry[0];
 
 	while (pfn < pfn_end) {
 		pe->page_size = RMP_PG_SIZE_4K;
-		pe->action    = action;
+		pe->action = action;
 		pe->ignore_cf = 0;
-		pe->rsvd      = 0;
-		pe->pfn       = pfn;
+		pe->rsvd = 0;
+		pe->pfn = pfn;
 
 		pe++;
 		pfn++;
@@ -371,7 +562,8 @@ static u64 svsm_build_ca_from_pfn_range(u64 pfn, u64 pfn_end, bool action,
 	return pfn;
 }
 
-static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc, unsigned int desc_entry,
+static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc,
+				       unsigned int desc_entry,
 				       struct svsm_pvalidate_call *pc)
 {
 	struct svsm_pvalidate_entry *pe;
@@ -379,17 +571,17 @@ static int svsm_build_ca_from_psc_desc(struct snp_psc_desc *desc, unsigned int d
 
 	/* Nothing in the CA yet */
 	pc->num_entries = 0;
-	pc->cur_index   = 0;
+	pc->cur_index = 0;
 
 	pe = &pc->entry[0];
-	e  = &desc->entries[desc_entry];
+	e = &desc->entries[desc_entry];
 
 	while (desc_entry <= desc->hdr.end_entry) {
 		pe->page_size = e->pagesize ? RMP_PG_SIZE_2M : RMP_PG_SIZE_4K;
-		pe->action    = e->operation == SNP_PAGE_STATE_PRIVATE;
+		pe->action = e->operation == SNP_PAGE_STATE_PRIVATE;
 		pe->ignore_cf = 0;
-		pe->rsvd      = 0;
-		pe->pfn       = e->gfn;
+		pe->rsvd = 0;
+		pe->pfn = e->gfn;
 
 		pe++;
 		e++;
@@ -451,7 +643,8 @@ static void svsm_pval_pages(struct snp_psc_desc *desc)
 			 */
 
 			if (call.rax_out == SVSM_PVALIDATE_FAIL_SIZEMISMATCH &&
-			    pc->entry[pc->cur_index].page_size == RMP_PG_SIZE_2M) {
+			    pc->entry[pc->cur_index].page_size ==
+				    RMP_PG_SIZE_2M) {
 				/* Save this entry for post-processing at 4K */
 				pv_4k[pv_4k_count++] = pc->entry[pc->cur_index];
 
@@ -472,12 +665,13 @@ static void svsm_pval_pages(struct snp_psc_desc *desc)
 	for (i = 0; i < pv_4k_count; i++) {
 		u64 pfn, pfn_end;
 
-		action  = pv_4k[i].action;
-		pfn     = pv_4k[i].pfn;
+		action = pv_4k[i].action;
+		pfn = pv_4k[i].pfn;
 		pfn_end = pfn + 512;
 
 		while (pfn < pfn_end) {
-			pfn = svsm_build_ca_from_pfn_range(pfn, pfn_end, action, pc);
+			pfn = svsm_build_ca_from_pfn_range(pfn, pfn_end, action,
+							   pc);
 
 			ret = svsm_perform_call_protocol(&call);
 			if (ret)
@@ -513,7 +707,8 @@ static void pvalidate_pages(struct snp_psc_desc *desc)
 		 * eviction mitigation.
 		 */
 		if (e->operation == SNP_PAGE_STATE_PRIVATE)
-			sev_evict_cache(pfn_to_kaddr(e->gfn), e->pagesize ? 512 : 1);
+			sev_evict_cache(pfn_to_kaddr(e->gfn),
+					e->pagesize ? 512 : 1);
 	}
 }
 
@@ -527,7 +722,8 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 
 	/* Copy the input desc into GHCB shared buffer */
 	data = (struct snp_psc_desc *)ghcb->shared_buffer;
-	memcpy(ghcb->shared_buffer, desc, min_t(int, GHCB_SHARED_BUF_SIZE, sizeof(*desc)));
+	memcpy(ghcb->shared_buffer, desc,
+	       min_t(int, GHCB_SHARED_BUF_SIZE, sizeof(*desc)));
 
 	/*
 	 * As per the GHCB specification, the hypervisor can resume the guest
@@ -555,14 +751,15 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 		 * exit_info_2.
 		 */
 		if (WARN(ret || ghcb->save.sw_exit_info_2,
-			 "SNP: PSC failed ret=%d exit_info_2=%llx\n",
-			 ret, ghcb->save.sw_exit_info_2)) {
+			 "SNP: PSC failed ret=%d exit_info_2=%llx\n", ret,
+			 ghcb->save.sw_exit_info_2)) {
 			ret = 1;
 			goto out;
 		}
 
 		/* Verify that reserved bit is not set */
-		if (WARN(data->hdr.reserved, "Reserved bit is set in the PSC header\n")) {
+		if (WARN(data->hdr.reserved,
+			 "Reserved bit is set in the PSC header\n")) {
 			ret = 1;
 			goto out;
 		}
@@ -571,9 +768,11 @@ static int vmgexit_psc(struct ghcb *ghcb, struct snp_psc_desc *desc)
 		 * Sanity check that entry processing is not going backwards.
 		 * This will happen only if hypervisor is tricking us.
 		 */
-		if (WARN(data->hdr.end_entry > end_entry || cur_entry > data->hdr.cur_entry,
-"SNP: PSC processing going backward, end_entry %d (got %d) cur_entry %d (got %d)\n",
-			 end_entry, data->hdr.end_entry, cur_entry, data->hdr.cur_entry)) {
+		if (WARN(data->hdr.end_entry > end_entry ||
+				 cur_entry > data->hdr.cur_entry,
+			 "SNP: PSC processing going backward, end_entry %d (got %d) cur_entry %d (got %d)\n",
+			 end_entry, data->hdr.end_entry, cur_entry,
+			 data->hdr.cur_entry)) {
 			ret = 1;
 			goto out;
 		}
@@ -583,7 +782,8 @@ out:
 	return ret;
 }
 
-static unsigned long __set_pages_state(struct snp_psc_desc *data, unsigned long vaddr,
+static unsigned long __set_pages_state(struct snp_psc_desc *data,
+				       unsigned long vaddr,
 				       unsigned long vaddr_end, int op)
 {
 	struct ghcb_state state;
@@ -655,6 +855,24 @@ static unsigned long __set_pages_state(struct snp_psc_desc *data, unsigned long 
 	return vaddr;
 }
 
+static void *alloc_page_table_safe(void)
+{
+	void *ptr;
+
+	if (slab_is_available()) {
+		ptr = (void *)get_zeroed_page(GFP_ATOMIC);
+	} else {
+		phys_addr_t pa = alloc_stolen_mem(PAGE_SIZE);
+		if (pa) {
+			ptr = __va(pa);
+			memset(ptr, 0, PAGE_SIZE);
+		} else {
+			ptr = NULL;
+		}
+	}
+	return ptr;
+}
+
 static void set_pages_state(unsigned long vaddr, unsigned long npages, int op)
 {
 	struct snp_psc_desc desc;
@@ -703,7 +921,8 @@ void snp_accept_memory(phys_addr_t start, phys_addr_t end)
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
-static int vmgexit_ap_control(u64 event, struct sev_es_save_area *vmsa, u32 apic_id)
+static int vmgexit_ap_control(u64 event, struct sev_es_save_area *vmsa,
+			      u32 apic_id)
 {
 	bool create = event != SVM_VMGEXIT_AP_DESTROY;
 	struct ghcb_state state;
@@ -721,10 +940,8 @@ static int vmgexit_ap_control(u64 event, struct sev_es_save_area *vmsa, u32 apic
 		ghcb_set_rax(ghcb, vmsa->sev_features);
 
 	ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_AP_CREATION);
-	ghcb_set_sw_exit_info_1(ghcb,
-				((u64)apic_id << 32)	|
-				((u64)snp_vmpl << 16)	|
-				event);
+	ghcb_set_sw_exit_info_1(ghcb, ((u64)apic_id << 32) |
+					      ((u64)snp_vmpl << 16) | event);
 	ghcb_set_sw_exit_info_2(ghcb, __pa(vmsa));
 
 	sev_es_wr_ghcb_msr(__pa(ghcb));
@@ -760,7 +977,7 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 			/* Protocol 0, Call ID 2 */
 			call.rax = SVSM_CORE_CALL(SVSM_CORE_CREATE_VCPU);
 			call.rdx = __pa(caa);
-			call.r8  = apic_id;
+			call.r8 = apic_id;
 		} else {
 			/* Protocol 0, Call ID 3 */
 			call.rax = SVSM_CORE_CALL(SVSM_CORE_DELETE_VCPU);
@@ -788,6 +1005,217 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 	return ret;
 }
 
+static int force_map_va_range(unsigned long va_start, unsigned long va_end,
+			      phys_addr_t pa_start, unsigned long flags)
+{
+	unsigned long addr;
+	phys_addr_t paddr = pa_start;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	for (addr = va_start; addr < va_end;
+	     addr += PAGE_SIZE, paddr += PAGE_SIZE) {
+		/* --- Level 4: PGD --- */
+		pgd = pgd_offset_k(addr);
+
+		if (pgd_none(*pgd)) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+
+			set_pgd(pgd, __pgd(__pa(new_page) | 0x67 | _ENC));
+		}
+
+		p4d = p4d_offset(pgd, addr);
+
+		/* --- Level 3: PUD --- */
+		if (pud_none(*pud_offset(p4d, addr))) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+			set_pud(pud_offset(p4d, addr),
+				__pud(__pa(new_page) | 0x63 | _ENC));
+		}
+		pud = pud_offset(p4d, addr);
+
+		/* --- Level 2: PMD --- */
+		if (pmd_none(*pmd_offset(pud, addr))) {
+			void *new_page = alloc_page_table_safe();
+			if (!new_page)
+				return -ENOMEM;
+
+			set_pmd(pmd_offset(pud, addr),
+				__pmd(__pa(new_page) | 0x67 | _ENC));
+		}
+		pmd = pmd_offset(pud, addr);
+
+		/* --- Level 1: PTE --- */
+		pte = pte_offset_kernel(pmd, addr);
+
+		set_pte(pte, __pte(paddr | 0x167 | _ENC));
+	}
+
+	return 0;
+}
+
+int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
+{
+	struct svsm_call call = { 0 };
+
+	call.caa = svsm_get_caa();
+	struct deko_load_policy_req *req;
+	phys_addr_t req_pa;
+	unsigned long flags;
+	u64 max_blob_len;
+	int ret = 0;
+
+	if (!domain_id || !buf || !len)
+		return -EINVAL;
+
+	max_blob_len = sizeof_field(struct svsm_ca, svsm_buffer) - sizeof(*req);
+	if (len > max_blob_len)
+		return -E2BIG;
+
+	local_irq_save(flags);
+
+	req = (struct deko_load_policy_req *)(svsm_get_caa()->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+
+	req->domain_id = domain_id;
+	req->reserved = 0;
+	req->blob_gpa = req_pa + sizeof(*req);
+	req->blob_len = len;
+	memcpy(req + 1, buf, len);
+
+	call.caa = svsm_get_caa();
+	call.r9 = req_pa;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LOAD_POLICY);
+
+	if (svsm_perform_call_protocol(&call))
+		ret = -EOPNOTSUPP;
+
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
+
+static void make_va_decrypted(unsigned long va)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	/* 1. Walk PGD */
+	pgd = pgd_offset_k(va);
+	if (pgd_none(*pgd))
+		return;
+
+	p4d = p4d_offset(pgd, va);
+	if (p4d_none(*p4d))
+		return;
+
+	/* 2. Walk PUD */
+	pud = pud_offset(p4d, va);
+	if (pud_none(*pud))
+		return;
+
+	/* 3. Walk PMD */
+	pmd = pmd_offset(pud, va);
+	if (pmd_none(*pmd))
+		return;
+
+	if ((pmd_val(*pmd) & _PAGE_PSE)) {
+		unsigned long val = pmd_val(*pmd);
+
+		val &= ~_ENC;
+		set_pmd(pmd, __pmd(val));
+		pr_info("SVSM: GHCB VA %lx (PMD Huge) marked as Decrypted to %lx.\n",
+			va, val);
+		return;
+	}
+
+	pte = pte_offset_kernel(pmd, va);
+	if (pte_none(*pte))
+		return;
+
+	unsigned long val = pte_val(*pte);
+	val &= ~_ENC;
+	set_pte(pte, __pte(val));
+
+	pr_info("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va,
+		val);
+}
+
+static void process_map_vmpl1(struct svsm_map_ifc_req *req)
+{
+	size_t i;
+	struct svsm_map_ifc_single_req *cur;
+	int cpu;
+	u64 ghcb_va, db_va;
+	unsigned long calculated_va;
+
+	for (i = 0; i < req->req_len; i++) {
+		cur = &req->reqs[i];
+
+		if (!cur->is_per_cpu) {
+			if (smp_processor_id() == 0) {
+				force_map_va_range(cur->va_start, cur->va_end,
+						   cur->pa_start, 0x163);
+			}
+		} else {
+			cpu = smp_processor_id();
+			calculated_va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
+
+			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
+				cpu, calculated_va, cur->pa_start);
+
+			if (force_map_va_range(calculated_va,
+					       calculated_va + PAGE_SIZE,
+					       cur->pa_start, 0x163))
+				pr_err("Mapping PER-CPU failed.");
+		}
+	}
+
+	ghcb_va = req->ghcb_va;
+	db_va = req->db_va;
+	make_va_decrypted(ghcb_va);
+	make_va_decrypted(db_va);
+
+	__flush_tlb_all();
+}
+
+/*
+ * Leverage Linux's support for mapping the VMPL1 GHCB within it.
+ *
+ * The kernel cannot see the content nor write to the GHCB due to RMP protections
+ * but it can help us manage the mapping in its kernel space so that we can utilize
+ * the GHCB protocol for SVSM calls when VMPL1 is active.
+ */
+enum es_result __init svsm_map_vmpl1(void)
+{
+	struct svsm_call call = { 0 };
+
+	call.caa = svsm_get_caa();
+	struct svsm_map_ifc_req req = { 0 };
+	unsigned long pa = get_anything_pa(&req);
+
+	call.caa = svsm_get_caa();
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_MAP_IFC);
+	call.rcx = pa;
+
+	if (svsm_perform_call_protocol(&call))
+		return ES_UNSUPPORTED;
+
+	process_map_vmpl1(&req);
+
+	return ES_OK;
+}
+
 static void snp_cleanup_vmsa(struct sev_es_save_area *vmsa, int apic_id)
 {
 	int err;
@@ -802,14 +1230,270 @@ static void snp_cleanup_vmsa(struct sev_es_save_area *vmsa, int apic_id)
 static void set_pte_enc(pte_t *kpte, int level, void *va)
 {
 	struct pte_enc_desc d = {
-		.kpte	   = kpte,
-		.pte_level = level,
-		.va	   = va,
-		.encrypt   = true
+		.kpte = kpte, .pte_level = level, .va = va, .encrypt = true
 	};
 
 	prepare_pte_enc(&d);
 	set_pte_enc_mask(kpte, d.pfn, d.new_pgprot);
+}
+
+static void deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
+			       u32 flags, unsigned long mapped_start,
+			       unsigned long mapped_end,
+			       unsigned long exact_start,
+			       unsigned long exact_end)
+{
+	struct deko_base_region_desc *prev;
+	u16 idx;
+
+	if (mapped_start >= mapped_end || exact_start >= exact_end)
+		return;
+
+	if (req->region_count > 0) {
+		prev = &req->regions[req->region_count - 1];
+		if (prev->kind == kind && prev->perm == perm &&
+		    prev->flags == flags && prev->mapped_end == mapped_start &&
+		    prev->exact_end == exact_start) {
+			prev->mapped_end = mapped_end;
+			prev->exact_end = exact_end;
+			return;
+		}
+	}
+
+	if (req->region_count >= DEKO_MAX_BASE_REGIONS)
+		return;
+
+	idx = req->region_count;
+	req->regions[idx].kind = kind;
+	req->regions[idx].perm = perm;
+	req->regions[idx].flags = flags;
+	req->regions[idx].mapped_start = mapped_start;
+	req->regions[idx].mapped_end = mapped_end;
+	req->regions[idx].exact_start = exact_start;
+	req->regions[idx].exact_end = exact_end;
+	req->region_count = idx + 1;
+}
+
+static u16 deko_region_perm_from_vma(const struct vm_area_struct *vma)
+{
+	u16 perm = 0;
+
+	if (vma->vm_flags & VM_READ)
+		perm |= DEKO_REGION_R;
+	if (vma->vm_flags & VM_WRITE)
+		perm |= DEKO_REGION_W;
+	if (vma->vm_flags & VM_EXEC)
+		perm |= DEKO_REGION_X;
+
+	return perm;
+}
+
+static void deko_fill_req_regions(struct deko_new_app_req *req,
+				  struct task_struct *task)
+{
+	struct mm_struct *mm = task->mm;
+	struct vm_area_struct *vma;
+	unsigned long data_exact_lo;
+	unsigned long data_exact_hi;
+	unsigned long data_mapped_hi;
+	unsigned long heap_exact_lo;
+	unsigned long heap_exact_hi;
+	unsigned long heap_mapped_lo;
+	unsigned long heap_mapped_hi;
+	struct vma_iterator vmi;
+
+	if (!mm)
+		return;
+
+	vma_iter_init(&vmi, mm, 0);
+	data_exact_lo = mm->start_data;
+	data_exact_hi = mm->end_data;
+	data_mapped_hi = PAGE_ALIGN(mm->end_data);
+	heap_exact_lo = mm->start_brk;
+	heap_exact_hi = mm->brk;
+	heap_mapped_lo = heap_exact_lo & PAGE_MASK;
+	heap_mapped_hi = PAGE_ALIGN(heap_exact_hi);
+
+	for_each_vma(vmi, vma) {
+		u16 perm = deko_region_perm_from_vma(vma);
+		u32 flags = 0;
+		unsigned long start = vma->vm_start;
+		unsigned long end = vma->vm_end;
+
+		if (vma_is_initial_stack(vma)) {
+			if (vma->vm_flags & VM_GROWSDOWN)
+				flags |= DEKO_REGION_F_GROWSDOWN;
+			deko_append_region(req, DEKO_BASE_REGION_STACK, perm,
+					   flags, start, end, start, end);
+			continue;
+		}
+
+		if (vma->vm_flags & VM_EXEC) {
+			deko_append_region(req, DEKO_BASE_REGION_CODE, perm, 0,
+					   start, end, start, end);
+			continue;
+		}
+
+		if ((vma->vm_flags & VM_READ) && !(vma->vm_flags & VM_WRITE) &&
+		    !(vma->vm_flags & VM_EXEC) && vma->vm_file) {
+			deko_append_region(req, DEKO_BASE_REGION_RODATA, perm,
+					   0, start, end, start, end);
+			continue;
+		}
+
+		if ((vma->vm_flags & (VM_WRITE | VM_SHARED | VM_STACK)) ==
+		    VM_WRITE) {
+			unsigned long exact_lo;
+			unsigned long exact_hi;
+
+			exact_lo = max(start, data_exact_lo);
+			exact_hi = min(end, data_exact_hi);
+			if (exact_lo < exact_hi) {
+				deko_append_region(req, DEKO_BASE_REGION_DATA,
+						   perm,
+						   DEKO_REGION_F_TEMPLATE_RW,
+						   start,
+						   min(end, data_mapped_hi),
+						   exact_lo, exact_hi);
+			}
+
+			if (!vma->vm_file && data_mapped_hi < heap_exact_lo) {
+				unsigned long bss_mapped_lo;
+				unsigned long bss_mapped_hi;
+				unsigned long bss_exact_lo;
+				unsigned long bss_exact_hi;
+
+				bss_mapped_lo = max(start, data_mapped_hi);
+				bss_mapped_hi = min(end, heap_mapped_lo);
+				bss_exact_lo = bss_mapped_lo;
+				bss_exact_hi = min(end, heap_exact_lo);
+				if (bss_mapped_lo < bss_mapped_hi &&
+				    bss_exact_lo < bss_exact_hi) {
+					deko_append_region(
+						req, DEKO_BASE_REGION_BSS, perm,
+						DEKO_REGION_F_ZERO_INIT |
+							DEKO_REGION_F_TEMPLATE_RW,
+						bss_mapped_lo, bss_mapped_hi,
+						bss_exact_lo, bss_exact_hi);
+				}
+			}
+		}
+
+		{
+			unsigned long heap_exact_vma_lo;
+			unsigned long heap_exact_vma_hi;
+			unsigned long heap_mapped_vma_lo;
+			unsigned long heap_mapped_vma_hi;
+
+			heap_exact_vma_lo = max(start, heap_exact_lo);
+			heap_exact_vma_hi = min(end, heap_exact_hi);
+			heap_mapped_vma_lo = max(start, heap_mapped_lo);
+			heap_mapped_vma_hi = min(end, heap_mapped_hi);
+			if (heap_mapped_vma_lo < heap_mapped_vma_hi &&
+			    heap_exact_vma_lo < heap_exact_vma_hi) {
+				deko_append_region(req, DEKO_BASE_REGION_HEAP,
+						   perm, 0, heap_mapped_vma_lo,
+						   heap_mapped_vma_hi,
+						   heap_exact_vma_lo,
+						   heap_exact_vma_hi);
+			}
+		}
+	}
+}
+
+enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
+				     bool creation, unsigned long *token_low,
+				     unsigned long *token_high,
+				     enum deko_new_app_type ty)
+{
+	enum es_result ret = ES_OK;
+	phys_addr_t req_pa;
+	struct deko_new_app_req *req;
+	struct svsm_call call = { 0 };
+
+	call.caa = svsm_get_caa();
+	unsigned long flags;
+
+	local_irq_save(flags);
+
+	/* Re-use the SVSM buffer for allocating the request body. */
+	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	memset(req, 0, sizeof(*req));
+
+	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
+	req->req_size = sizeof(*req);
+	req->pid = task->pid;
+	req->ppid = task->real_parent->pid;
+	req->tgid = task->tgid;
+	req->uid = current_cred()->uid.val;
+	req->domain_id = 0;
+	req->mnt_ns_id = 0;
+	req->start_brk = task->mm ? task->mm->start_brk : 0;
+	req->brk = task->mm ? task->mm->brk : 0;
+
+	req->fs_base = x86_fsbase_read_task(task);
+	req->gs_base = x86_gsbase_read_task(task);
+	req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task));
+	req->app_type = ty;
+
+	strscpy(req->comm, task->comm, sizeof(req->comm));
+	strscpy(req->launch_identity, task->comm, sizeof(req->launch_identity));
+
+	if (task->nsproxy && task->nsproxy->mnt_ns)
+		req->mnt_ns_id = ns_id;
+
+	if (ty == DEKO_DOCKER_APPS) {
+		if (deko_domain_lookup(req->mnt_ns_id, &req->domain_id)) {
+			pr_err("report_app domain lookup failed: pid=%d comm=%s mnt_ns_id=%llu creation=%u\n",
+			       task->pid, task->comm,
+			       (unsigned long long)req->mnt_ns_id,
+			       creation ? 1 : 0);
+			local_irq_restore(flags);
+			return ES_UNSUPPORTED;
+		}
+	}
+
+	if (task->mm) {
+		mmap_read_lock(task->mm);
+		deko_fill_req_regions(req, task);
+		mmap_read_unlock(task->mm);
+	}
+
+	call.caa = svsm_get_caa();
+	call.r9 = req_pa;
+	call.r8 = creation ? 1 : 0;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
+
+	pr_info("report app live CR3 pid=%d comm=%s hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx mm_pgd=%px creation=%u\n",
+		task->pid, task->comm, read_cr3_pa(),
+		task->mm ? __sme_pa(task->mm->pgd) : 0UL,
+		task->mm ? task->mm->pgd : NULL, creation ? 1 : 0);
+
+	{
+		int call_ret = svsm_perform_call_protocol(&call);
+
+		if (call_ret) {
+			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%lx mm_pgd_pa=0x%lx\n",
+			       task->pid, task->comm, req->launch_identity,
+			       creation ? 1 : 0, call_ret, call.rax_out,
+			       call.rcx_out, call.rdx_out, call.r8_out,
+			       call.r9_out, req->domain_id,
+			       (unsigned long long)req->mnt_ns_id, req->version,
+			       req->req_size, req->region_count, read_cr3_pa(),
+			       task->mm ? __sme_pa(task->mm->pgd) : 0UL);
+			ret = ES_UNSUPPORTED;
+		}
+	}
+
+	if (creation && ty == DEKO_DOCKER_APPS) {
+		*token_low = req->kernel_vmpl1_rsp;
+		*token_high = 0;
+	}
+
+	local_irq_restore(flags);
+
+	return ret;
 }
 
 static void unshare_all_memory(void)
@@ -823,7 +1507,7 @@ static void unshare_all_memory(void)
 
 	/* Unshare the direct mapping. */
 	addr = PAGE_OFFSET;
-	end  = PAGE_OFFSET + get_max_mapped();
+	end = PAGE_OFFSET + get_max_mapped();
 
 	while (addr < end) {
 		pte = lookup_address(addr, &level);
@@ -861,7 +1545,7 @@ static void unshare_all_memory(void)
 
 	/* Unshare all bss decrypted memory. */
 	addr = (unsigned long)__start_bss_decrypted;
-	end  = (unsigned long)__start_bss_decrypted_unused;
+	end = (unsigned long)__start_bss_decrypted_unused;
 	npages = (end - addr) >> PAGE_SHIFT;
 
 	for (; addr < end; addr += PAGE_SIZE) {
@@ -955,6 +1639,59 @@ static void shutdown_all_aps(void)
 	put_cpu();
 }
 
+/*
+ * "Allocate" an isolated region from the VM hole for the trampoline code.
+ * This region shall never interfere with any other memory used by the linux
+ * kernel so we can reduce the overhead of page faults handling etc. if
+ * any other code is trying to R/W the data/code that coincidentally share
+ * the same intermedate page translation paths.
+ */
+int __init alloc_isolated_trampoline(void)
+{
+	void *target_va;
+	int cpu;
+	char *cpu_trampoline_va;
+
+	if (!trampoline_pa_base) {
+		trampoline_pa_base = alloc_stolen_mem(PMD_SIZE);
+		if (!trampoline_pa_base)
+			return -ENOMEM;
+	}
+
+	if (!deko_ifc_policy_engine_mem) {
+		deko_ifc_policy_engine_mem =
+			alloc_stolen_mem(DEKO_IFC_POLICY_ENGINE_MEM_SIZE);
+		if (!deko_ifc_policy_engine_mem)
+			/*
+		 * Need to free the memory but returning this eventually panics the system
+		 * so should be fine.
+		 */
+			return -ENOMEM;
+	}
+
+	target_va = __va(trampoline_pa_base);
+
+	/* Now copy the magic number. */
+	cpu = smp_processor_id();
+	cpu_trampoline_va = (char *)(target_va + (cpu * PAGE_SIZE));
+
+	/* Copy the trampoline code to the allocated region. */
+	memcpy(cpu_trampoline_va, trampoline_init_magic,
+	       sizeof(trampoline_init_magic));
+
+	/*
+	 * Now we utilize the "hole" for placing the trampoline code.
+	 *
+	 * This avoids interference with other kernel functionalities and ensure
+	 * no potential #PF will occur.
+	 */
+	if (!cpu && (claim_whole_pgd_entry() ||
+		     set_up_deko_ifc_policy_engine_mapping()))
+		return -EINVAL;
+
+	return 0;
+}
+
 void snp_kexec_finish(void)
 {
 	struct sev_es_runtime_data *data;
@@ -994,12 +1731,13 @@ void snp_kexec_finish(void)
 	}
 }
 
-#define __ATTR_BASE		(SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK)
-#define INIT_CS_ATTRIBS		(__ATTR_BASE | SVM_SELECTOR_READ_MASK | SVM_SELECTOR_CODE_MASK)
-#define INIT_DS_ATTRIBS		(__ATTR_BASE | SVM_SELECTOR_WRITE_MASK)
+#define __ATTR_BASE (SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK)
+#define INIT_CS_ATTRIBS \
+	(__ATTR_BASE | SVM_SELECTOR_READ_MASK | SVM_SELECTOR_CODE_MASK)
+#define INIT_DS_ATTRIBS (__ATTR_BASE | SVM_SELECTOR_WRITE_MASK)
 
-#define INIT_LDTR_ATTRIBS	(SVM_SELECTOR_P_MASK | 2)
-#define INIT_TR_ATTRIBS		(SVM_SELECTOR_P_MASK | 3)
+#define INIT_LDTR_ATTRIBS (SVM_SELECTOR_P_MASK | 2)
+#define INIT_TR_ATTRIBS (SVM_SELECTOR_P_MASK | 3)
 
 static void *snp_alloc_vmsa_page(int cpu)
 {
@@ -1013,7 +1751,8 @@ static void *snp_alloc_vmsa_page(int cpu)
 	 *
 	 * Allocate an 8k page which is also 8k-aligned.
 	 */
-	p = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL_ACCOUNT | __GFP_ZERO, 1);
+	p = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL_ACCOUNT | __GFP_ZERO,
+			     1);
 	if (!p)
 		return NULL;
 
@@ -1025,7 +1764,8 @@ static void *snp_alloc_vmsa_page(int cpu)
 	return page_address(p + 1);
 }
 
-static int wakeup_cpu_via_vmgexit(u32 apic_id, unsigned long start_ip, unsigned int cpu)
+static int wakeup_cpu_via_vmgexit(u32 apic_id, unsigned long start_ip,
+				  unsigned int cpu)
 {
 	struct sev_es_save_area *cur_vmsa, *vmsa;
 	struct svsm_ca *caa;
@@ -1071,54 +1811,54 @@ static int wakeup_cpu_via_vmgexit(u32 apic_id, unsigned long start_ip, unsigned 
 	cr4 = native_read_cr4() & X86_CR4_MCE;
 
 	/* Set the CS value based on the start_ip converted to a SIPI vector */
-	sipi_vector		= (start_ip >> 12);
-	vmsa->cs.base		= sipi_vector << 12;
-	vmsa->cs.limit		= AP_INIT_CS_LIMIT;
-	vmsa->cs.attrib		= INIT_CS_ATTRIBS;
-	vmsa->cs.selector	= sipi_vector << 8;
+	sipi_vector = (start_ip >> 12);
+	vmsa->cs.base = sipi_vector << 12;
+	vmsa->cs.limit = AP_INIT_CS_LIMIT;
+	vmsa->cs.attrib = INIT_CS_ATTRIBS;
+	vmsa->cs.selector = sipi_vector << 8;
 
 	/* Set the RIP value based on start_ip */
-	vmsa->rip		= start_ip & 0xfff;
+	vmsa->rip = start_ip & 0xfff;
 
 	/* Set AP INIT defaults as documented in the APM */
-	vmsa->ds.limit		= AP_INIT_DS_LIMIT;
-	vmsa->ds.attrib		= INIT_DS_ATTRIBS;
-	vmsa->es		= vmsa->ds;
-	vmsa->fs		= vmsa->ds;
-	vmsa->gs		= vmsa->ds;
-	vmsa->ss		= vmsa->ds;
+	vmsa->ds.limit = AP_INIT_DS_LIMIT;
+	vmsa->ds.attrib = INIT_DS_ATTRIBS;
+	vmsa->es = vmsa->ds;
+	vmsa->fs = vmsa->ds;
+	vmsa->gs = vmsa->ds;
+	vmsa->ss = vmsa->ds;
 
-	vmsa->gdtr.limit	= AP_INIT_GDTR_LIMIT;
-	vmsa->ldtr.limit	= AP_INIT_LDTR_LIMIT;
-	vmsa->ldtr.attrib	= INIT_LDTR_ATTRIBS;
-	vmsa->idtr.limit	= AP_INIT_IDTR_LIMIT;
-	vmsa->tr.limit		= AP_INIT_TR_LIMIT;
-	vmsa->tr.attrib		= INIT_TR_ATTRIBS;
+	vmsa->gdtr.limit = AP_INIT_GDTR_LIMIT;
+	vmsa->ldtr.limit = AP_INIT_LDTR_LIMIT;
+	vmsa->ldtr.attrib = INIT_LDTR_ATTRIBS;
+	vmsa->idtr.limit = AP_INIT_IDTR_LIMIT;
+	vmsa->tr.limit = AP_INIT_TR_LIMIT;
+	vmsa->tr.attrib = INIT_TR_ATTRIBS;
 
-	vmsa->cr4		= cr4;
-	vmsa->cr0		= AP_INIT_CR0_DEFAULT;
-	vmsa->dr7		= DR7_RESET_VALUE;
-	vmsa->dr6		= AP_INIT_DR6_DEFAULT;
-	vmsa->rflags		= AP_INIT_RFLAGS_DEFAULT;
-	vmsa->g_pat		= AP_INIT_GPAT_DEFAULT;
-	vmsa->xcr0		= AP_INIT_XCR0_DEFAULT;
-	vmsa->mxcsr		= AP_INIT_MXCSR_DEFAULT;
-	vmsa->x87_ftw		= AP_INIT_X87_FTW_DEFAULT;
-	vmsa->x87_fcw		= AP_INIT_X87_FCW_DEFAULT;
+	vmsa->cr4 = cr4;
+	vmsa->cr0 = AP_INIT_CR0_DEFAULT;
+	vmsa->dr7 = DR7_RESET_VALUE;
+	vmsa->dr6 = AP_INIT_DR6_DEFAULT;
+	vmsa->rflags = AP_INIT_RFLAGS_DEFAULT;
+	vmsa->g_pat = AP_INIT_GPAT_DEFAULT;
+	vmsa->xcr0 = AP_INIT_XCR0_DEFAULT;
+	vmsa->mxcsr = AP_INIT_MXCSR_DEFAULT;
+	vmsa->x87_ftw = AP_INIT_X87_FTW_DEFAULT;
+	vmsa->x87_fcw = AP_INIT_X87_FCW_DEFAULT;
 
 	if (cc_platform_has(CC_ATTR_SNP_SECURE_AVIC))
 		vmsa->vintr_ctrl |= V_GIF_MASK | V_NMI_ENABLE_MASK;
 
 	/* SVME must be set. */
-	vmsa->efer		= EFER_SVME;
+	vmsa->efer = EFER_SVME;
 
 	/*
 	 * Set the SNP-specific fields for this VMSA:
 	 *   VMPL level
 	 *   SEV_FEATURES (matches the SEV STATUS MSR right shifted 2 bits)
 	 */
-	vmsa->vmpl		= snp_vmpl;
-	vmsa->sev_features	= sev_status >> 2;
+	vmsa->vmpl = snp_vmpl;
+	vmsa->sev_features = sev_status >> 2;
 
 	/* Populate AP's TSC scale/offset to get accurate TSC values. */
 	if (cc_platform_has(CC_ATTR_GUEST_SNP_SECURE_TSC)) {
@@ -1185,8 +1925,8 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
 	jump_table_pa = jump_table_addr & PAGE_MASK;
 
 	startup_cs = (u16)(rmh->trampoline_start >> 4);
-	startup_ip = (u16)(rmh->sev_es_trampoline_start -
-			   rmh->trampoline_start);
+	startup_ip =
+		(u16)(rmh->sev_es_trampoline_start - rmh->trampoline_start);
 
 	jump_table = ioremap_encrypted(jump_table_pa, PAGE_SIZE);
 	if (!jump_table)
@@ -1198,6 +1938,21 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
 	iounmap(jump_table);
 
 	return 0;
+}
+
+phys_addr_t get_anything_pa(void *vaddr)
+{
+	unsigned long addr = (unsigned long)vaddr;
+	struct page *page;
+
+	if (is_vmalloc_addr(vaddr)) {
+		page = vmalloc_to_page(vaddr);
+		if (!page)
+			return 0;
+		return (page_to_pfn(page) << PAGE_SHIFT) | (addr & ~PAGE_MASK);
+	}
+
+	return __pa(addr);
 }
 
 /*
@@ -1235,12 +1990,53 @@ int __init sev_es_efi_map_ghcbs_cas(pgd_t *pgd)
 				return 1;
 
 			pfn = address >> PAGE_SHIFT;
-			if (kernel_map_pages_in_pgd(pgd, pfn, address, 1, pflags_enc))
+			if (kernel_map_pages_in_pgd(pgd, pfn, address, 1,
+						    pflags_enc))
 				return 1;
 		}
 	}
 
 	return 0;
+}
+
+/*
+ * Sets up the syscall entry point for the SVSM. This is needed for the SVSM to be able
+ * to handle syscalls when running at VMPL1.
+ *
+ * The trampolien replaces the original syscall's body with a jump to the IFC engine, and
+ * then re-uses the entry point to handle the syscalls.
+ */
+enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr)
+{
+	enum es_result ret = ES_OK;
+	struct svsm_sev_trampoline_setup_req *req;
+	struct svsm_call call = { 0 };
+	phys_addr_t req_pa;
+	int cpu_id;
+
+	cpu_id = smp_processor_id();
+	call.caa = svsm_get_caa();
+
+	if (!cpu_id) {
+		/* Re-use the SVSM buffer for allocating the request body. */
+		req = (struct svsm_sev_trampoline_setup_req *)(call.caa->svsm_buffer);
+		req_pa = svsm_get_caa_pa() +
+			 offsetof(struct svsm_ca, svsm_buffer);
+		call.r9 = req_pa;
+		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TRAMPOLINE_SETUP);
+
+		req->syscall_enter_addr = sysenter_addr;
+		req->trampoline_gva = TRAMPOLINE_VA_BASE;
+		req->trampoline_gpa = trampoline_pa_base;
+
+		if (svsm_perform_call_protocol(&call)) {
+			ret = ES_UNSUPPORTED;
+			goto out;
+		}
+	}
+
+out:
+	return ret;
 }
 
 u64 savic_ghcb_msr_read(u32 reg)
@@ -1259,7 +2055,8 @@ u64 savic_ghcb_msr_read(u32 reg)
 
 	res = sev_es_ghcb_handle_msr(ghcb, &ctxt, false);
 	if (res != ES_OK) {
-		pr_err("Secure AVIC MSR (0x%llx) read returned error (%d)\n", msr, res);
+		pr_err("Secure AVIC MSR (0x%llx) read returned error (%d)\n",
+		       msr, res);
 		/* MSR read failures are treated as fatal errors */
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_SAVIC_FAIL);
 	}
@@ -1272,11 +2069,9 @@ u64 savic_ghcb_msr_read(u32 reg)
 void savic_ghcb_msr_write(u32 reg, u64 value)
 {
 	u64 msr = APIC_BASE_MSR + (reg >> 4);
-	struct pt_regs regs = {
-		.cx = msr,
-		.ax = lower_32_bits(value),
-		.dx = upper_32_bits(value)
-	};
+	struct pt_regs regs = { .cx = msr,
+				.ax = lower_32_bits(value),
+				.dx = upper_32_bits(value) };
 	struct es_em_ctxt ctxt = { .regs = &regs };
 	struct ghcb_state state;
 	enum es_result res;
@@ -1289,7 +2084,8 @@ void savic_ghcb_msr_write(u32 reg, u64 value)
 
 	res = sev_es_ghcb_handle_msr(ghcb, &ctxt, true);
 	if (res != ES_OK) {
-		pr_err("Secure AVIC MSR (0x%llx) write returned error (%d)\n", msr, res);
+		pr_err("Secure AVIC MSR (0x%llx) write returned error (%d)\n",
+		       msr, res);
 		/* MSR writes should never fail. Any failure is fatal error for SNP guest */
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_SAVIC_FAIL);
 	}
@@ -1441,8 +2237,8 @@ static void sev_es_play_dead(void)
 	 */
 	soft_restart_cpu();
 }
-#else  /* CONFIG_HOTPLUG_CPU */
-#define sev_es_play_dead	native_play_dead
+#else /* CONFIG_HOTPLUG_CPU */
+#define sev_es_play_dead native_play_dead
 #endif /* CONFIG_HOTPLUG_CPU */
 
 #ifdef CONFIG_SMP
@@ -1451,7 +2247,9 @@ static void __init sev_es_setup_play_dead(void)
 	smp_ops.play_dead = sev_es_play_dead;
 }
 #else
-static inline void sev_es_setup_play_dead(void) { }
+static inline void sev_es_setup_play_dead(void)
+{
+}
 #endif
 
 static void __init alloc_runtime_data(int cpu)
@@ -1468,8 +2266,8 @@ static void __init alloc_runtime_data(int cpu)
 		struct svsm_ca *caa;
 
 		/* Allocate the SVSM CA page if an SVSM is present */
-		caa = cpu ? memblock_alloc_or_panic(sizeof(*caa), PAGE_SIZE)
-			  : &boot_svsm_ca_page;
+		caa = cpu ? memblock_alloc_or_panic(sizeof(*caa), PAGE_SIZE) :
+			    &boot_svsm_ca_page;
 
 		per_cpu(svsm_caa, cpu) = caa;
 		per_cpu(svsm_caa_pa, cpu) = __pa(caa);
@@ -1498,7 +2296,8 @@ void __init sev_es_init_vc_handling(void)
 {
 	int cpu;
 
-	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) % PAGE_SIZE);
+	BUILD_BUG_ON(offsetof(struct sev_es_runtime_data, ghcb_page) %
+		     PAGE_SIZE);
 
 	if (!cc_platform_has(CC_ATTR_GUEST_STATE_ENCRYPT))
 		return;
@@ -1514,7 +2313,8 @@ void __init sev_es_init_vc_handling(void)
 		sev_hv_features = get_hv_features();
 
 		if (!(sev_hv_features & GHCB_HV_FT_SNP))
-			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
+			sev_es_terminate(SEV_TERM_SET_GEN,
+					 GHCB_SNP_UNSUPPORTED);
 	}
 
 	/* Initialize per-cpu GHCB pages */
@@ -1548,8 +2348,8 @@ static void dump_cpuid_table(void)
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
 	int i = 0;
 
-	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n",
-		cpuid_table->count, cpuid_table->__reserved1, cpuid_table->__reserved2);
+	pr_info("count=%d reserved=0x%x reserved2=0x%llx\n", cpuid_table->count,
+		cpuid_table->__reserved1, cpuid_table->__reserved2);
 
 	for (i = 0; i < SNP_CPUID_COUNT_MAX; i++) {
 		const struct snp_cpuid_fn *fn = &cpuid_table->fn[i];
@@ -1588,7 +2388,8 @@ static int __init report_snp_info(void)
 }
 arch_initcall(report_snp_info);
 
-static void update_attest_input(struct svsm_call *call, struct svsm_attest_call *input)
+static void update_attest_input(struct svsm_call *call,
+				struct svsm_attest_call *input)
 {
 	/* If (new) lengths have been returned, propagate them up */
 	if (call->rcx_out != call->rcx)
@@ -1617,7 +2418,8 @@ int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call,
 	call->caa = svsm_get_caa();
 
 	ac = (struct svsm_attest_call *)call->caa->svsm_buffer;
-	attest_call_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	attest_call_pa =
+		svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	*ac = *input;
 
@@ -1668,7 +2470,8 @@ static int snp_issue_guest_request(struct snp_guest_req *req)
 		ghcb_set_rbx(ghcb, input->data_npages);
 	}
 
-	ret = sev_es_ghcb_hv_call(ghcb, &ctxt, req->exit_code, input->req_gpa, input->resp_gpa);
+	ret = sev_es_ghcb_hv_call(ghcb, &ctxt, req->exit_code, input->req_gpa,
+				  input->resp_gpa);
 	if (ret)
 		goto e_put;
 
@@ -1761,13 +2564,13 @@ int snp_svsm_vtpm_send_command(u8 *buffer)
 EXPORT_SYMBOL_GPL(snp_svsm_vtpm_send_command);
 
 static struct platform_device sev_guest_device = {
-	.name		= "sev-guest",
-	.id		= -1,
+	.name = "sev-guest",
+	.id = -1,
 };
 
 static struct platform_device tpm_svsm_device = {
-	.name		= "tpm-svsm",
-	.id		= -1,
+	.name = "tpm-svsm",
+	.id = -1,
 };
 
 static int __init snp_init_platform_device(void)
@@ -1778,8 +2581,7 @@ static int __init snp_init_platform_device(void)
 	if (platform_device_register(&sev_guest_device))
 		return -ENODEV;
 
-	if (snp_svsm_vtpm_probe() &&
-	    platform_device_register(&tpm_svsm_device))
+	if (snp_svsm_vtpm_probe() && platform_device_register(&tpm_svsm_device))
 		return -ENODEV;
 
 	pr_info("SNP guest platform devices initialized.\n");
@@ -1804,18 +2606,15 @@ void sev_show_status(void)
 }
 
 #ifdef CONFIG_SYSFS
-static ssize_t vmpl_show(struct kobject *kobj,
-			 struct kobj_attribute *attr, char *buf)
+static ssize_t vmpl_show(struct kobject *kobj, struct kobj_attribute *attr,
+			 char *buf)
 {
 	return sysfs_emit(buf, "%d\n", snp_vmpl);
 }
 
 static struct kobj_attribute vmpl_attr = __ATTR_RO(vmpl);
 
-static struct attribute *vmpl_attrs[] = {
-	&vmpl_attr.attr,
-	NULL
-};
+static struct attribute *vmpl_attrs[] = { &vmpl_attr.attr, NULL };
 
 static struct attribute_group sev_attr_group = {
 	.attrs = vmpl_attrs,
@@ -1937,7 +2736,8 @@ int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id)
 	if (vmpck_id == -1)
 		vmpck_id = snp_vmpl;
 
-	mdesc->vmpck = get_vmpck(vmpck_id, mdesc->secrets, &mdesc->os_area_msg_seqno);
+	mdesc->vmpck =
+		get_vmpck(vmpck_id, mdesc->secrets, &mdesc->os_area_msg_seqno);
 	if (!mdesc->vmpck) {
 		pr_err("Invalid VMPCK%d communication key\n", vmpck_id);
 		return -EINVAL;
@@ -2036,7 +2836,7 @@ static DEFINE_MUTEX(snp_cmd_mutex);
 static void snp_disable_vmpck(struct snp_msg_desc *mdesc)
 {
 	pr_alert("Disabling VMPCK%d communication key to prevent IV reuse.\n",
-		  mdesc->vmpck_id);
+		 mdesc->vmpck_id);
 	memzero_explicit(mdesc->vmpck, VMPCK_KEY_LEN);
 	mdesc->vmpck = NULL;
 }
@@ -2083,7 +2883,8 @@ static void snp_inc_msg_seqno(struct snp_msg_desc *mdesc)
 	*mdesc->os_area_msg_seqno += 2;
 }
 
-static int verify_and_dec_payload(struct snp_msg_desc *mdesc, struct snp_guest_req *req)
+static int verify_and_dec_payload(struct snp_msg_desc *mdesc,
+				  struct snp_guest_req *req)
 {
 	struct snp_guest_msg *resp_msg = &mdesc->secret_response;
 	struct snp_guest_msg *req_msg = &mdesc->secret_request;
@@ -2093,8 +2894,8 @@ static int verify_and_dec_payload(struct snp_msg_desc *mdesc, struct snp_guest_r
 	u8 iv[GCM_AES_IV_SIZE] = {};
 
 	pr_debug("response [seqno %lld type %d version %d sz %d]\n",
-		 resp_msg_hdr->msg_seqno, resp_msg_hdr->msg_type, resp_msg_hdr->msg_version,
-		 resp_msg_hdr->msg_sz);
+		 resp_msg_hdr->msg_seqno, resp_msg_hdr->msg_type,
+		 resp_msg_hdr->msg_version, resp_msg_hdr->msg_sz);
 
 	/* Copy response from shared memory to encrypted memory. */
 	memcpy(resp_msg, mdesc->response, sizeof(*resp_msg));
@@ -2116,15 +2917,18 @@ static int verify_and_dec_payload(struct snp_msg_desc *mdesc, struct snp_guest_r
 		return -EBADMSG;
 
 	/* Decrypt the payload */
-	memcpy(iv, &resp_msg_hdr->msg_seqno, min(sizeof(iv), sizeof(resp_msg_hdr->msg_seqno)));
-	if (!aesgcm_decrypt(ctx, req->resp_buf, resp_msg->payload, resp_msg_hdr->msg_sz,
-			    &resp_msg_hdr->algo, AAD_LEN, iv, resp_msg_hdr->authtag))
+	memcpy(iv, &resp_msg_hdr->msg_seqno,
+	       min(sizeof(iv), sizeof(resp_msg_hdr->msg_seqno)));
+	if (!aesgcm_decrypt(ctx, req->resp_buf, resp_msg->payload,
+			    resp_msg_hdr->msg_sz, &resp_msg_hdr->algo, AAD_LEN,
+			    iv, resp_msg_hdr->authtag))
 		return -EBADMSG;
 
 	return 0;
 }
 
-static int enc_payload(struct snp_msg_desc *mdesc, u64 seqno, struct snp_guest_req *req)
+static int enc_payload(struct snp_msg_desc *mdesc, u64 seqno,
+		       struct snp_guest_req *req)
 {
 	struct snp_guest_msg *msg = &mdesc->secret_request;
 	struct snp_guest_msg_hdr *hdr = &msg->hdr;
@@ -2159,7 +2963,8 @@ static int enc_payload(struct snp_msg_desc *mdesc, u64 seqno, struct snp_guest_r
 	return 0;
 }
 
-static int __handle_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req)
+static int __handle_guest_request(struct snp_msg_desc *mdesc,
+				  struct snp_guest_req *req)
 {
 	unsigned long req_start = jiffies;
 	unsigned int override_npages = 0;
@@ -2184,7 +2989,7 @@ retry_request:
 		 * IV reuse.
 		 */
 		override_npages = req->input.data_npages;
-		req->exit_code	= SVM_VMGEXIT_GUEST_REQUEST;
+		req->exit_code = SVM_VMGEXIT_GUEST_REQUEST;
 
 		/*
 		 * Override the error to inform callers the given extended
@@ -2234,7 +3039,9 @@ retry_request:
 		 * prevent IV reuse. If the standard request was successful, return -EIO
 		 * back to the caller as would have originally been returned.
 		 */
-		if (!rc && override_err == SNP_GUEST_VMM_ERR(SNP_GUEST_VMM_ERR_INVALID_LEN))
+		if (!rc &&
+		    override_err ==
+			    SNP_GUEST_VMM_ERR(SNP_GUEST_VMM_ERR_INVALID_LEN))
 			rc = -EIO;
 	}
 
@@ -2244,7 +3051,8 @@ retry_request:
 	return rc;
 }
 
-int snp_send_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req)
+int snp_send_guest_request(struct snp_msg_desc *mdesc,
+			   struct snp_guest_req *req)
 {
 	u64 seqno;
 	int rc;
@@ -2283,7 +3091,8 @@ int snp_send_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req
 	 * Write the fully encrypted request to the shared unencrypted
 	 * request page.
 	 */
-	memcpy(mdesc->request, &mdesc->secret_request, sizeof(mdesc->secret_request));
+	memcpy(mdesc->request, &mdesc->secret_request,
+	       sizeof(mdesc->secret_request));
 
 	/* Initialize the input address for guest request */
 	req->input.req_gpa = __pa(mdesc->request);
@@ -2293,11 +3102,13 @@ int snp_send_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req
 	rc = __handle_guest_request(mdesc, req);
 	if (rc) {
 		if (rc == -EIO &&
-		    req->exitinfo2 == SNP_GUEST_VMM_ERR(SNP_GUEST_VMM_ERR_INVALID_LEN))
+		    req->exitinfo2 ==
+			    SNP_GUEST_VMM_ERR(SNP_GUEST_VMM_ERR_INVALID_LEN))
 			return rc;
 
-		pr_alert("Detected error from ASP request. rc: %d, exitinfo2: 0x%llx\n",
-			 rc, req->exitinfo2);
+		pr_alert(
+			"Detected error from ASP request. rc: %d, exitinfo2: 0x%llx\n",
+			rc, req->exitinfo2);
 
 		snp_disable_vmpck(mdesc);
 		return rc;
@@ -2305,7 +3116,9 @@ int snp_send_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req
 
 	rc = verify_and_dec_payload(mdesc, req);
 	if (rc) {
-		pr_alert("Detected unexpected decode failure from ASP. rc: %d\n", rc);
+		pr_alert(
+			"Detected unexpected decode failure from ASP. rc: %d\n",
+			rc);
 		snp_disable_vmpck(mdesc);
 		return rc;
 	}
@@ -2356,15 +3169,17 @@ static int __init snp_get_tsc_info(void)
 	if (rc)
 		goto e_request;
 
-	pr_debug("%s: response status 0x%x scale 0x%llx offset 0x%llx factor 0x%x\n",
-		 __func__, tsc_resp->status, tsc_resp->tsc_scale, tsc_resp->tsc_offset,
-		 tsc_resp->tsc_factor);
+	pr_debug(
+		"%s: response status 0x%x scale 0x%llx offset 0x%llx factor 0x%x\n",
+		__func__, tsc_resp->status, tsc_resp->tsc_scale,
+		tsc_resp->tsc_offset, tsc_resp->tsc_factor);
 
 	if (!tsc_resp->status) {
 		snp_tsc_scale = tsc_resp->tsc_scale;
 		snp_tsc_offset = tsc_resp->tsc_offset;
 	} else {
-		pr_err("Failed to get TSC info, response status 0x%x\n", tsc_resp->status);
+		pr_err("Failed to get TSC info, response status 0x%x\n",
+		       tsc_resp->status);
 		rc = -EIO;
 	}
 
@@ -2422,7 +3237,8 @@ void __init snp_secure_tsc_init(void)
 	/* Extract the GUEST TSC MHZ from BIT[17:0], rest is reserved space */
 	tsc_freq_mhz &= GENMASK_ULL(17, 0);
 
-	snp_tsc_freq_khz = SNP_SCALE_TSC_FREQ(tsc_freq_mhz * 1000, secrets->tsc_factor);
+	snp_tsc_freq_khz =
+		SNP_SCALE_TSC_FREQ(tsc_freq_mhz * 1000, secrets->tsc_factor);
 
 	x86_platform.calibrate_cpu = securetsc_get_tsc_khz;
 	x86_platform.calibrate_tsc = securetsc_get_tsc_khz;

@@ -17,22 +17,95 @@
 #include <asm/set_memory.h>
 #include <asm/svm.h>
 
-#define GHCB_PROTOCOL_MIN	1ULL
-#define GHCB_PROTOCOL_MAX	2ULL
-#define GHCB_DEFAULT_USAGE	0ULL
+#define GHCB_PROTOCOL_MIN 1ULL
+#define GHCB_PROTOCOL_MAX 2ULL
+#define GHCB_DEFAULT_USAGE 0ULL
 
-#define	VMGEXIT()			{ asm volatile("rep; vmmcall\n\r"); }
+#define VMGEXIT()                                 \
+	{                                         \
+		asm volatile("rep; vmmcall\n\r"); \
+	}
 
 struct boot_params;
 
 enum es_result {
-	ES_OK,			/* All good */
-	ES_UNSUPPORTED,		/* Requested operation not supported */
-	ES_VMM_ERROR,		/* Unexpected state from the VMM */
-	ES_DECODE_FAILED,	/* Instruction decoding failed */
-	ES_EXCEPTION,		/* Instruction caused exception */
-	ES_RETRY,		/* Retry instruction emulation */
+	ES_OK, /* All good */
+	ES_UNSUPPORTED, /* Requested operation not supported */
+	ES_VMM_ERROR, /* Unexpected state from the VMM */
+	ES_DECODE_FAILED, /* Instruction decoding failed */
+	ES_EXCEPTION, /* Instruction caused exception */
+	ES_RETRY, /* Retry instruction emulation */
 };
+
+enum deko_new_app_type {
+	DEKO_DOCKER_INFRA = 0,
+	DEKO_DOCKER_APPS = 1,
+};
+
+#define DEKO_NEW_APP_REQ_VERSION_V3 3
+#define DEKO_MAX_BASE_REGIONS 16
+
+enum deko_base_region_kind {
+	DEKO_BASE_REGION_CODE = 1,
+	DEKO_BASE_REGION_RODATA = 2,
+	DEKO_BASE_REGION_DATA = 3,
+	DEKO_BASE_REGION_BSS = 4,
+	DEKO_BASE_REGION_HEAP = 5,
+	DEKO_BASE_REGION_STACK = 6,
+};
+
+enum deko_region_perm {
+	DEKO_REGION_R = 1u << 0,
+	DEKO_REGION_W = 1u << 1,
+	DEKO_REGION_X = 1u << 2,
+};
+
+enum deko_region_flags {
+	DEKO_REGION_F_ZERO_INIT = 1u << 0,
+	DEKO_REGION_F_GROWSDOWN = 1u << 1,
+	DEKO_REGION_F_TEMPLATE_RW = 1u << 2,
+};
+
+struct deko_base_region_desc {
+	u16 kind;
+	u16 perm;
+	u32 flags;
+	u64 mapped_start;
+	u64 mapped_end;
+	u64 exact_start;
+	u64 exact_end;
+} __attribute__((aligned(8)));
+
+struct deko_new_app_req {
+	u16 version;
+	u16 region_count;
+	u32 req_size;
+
+	u32 pid;
+	u32 tgid;
+	u32 ppid;
+	u32 uid;
+
+	u64 mnt_ns_id;
+	u64 start_brk;
+	u64 brk;
+	char comm[16];
+	char launch_identity[64];
+	u64 kernel_vmpl1_rsp;
+	u64 fs_base;
+	u64 gs_base;
+	u64 kernel_gs_base;
+	enum deko_new_app_type app_type;
+	u32 domain_id;
+	struct deko_base_region_desc regions[DEKO_MAX_BASE_REGIONS];
+} __attribute__((aligned(8)));
+
+struct deko_load_policy_req {
+	u32 domain_id;
+	u32 reserved;
+	u64 blob_gpa;
+	u64 blob_len;
+} __attribute__((aligned(8)));
 
 struct es_fault_info {
 	unsigned long vector;
@@ -54,7 +127,7 @@ struct es_em_ctxt {
  * defined in OVMF UEFI firmware header:
  * https://github.com/tianocore/edk2/blob/master/OvmfPkg/Include/Guid/ConfidentialComputingSevSnpBlob.h
  */
-#define CC_BLOB_SEV_HDR_MAGIC	0x45444d41
+#define CC_BLOB_SEV_HDR_MAGIC 0x45444d41
 struct cc_blob_sev_info {
 	u32 magic;
 	u16 version;
@@ -78,6 +151,18 @@ static inline u64 lower_bits(u64 val, unsigned int bits)
 
 struct real_mode_header;
 enum stack_type;
+
+extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
+					    bool creation,
+					    unsigned long *token_low,
+					    unsigned long *token_high,
+					    enum deko_new_app_type ty);
+extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
+
+extern int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len);
+extern int deko_domain_bind(u64 mnt_ns_id, u32 domain_id);
+extern int deko_domain_lookup(u64 mnt_ns_id, u32 *domain_id);
+extern int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id);
 
 /* Early IDT entry points for #VC handler */
 extern void vc_no_ghcb(void);
@@ -115,22 +200,24 @@ struct snp_cpuid_table {
 } __packed;
 
 /* PVALIDATE return codes */
-#define PVALIDATE_FAIL_SIZEMISMATCH	6
+#define PVALIDATE_FAIL_SIZEMISMATCH 6
 
 /* Software defined (when rFlags.CF = 1) */
-#define PVALIDATE_FAIL_NOUPDATE		255
+#define PVALIDATE_FAIL_NOUPDATE 255
 
 /* RMUPDATE detected 4K page and 2MB page overlap. */
-#define RMPUPDATE_FAIL_OVERLAP		4
+#define RMPUPDATE_FAIL_OVERLAP 4
 
 /* PSMASH failed due to concurrent access by another CPU */
-#define PSMASH_FAIL_INUSE		3
+#define PSMASH_FAIL_INUSE 3
 
 /* RMP page size */
-#define RMP_PG_SIZE_4K			0
-#define RMP_PG_SIZE_2M			1
-#define RMP_TO_PG_LEVEL(level)		(((level) == RMP_PG_SIZE_4K) ? PG_LEVEL_4K : PG_LEVEL_2M)
-#define PG_LEVEL_TO_RMP(level)		(((level) == PG_LEVEL_4K) ? RMP_PG_SIZE_4K : RMP_PG_SIZE_2M)
+#define RMP_PG_SIZE_4K 0
+#define RMP_PG_SIZE_2M 1
+#define RMP_TO_PG_LEVEL(level) \
+	(((level) == RMP_PG_SIZE_4K) ? PG_LEVEL_4K : PG_LEVEL_2M)
+#define PG_LEVEL_TO_RMP(level) \
+	(((level) == PG_LEVEL_4K) ? RMP_PG_SIZE_4K : RMP_PG_SIZE_2M)
 
 struct rmp_state {
 	u64 gpa;
@@ -141,7 +228,7 @@ struct rmp_state {
 	u32 asid;
 } __packed;
 
-#define RMPADJUST_VMSA_PAGE_BIT		BIT(16)
+#define RMPADJUST_VMSA_PAGE_BIT BIT(16)
 
 /* SNP Guest message request */
 struct snp_req_data {
@@ -151,13 +238,13 @@ struct snp_req_data {
 	unsigned int data_npages;
 };
 
-#define MAX_AUTHTAG_LEN		32
-#define AUTHTAG_LEN		16
-#define AAD_LEN			48
-#define MSG_HDR_VER		1
+#define MAX_AUTHTAG_LEN 32
+#define AUTHTAG_LEN 16
+#define AAD_LEN 48
+#define MSG_HDR_VER 1
 
-#define SNP_REQ_MAX_RETRY_DURATION      (60*HZ)
-#define SNP_REQ_RETRY_DELAY             (2*HZ)
+#define SNP_REQ_MAX_RETRY_DURATION (60 * HZ)
+#define SNP_REQ_RETRY_DELAY (2 * HZ)
 
 /* See SNP spec SNP_GUEST_REQUEST section for the structure */
 enum msg_type {
@@ -208,7 +295,7 @@ struct snp_guest_msg {
 	u8 payload[PAGE_SIZE - sizeof(struct snp_guest_msg_hdr)];
 } __packed;
 
-#define SNP_TSC_INFO_REQ_SZ	128
+#define SNP_TSC_INFO_REQ_SZ 128
 
 struct snp_tsc_info_req {
 	u8 rsvd[SNP_TSC_INFO_REQ_SZ];
@@ -269,13 +356,12 @@ struct secrets_os_area {
 	u8 guest_usage[32];
 } __packed;
 
-#define VMPCK_KEY_LEN		32
+#define VMPCK_KEY_LEN 32
 
 /* See the SNP spec version 0.9 for secrets page format */
 struct snp_secrets_page {
 	u32 version;
-	u32 imien	: 1,
-	    rsvd1	: 31;
+	u32 imien : 1, rsvd1 : 31;
 	u32 fms;
 	u32 rsvd2;
 	u8 gosvw[16];
@@ -332,26 +418,25 @@ struct svsm_ca {
 	u8 svsm_buffer[PAGE_SIZE - 8];
 };
 
-#define SVSM_SUCCESS				0
-#define SVSM_ERR_INCOMPLETE			0x80000000
-#define SVSM_ERR_UNSUPPORTED_PROTOCOL		0x80000001
-#define SVSM_ERR_UNSUPPORTED_CALL		0x80000002
-#define SVSM_ERR_INVALID_ADDRESS		0x80000003
-#define SVSM_ERR_INVALID_FORMAT			0x80000004
-#define SVSM_ERR_INVALID_PARAMETER		0x80000005
-#define SVSM_ERR_INVALID_REQUEST		0x80000006
-#define SVSM_ERR_BUSY				0x80000007
-#define SVSM_PVALIDATE_FAIL_SIZEMISMATCH	0x80001006
+#define SVSM_SUCCESS 0
+#define SVSM_ERR_INCOMPLETE 0x80000000
+#define SVSM_ERR_UNSUPPORTED_PROTOCOL 0x80000001
+#define SVSM_ERR_UNSUPPORTED_CALL 0x80000002
+#define SVSM_ERR_INVALID_ADDRESS 0x80000003
+#define SVSM_ERR_INVALID_FORMAT 0x80000004
+#define SVSM_ERR_INVALID_PARAMETER 0x80000005
+#define SVSM_ERR_INVALID_REQUEST 0x80000006
+#define SVSM_ERR_BUSY 0x80000007
+#define SVSM_PVALIDATE_FAIL_SIZEMISMATCH 0x80001006
+
+#define DEKO_TIMER_SERVICE 0x70000001
+#define DEKO_SERVICE_APP_ENTER_OK 0x0
 
 /*
  * The SVSM PVALIDATE related structures
  */
 struct svsm_pvalidate_entry {
-	u64 page_size		: 2,
-	    action		: 1,
-	    ignore_cf		: 1,
-	    rsvd		: 8,
-	    pfn			: 52;
+	u64 page_size : 2, action : 1, ignore_cf : 1, rsvd : 8, pfn : 52;
 };
 
 struct svsm_pvalidate_call {
@@ -363,9 +448,10 @@ struct svsm_pvalidate_call {
 	struct svsm_pvalidate_entry entry[];
 };
 
-#define SVSM_PVALIDATE_MAX_COUNT	((sizeof_field(struct svsm_ca, svsm_buffer) -		\
-					  offsetof(struct svsm_pvalidate_call, entry)) /	\
-					 sizeof(struct svsm_pvalidate_entry))
+#define SVSM_PVALIDATE_MAX_COUNT                         \
+	((sizeof_field(struct svsm_ca, svsm_buffer) -    \
+	  offsetof(struct svsm_pvalidate_call, entry)) / \
+	 sizeof(struct svsm_pvalidate_entry))
 
 /*
  * The SVSM Attestation related structures
@@ -421,19 +507,39 @@ struct svsm_call {
 	u64 r9_out;
 };
 
-#define SVSM_CORE_CALL(x)		((0ULL << 32) | (x))
-#define SVSM_CORE_REMAP_CA		0
-#define SVSM_CORE_PVALIDATE		1
-#define SVSM_CORE_CREATE_VCPU		2
-#define SVSM_CORE_DELETE_VCPU		3
+struct deko_task_work {
+	struct callback_head work;
+};
 
-#define SVSM_ATTEST_CALL(x)		((1ULL << 32) | (x))
-#define SVSM_ATTEST_SERVICES		0
-#define SVSM_ATTEST_SINGLE_SERVICE	1
+extern struct svsm_ca *svsm_get_caa(void);
+extern u64 svsm_get_caa_pa(void);
+extern int svsm_perform_call_protocol(struct svsm_call *call);
+extern int svsm_perform_msr_protocol(struct svsm_call *call);
+extern void deko_proxy_loop(struct callback_head *work);
+extern phys_addr_t get_anything_pa(void *vaddr);
 
-#define SVSM_VTPM_CALL(x)		((2ULL << 32) | (x))
-#define SVSM_VTPM_QUERY			0
-#define SVSM_VTPM_CMD			1
+#define SVSM_CORE_CALL(x) ((0ULL << 32) | (x))
+#define SVSM_CORE_REMAP_CA 0
+#define SVSM_CORE_PVALIDATE 1
+#define SVSM_CORE_CREATE_VCPU 2
+#define SVSM_CORE_DELETE_VCPU 3
+
+#define SVSM_ATTEST_CALL(x) ((1ULL << 32) | (x))
+#define SVSM_ATTEST_SERVICES 0
+#define SVSM_ATTEST_SINGLE_SERVICE 1
+
+#define SVSM_VTPM_CALL(x) ((2ULL << 32) | (x))
+#define SVSM_VTPM_QUERY 0
+#define SVSM_VTPM_CMD 1
+
+#define SVSM_EXTEND_CALL(x) ((4ULL << 32) | (x))
+#define SVSM_EXTEND_TRAMPOLINE_SETUP 0
+#define SVSM_EXTEND_SYSCALL_ANALYSIS 1
+#define SVSM_EXTEND_REPORT_APP 2
+#define SVSM_EXTEND_LAUNCH_APP 3
+#define SVSM_EXTEND_MAP_IFC 4
+#define SVSM_EXTEND_TASK_MIGRATE 5
+#define SVSM_EXTEND_LOAD_POLICY 8
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
@@ -472,7 +578,8 @@ extern void sev_enable(struct boot_params *bp);
  * level the instruction is targeting, the instruction will succeed,
  * otherwise, it will fail.
  */
-static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs)
+static inline int rmpadjust(unsigned long vaddr, bool rmp_psize,
+			    unsigned long attrs)
 {
 	int rc;
 
@@ -512,7 +619,8 @@ void snp_set_memory_private(unsigned long vaddr, unsigned long npages);
 void snp_set_wakeup_secondary_cpu(void);
 bool snp_init(struct boot_params *bp);
 void snp_dmi_setup(void);
-int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call, struct svsm_attest_call *input);
+int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call,
+			      struct svsm_attest_call *input);
 void snp_accept_memory(phys_addr_t start, phys_addr_t end);
 u64 snp_get_unsupported_features(u64 status);
 u64 sev_get_status(void);
@@ -525,7 +633,8 @@ void snp_kexec_begin(void);
 int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id);
 struct snp_msg_desc *snp_msg_alloc(void);
 void snp_msg_free(struct snp_msg_desc *mdesc);
-int snp_send_guest_request(struct snp_msg_desc *mdesc, struct snp_guest_req *req);
+int snp_send_guest_request(struct snp_msg_desc *mdesc,
+			   struct snp_guest_req *req);
 
 int snp_svsm_vtpm_send_command(u8 *buffer);
 
@@ -539,7 +648,8 @@ void savic_ghcb_msr_write(u32 reg, u64 value);
 static __always_inline void vc_ghcb_invalidate(struct ghcb *ghcb)
 {
 	ghcb->save.sw_exit_code = 0;
-	__builtin_memset(ghcb->save.valid_bitmap, 0, sizeof(ghcb->save.valid_bitmap));
+	__builtin_memset(ghcb->save.valid_bitmap, 0,
+			 sizeof(ghcb->save.valid_bitmap));
 }
 
 /* I/O parameters for CPUID-related helpers */
@@ -554,15 +664,14 @@ struct cpuid_leaf {
 
 int svsm_perform_msr_protocol(struct svsm_call *call);
 int __pi_svsm_perform_msr_protocol(struct svsm_call *call);
-int snp_cpuid(void (*cpuid_fn)(void *ctx, struct cpuid_leaf *leaf),
-	      void *ctx, struct cpuid_leaf *leaf);
+int snp_cpuid(void (*cpuid_fn)(void *ctx, struct cpuid_leaf *leaf), void *ctx,
+	      struct cpuid_leaf *leaf);
 
 void svsm_issue_call(struct svsm_call *call, u8 *pending);
 int svsm_process_result_codes(struct svsm_call *call);
 
 void __noreturn sev_es_terminate(unsigned int set, unsigned int reason);
-enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb,
-				   struct es_em_ctxt *ctxt,
+enum es_result sev_es_ghcb_hv_call(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 				   u64 exit_code, u64 exit_info_1,
 				   u64 exit_info_2);
 
@@ -597,54 +706,148 @@ static inline void sev_evict_cache(void *va, int npages)
 	}
 }
 
-#else	/* !CONFIG_AMD_MEM_ENCRYPT */
+#else /* !CONFIG_AMD_MEM_ENCRYPT */
 
 #define snp_vmpl 0
-static inline void sev_es_ist_enter(struct pt_regs *regs) { }
-static inline void sev_es_ist_exit(void) { }
-static inline int sev_es_setup_ap_jump_table(struct real_mode_header *rmh) { return 0; }
-static inline void sev_es_nmi_complete(void) { }
-static inline int sev_es_efi_map_ghcbs_cas(pgd_t *pgd) { return 0; }
-static inline void sev_enable(struct boot_params *bp) { }
-static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate) { return 0; }
-static inline int rmpadjust(unsigned long vaddr, bool rmp_psize, unsigned long attrs) { return 0; }
-static inline void setup_ghcb(void) { }
-static inline void __init
-early_snp_set_memory_private(unsigned long vaddr, unsigned long paddr, unsigned long npages) { }
-static inline void __init
-early_snp_set_memory_shared(unsigned long vaddr, unsigned long paddr, unsigned long npages) { }
-static inline void snp_set_memory_shared(unsigned long vaddr, unsigned long npages) { }
-static inline void snp_set_memory_private(unsigned long vaddr, unsigned long npages) { }
-static inline void snp_set_wakeup_secondary_cpu(void) { }
-static inline bool snp_init(struct boot_params *bp) { return false; }
-static inline void snp_dmi_setup(void) { }
-static inline int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call, struct svsm_attest_call *input)
+static inline void sev_es_ist_enter(struct pt_regs *regs)
+{
+}
+static inline void sev_es_ist_exit(void)
+{
+}
+static inline int sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
+{
+	return 0;
+}
+static inline void sev_es_nmi_complete(void)
+{
+}
+static inline int sev_es_efi_map_ghcbs_cas(pgd_t *pgd)
+{
+	return 0;
+}
+static inline void sev_enable(struct boot_params *bp)
+{
+}
+static inline int pvalidate(unsigned long vaddr, bool rmp_psize, bool validate)
+{
+	return 0;
+}
+static inline int rmpadjust(unsigned long vaddr, bool rmp_psize,
+			    unsigned long attrs)
+{
+	return 0;
+}
+static inline void setup_ghcb(void)
+{
+}
+static inline void __init early_snp_set_memory_private(unsigned long vaddr,
+						       unsigned long paddr,
+						       unsigned long npages)
+{
+}
+static inline void __init early_snp_set_memory_shared(unsigned long vaddr,
+						      unsigned long paddr,
+						      unsigned long npages)
+{
+}
+static inline void snp_set_memory_shared(unsigned long vaddr,
+					 unsigned long npages)
+{
+}
+static inline void snp_set_memory_private(unsigned long vaddr,
+					  unsigned long npages)
+{
+}
+static inline void snp_set_wakeup_secondary_cpu(void)
+{
+}
+static inline bool snp_init(struct boot_params *bp)
+{
+	return false;
+}
+static inline void snp_dmi_setup(void)
+{
+}
+static inline int snp_issue_svsm_attest_req(u64 call_id, struct svsm_call *call,
+					    struct svsm_attest_call *input)
 {
 	return -ENOTTY;
 }
-static inline void snp_accept_memory(phys_addr_t start, phys_addr_t end) { }
-static inline u64 snp_get_unsupported_features(u64 status) { return 0; }
-static inline u64 sev_get_status(void) { return 0; }
-static inline void sev_show_status(void) { }
-static inline int prepare_pte_enc(struct pte_enc_desc *d) { return 0; }
-static inline void set_pte_enc_mask(pte_t *kpte, unsigned long pfn, pgprot_t new_prot) { }
-static inline void snp_kexec_finish(void) { }
-static inline void snp_kexec_begin(void) { }
-static inline int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id) { return -1; }
-static inline struct snp_msg_desc *snp_msg_alloc(void) { return NULL; }
-static inline void snp_msg_free(struct snp_msg_desc *mdesc) { }
+static inline void snp_accept_memory(phys_addr_t start, phys_addr_t end)
+{
+}
+static inline u64 snp_get_unsupported_features(u64 status)
+{
+	return 0;
+}
+static inline u64 sev_get_status(void)
+{
+	return 0;
+}
+static inline void sev_show_status(void)
+{
+}
+static inline int prepare_pte_enc(struct pte_enc_desc *d)
+{
+	return 0;
+}
+static inline void set_pte_enc_mask(pte_t *kpte, unsigned long pfn,
+				    pgprot_t new_prot)
+{
+}
+static inline void snp_kexec_finish(void)
+{
+}
+static inline void snp_kexec_begin(void)
+{
+}
+static inline int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id)
+{
+	return -1;
+}
+static inline struct snp_msg_desc *snp_msg_alloc(void)
+{
+	return NULL;
+}
+static inline void snp_msg_free(struct snp_msg_desc *mdesc)
+{
+}
 static inline int snp_send_guest_request(struct snp_msg_desc *mdesc,
-					 struct snp_guest_req *req) { return -ENODEV; }
-static inline int snp_svsm_vtpm_send_command(u8 *buffer) { return -ENODEV; }
-static inline void __init snp_secure_tsc_prepare(void) { }
-static inline void __init snp_secure_tsc_init(void) { }
-static inline void sev_evict_cache(void *va, int npages) {}
-static inline enum es_result savic_register_gpa(u64 gpa) { return ES_UNSUPPORTED; }
-static inline enum es_result savic_unregister_gpa(u64 *gpa) { return ES_UNSUPPORTED; }
-static inline void savic_ghcb_msr_write(u32 reg, u64 value) { }
-static inline u64 savic_ghcb_msr_read(u32 reg) { return 0; }
+					 struct snp_guest_req *req)
+{
+	return -ENODEV;
+}
+static inline int snp_svsm_vtpm_send_command(u8 *buffer)
+{
+	return -ENODEV;
+}
+static inline void __init snp_secure_tsc_prepare(void)
+{
+}
+static inline void __init snp_secure_tsc_init(void)
+{
+}
+static inline void sev_evict_cache(void *va, int npages)
+{
+}
+static inline enum es_result savic_register_gpa(u64 gpa)
+{
+	return ES_UNSUPPORTED;
+}
+static inline enum es_result savic_unregister_gpa(u64 *gpa)
+{
+	return ES_UNSUPPORTED;
+}
+static inline void savic_ghcb_msr_write(u32 reg, u64 value)
+{
+}
+static inline u64 savic_ghcb_msr_read(u32 reg)
+{
+	return 0;
+}
 
-#endif	/* CONFIG_AMD_MEM_ENCRYPT */
+#endif /* CONFIG_AMD_MEM_ENCRYPT */
 
 #ifdef CONFIG_KVM_AMD_SEV
 bool snp_probe_rmptable_info(void);
@@ -652,7 +855,8 @@ int snp_rmptable_init(void);
 int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level);
 void snp_dump_hva_rmpentry(unsigned long address);
 int psmash(u64 pfn);
-int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid, bool immutable);
+int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid,
+		     bool immutable);
 int rmp_make_shared(u64 pfn, enum pg_level level);
 void __snp_leak_pages(u64 pfn, unsigned int npages, bool dump_rmp);
 void kdump_sev_callback(void);
@@ -662,21 +866,46 @@ static inline void snp_leak_pages(u64 pfn, unsigned int pages)
 	__snp_leak_pages(pfn, pages, true);
 }
 #else
-static inline bool snp_probe_rmptable_info(void) { return false; }
-static inline int snp_rmptable_init(void) { return -ENOSYS; }
-static inline int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level) { return -ENODEV; }
-static inline void snp_dump_hva_rmpentry(unsigned long address) {}
-static inline int psmash(u64 pfn) { return -ENODEV; }
-static inline int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level, u32 asid,
-				   bool immutable)
+static inline bool snp_probe_rmptable_info(void)
+{
+	return false;
+}
+static inline int snp_rmptable_init(void)
+{
+	return -ENOSYS;
+}
+static inline int snp_lookup_rmpentry(u64 pfn, bool *assigned, int *level)
 {
 	return -ENODEV;
 }
-static inline int rmp_make_shared(u64 pfn, enum pg_level level) { return -ENODEV; }
-static inline void __snp_leak_pages(u64 pfn, unsigned int npages, bool dump_rmp) {}
-static inline void snp_leak_pages(u64 pfn, unsigned int npages) {}
-static inline void kdump_sev_callback(void) { }
-static inline void snp_fixup_e820_tables(void) {}
+static inline void snp_dump_hva_rmpentry(unsigned long address)
+{
+}
+static inline int psmash(u64 pfn)
+{
+	return -ENODEV;
+}
+static inline int rmp_make_private(u64 pfn, u64 gpa, enum pg_level level,
+				   u32 asid, bool immutable)
+{
+	return -ENODEV;
+}
+static inline int rmp_make_shared(u64 pfn, enum pg_level level)
+{
+	return -ENODEV;
+}
+static inline void __snp_leak_pages(u64 pfn, unsigned int npages, bool dump_rmp)
+{
+}
+static inline void snp_leak_pages(u64 pfn, unsigned int npages)
+{
+}
+static inline void kdump_sev_callback(void)
+{
+}
+static inline void snp_fixup_e820_tables(void)
+{
+}
 #endif
 
 #endif
