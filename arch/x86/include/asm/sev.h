@@ -231,6 +231,7 @@ struct rmp_state {
 #define RMPADJUST_VMSA_PAGE_BIT BIT(16)
 
 DECLARE_PER_CPU(u64, deko_kernel_vmpl1_rsp);
+DECLARE_PER_CPU(unsigned long, deko_user_rsp);
 
 /* SNP Guest message request */
 struct snp_req_data {

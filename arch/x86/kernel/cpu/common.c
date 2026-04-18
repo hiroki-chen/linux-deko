@@ -2302,6 +2302,7 @@ DEFINE_PER_CPU_CACHE_HOT(unsigned long,
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 DEFINE_PER_CPU_CACHE_HOT(u64, deko_kernel_vmpl1_rsp) = TOP_OF_INIT_STACK;
+DEFINE_PER_CPU_CACHE_HOT(unsigned long, deko_user_rsp);
 #endif
 
 #ifdef CONFIG_X86_64

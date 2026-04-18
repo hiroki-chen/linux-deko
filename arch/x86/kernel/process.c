@@ -188,6 +188,10 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	p->thread.io_bitmap = NULL;
 	clear_tsk_thread_flag(p, TIF_IO_BITMAP);
 	p->thread.iopl_warn = 0;
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	p->thread.user_rsp = 0;
+	p->thread.kernel_vmpl1_rsp = 0;
+#endif
 	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
 
 #ifdef CONFIG_X86_64

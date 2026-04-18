@@ -509,6 +509,8 @@ struct thread_struct {
 	u32			pkru;
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
+	/* Per-thread saved userspace rsp for deko migration. */
+	unsigned long		user_rsp;
 	/* Per-thread saved VMPL1 kernel rsp. */
 	unsigned long		kernel_vmpl1_rsp;
 #endif

@@ -1424,6 +1424,8 @@ out_free_interp:
 		}
 
 		current->thread.kernel_vmpl1_rsp = regs->cx;
+		this_cpu_write(deko_kernel_vmpl1_rsp,
+			       current->thread.kernel_vmpl1_rsp);
 
 		if (sysctl_enable_vmpl_tramp) {
 			regs->bx = elf_entry;

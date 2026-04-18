@@ -38,6 +38,8 @@
 #include <asm/realmode.h>
 #include <asm/setup.h>
 #include <asm/traps.h>
+
+extern char __per_cpu_start[];
 #include <asm/svm.h>
 #include <asm/smp.h>
 #include <asm/cpu.h>
@@ -67,6 +69,30 @@ static phys_addr_t deko_ifc_policy_engine_mem = 0;
 /* The base address for the trampoline code's physical address. */
 static phys_addr_t trampoline_pa_base = 0;
 static unsigned long trampoline_va_base = 0;
+
+static void log_report_app_cpu_tss_sp2(struct task_struct *task,
+				       struct deko_new_app_req *req)
+{
+	int cpu = task_cpu(task);
+	struct tss_struct *cpu_tss = per_cpu_ptr(&cpu_tss_rw, cpu);
+	unsigned long kernel_gs_base = cpu_kernelmode_gs_base(cpu) +
+		(unsigned long)__per_cpu_start;
+	unsigned long cpu_tss_rw_addr = (unsigned long)cpu_tss;
+	unsigned long cpu_tss_rw_off = cpu_tss_rw_addr - kernel_gs_base;
+	unsigned long sp2_off = offsetof(struct tss_struct, x86_tss.sp2);
+	unsigned long sp2_addr = cpu_tss_rw_addr + sp2_off;
+	u64 sp2_percpu = READ_ONCE(cpu_tss->x86_tss.sp2);
+	u64 sp2_direct = READ_ONCE(*(u64 *)sp2_addr);
+	unsigned long gs_sp2_addr = req->kernel_gs_base + cpu_tss_rw_off + sp2_off;
+	u64 gs_sp2_direct = READ_ONCE(*(u64 *)gs_sp2_addr);
+
+	pr_info("report app cpu_tss_rw snapshot pid=%d comm=%s target_cpu=%d current_cpu=%u kernel_gs_base=0x%lx cpu_tss_rw=%px cpu_tss_rw_off=0x%lx sp2_addr=0x%lx sp2_percpu=0x%llx sp2_direct=0x%llx gs_sp2_addr=0x%lx gs_sp2_direct=0x%llx\n",
+		task->pid, task->comm, cpu, smp_processor_id(), kernel_gs_base,
+		cpu_tss, cpu_tss_rw_off, sp2_addr,
+		(unsigned long long)sp2_percpu,
+		(unsigned long long)sp2_direct, gs_sp2_addr,
+		(unsigned long long)gs_sp2_direct);
+}
 
 /*
  * SVSM related information:
@@ -1221,17 +1247,29 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 {
 	size_t i;
 	struct svsm_map_ifc_single_req *cur;
+	int cpu;
 	u64 ghcb_va, db_va;
+	unsigned long calculated_va;
 
 	for (i = 0; i < req->req_len; i++) {
 		cur = &req->reqs[i];
 
-		if (force_map_va_range(cur->va_start, cur->va_end, cur->pa_start,
-				       0x163)) {
-			pr_err("Mapping %s IFC range failed: VA [%#llx-%#llx) -> PA [%#llx-%#llx)\n",
-			       cur->is_per_cpu ? "per-CPU" : "shared",
-			       cur->va_start, cur->va_end,
-			       cur->pa_start, cur->pa_end);
+		if (!cur->is_per_cpu) {
+			if (smp_processor_id() == 0) {
+				force_map_va_range(cur->va_start, cur->va_end,
+						   cur->pa_start, 0x163);
+			}
+		} else {
+			cpu = smp_processor_id();
+			calculated_va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
+
+			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
+				cpu, calculated_va, cur->pa_start);
+
+			if (force_map_va_range(calculated_va,
+					       calculated_va + PAGE_SIZE,
+					       cur->pa_start, 0x163))
+				pr_err("Mapping PER-CPU failed.");
 		}
 	}
 
@@ -1240,7 +1278,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	make_va_decrypted(ghcb_va);
 	make_va_decrypted(db_va);
 
-	flush_tlb_all();
+	__flush_tlb_all();
 }
 
 /*
@@ -1488,7 +1526,8 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 	req->fs_base = x86_fsbase_read_task(task);
 	req->gs_base = x86_gsbase_read_task(task);
-	req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task));
+	req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task)) +
+		(unsigned long)__per_cpu_start;
 	req->app_type = ty;
 
 	strscpy(req->comm, task->comm, sizeof(req->comm));
@@ -1519,16 +1558,21 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	call.r8 = creation ? 1 : 0;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
-	pr_info("report app live CR3 pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px creation=%u\n",
+	pr_info("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",
 		task->pid, task->comm, (unsigned long long)read_cr3_pa(),
 		task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) : 0ULL,
-		task->mm ? task->mm->pgd : NULL, creation ? 1 : 0);
+		task->mm ? task->mm->pgd : NULL,
+		(unsigned long long)req->fs_base,
+		(unsigned long long)req->gs_base,
+		(unsigned long long)req->kernel_gs_base,
+		creation ? 1 : 0);
+	log_report_app_cpu_tss_sp2(task, req);
 
 	{
 		int call_ret = svsm_perform_call_protocol(&call);
 
 		if (call_ret) {
-			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx\n",
+			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx\n",
 			       task->pid, task->comm, req->launch_identity,
 			       creation ? 1 : 0, call_ret, call.rax_out,
 			       call.rcx_out, call.rdx_out, call.r8_out,
@@ -1538,7 +1582,10 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 			       (unsigned long long)read_cr3_pa(),
 			       task->mm ? (unsigned long long)__sme_pa(
 						  task->mm->pgd) :
-					  0ULL);
+					  0ULL,
+			       (unsigned long long)req->fs_base,
+			       (unsigned long long)req->gs_base,
+			       (unsigned long long)req->kernel_gs_base);
 			ret = ES_UNSUPPORTED;
 		}
 	}
@@ -1761,7 +1808,8 @@ int alloc_isolated_trampoline(void)
 
 	ret = set_up_deko_ifc_policy_engine_mapping();
 	if (ret) {
-		pr_err("Failed to map IFC policy engine memory, err: %d\n", ret);
+		pr_err("Failed to map IFC policy engine memory, err: %d\n",
+		       ret);
 		return ret;
 	}
 

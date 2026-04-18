@@ -35,6 +35,8 @@
 #include <asm/syscall.h>
 #include <asm/current.h>
 
+extern char __per_cpu_start[];
+
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
 #define DEKO_DOMAIN_BITS 8
@@ -602,6 +604,7 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
+	unsigned long old_user_rsp;
 	unsigned long flags;
 
 	if (old_cpu == new_cpu || !current->is_monitored)
@@ -617,14 +620,15 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 	}
 
 	req = (struct deko_migration_req *)call.caa->svsm_buffer;
-	// old_user_rsp = per_cpu(pcpu_hot.user_rsp, old_cpu);
-	// this_cpu_write(pcpu_hot.user_rsp, old_user_rsp);
+	old_user_rsp = per_cpu(deko_user_rsp, old_cpu);
+	this_cpu_write(deko_user_rsp, old_user_rsp);
 
 	req->old_cpu = old_cpu;
 	req->new_cpu = new_cpu;
 	req->pid = current->tgid;
 
-	req->kernel_gs_base = (u64)cpu_kernelmode_gs_base(new_cpu);
+	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(new_cpu) +
+				      (unsigned long)__per_cpu_start);
 	req->user_gs_base = x86_gsbase_read_task(current);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
@@ -659,6 +663,23 @@ static int deko_prepare_launch_app_call(struct svsm_call *call,
 	call->r8 = migration_version;
 
 	return 0;
+}
+
+struct deko_map_vmpl1_state {
+	int ret;
+};
+
+static void deko_map_vmpl1_on_cpu(void *info)
+{
+	struct deko_map_vmpl1_state *state = info;
+	enum es_result res;
+
+	res = svsm_map_vmpl1();
+	if (res != ES_OK) {
+		pr_err("Failed to map VMPL1 trampoline on this CPU, err: %d\n",
+		       res);
+		cmpxchg(&state->ret, 0, -EIO);
+	}
 }
 
 void deko_proxy_loop(struct callback_head *work)
@@ -850,6 +871,7 @@ int deko_bootstrap(void)
 {
 	int ret;
 	enum es_result res;
+	struct deko_map_vmpl1_state map_state = { 0 };
 
 	pr_info("Bootstrapping Deko once\n");
 
@@ -865,13 +887,11 @@ int deko_bootstrap(void)
 		return -EIO;
 	}
 
-	pr_info("Mapping VMPL1 once and syncing page tables\n");
+	pr_info("Mapping VMPL1 on all CPUs\n");
 
-	res = svsm_map_vmpl1();
-	if (res != ES_OK) {
-		pr_err("Failed to map VMPL1 trampoline, err: %d\n", res);
-		return -EIO;
-	}
+	on_each_cpu(deko_map_vmpl1_on_cpu, &map_state, 1);
+	if (map_state.ret)
+		return map_state.ret;
 
 	return 0;
 }
