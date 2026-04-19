@@ -67,66 +67,6 @@ static bool deko_skip_pte_log(unsigned long addr)
 	return addr >= 0x700000000000UL && addr < 0x800000000000UL;
 }
 
-static void deko_log_vaddr_pte(struct mm_struct *mm, unsigned long addr)
-{
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	unsigned long pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw,
-		pte_val_raw;
-
-	if (deko_skip_pte_log(addr))
-		return;
-
-	pgd = pgd_offset(mm, addr);
-	pgd_val_raw = pgd_val(*pgd);
-	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
-		pr_info("PTE walk addr 0x%lx: pgd=0x%lx\n", addr, pgd_val_raw);
-		return;
-	}
-
-	p4d = p4d_offset(pgd, addr);
-	p4d_val_raw = p4d_val(*p4d);
-	if (p4d_none(*p4d) || p4d_bad(*p4d)) {
-		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx\n", addr,
-			pgd_val_raw, p4d_val_raw);
-		return;
-	}
-
-	pud = pud_offset(p4d, addr);
-	pud_val_raw = pud_val(*pud);
-	if (pud_none(*pud) || pud_bad(*pud) || pud_leaf(*pud)) {
-		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx\n",
-			addr, pgd_val_raw, p4d_val_raw, pud_val_raw);
-		return;
-	}
-
-	pmd = pmd_offset(pud, addr);
-	pmd_val_raw = pmd_val(*pmd);
-	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_leaf(*pmd)) {
-		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx\n",
-			addr, pgd_val_raw, p4d_val_raw, pud_val_raw,
-			pmd_val_raw);
-		return;
-	}
-
-	pte = pte_offset_map(pmd, addr);
-	if (!pte) {
-		pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx pte=<null>\n",
-			addr, pgd_val_raw, p4d_val_raw, pud_val_raw,
-			pmd_val_raw);
-		return;
-	}
-
-	pte_val_raw = pte_val(*pte);
-	pr_info("PTE walk addr 0x%lx: pgd=0x%lx p4d=0x%lx pud=0x%lx pmd=0x%lx pte=0x%lx\n",
-		addr, pgd_val_raw, p4d_val_raw, pud_val_raw, pmd_val_raw,
-		pte_val_raw);
-	pte_unmap(pte);
-}
-
 int deko_domain_bind(u64 mnt_ns_id, u32 domain_id)
 {
 	struct deko_domain_entry *entry;
@@ -574,8 +514,6 @@ static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
 
 		pr_info("Pinned %lu pages for VMA [0x%lx-0x%lx]\n", nr_pages,
 			start, end);
-		for (cur = start; cur < end; cur += PAGE_SIZE)
-			deko_log_vaddr_pte(mm, cur);
 	}
 
 	mmap_read_unlock(mm);
@@ -597,20 +535,34 @@ out_err:
 	return ret;
 }
 
+/*
+ * When the old CPU is detected to be different from the current CPU, we need to notify
+ * the monitor of the migration and update the CPU information in the monitor so that
+ * the monitor can update the corresponding CPU bitmask and thus ensure the correct VMPL1
+ * is scheduled on the new CPU. 
+ */
 static int deko_notify_monitor_migration(unsigned int old_cpu,
-					 unsigned int new_cpu,
+					 unsigned int *new_cpu,
 					 u64 *migration_version)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
+	unsigned int current_cpu;
 	unsigned long old_user_rsp;
 	unsigned long flags;
 
-	if (old_cpu == new_cpu || !current->is_monitored)
+	if (!current->is_monitored)
 		return 0;
 
 	local_irq_save(flags);
+	current_cpu = smp_processor_id();
+
+	if (old_cpu == current_cpu) {
+		local_irq_restore(flags);
+
+		return 0;
+	}
 
 	call.caa = svsm_get_caa();
 	if (unlikely(!call.caa)) {
@@ -624,11 +576,11 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 	this_cpu_write(deko_user_rsp, old_user_rsp);
 
 	req->old_cpu = old_cpu;
-	req->new_cpu = new_cpu;
+	req->new_cpu = current_cpu;
 	req->pid = current->tgid;
 
-	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(new_cpu) +
-				      (unsigned long)__per_cpu_start);
+	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(current_cpu) +
+				    (unsigned long)__per_cpu_start);
 	req->user_gs_base = x86_gsbase_read_task(current);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
@@ -640,26 +592,40 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 
 	if (unlikely(res != ES_OK)) {
 		pr_warn("Failed to notify monitor for task migration (app_id=%d, pid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
-			current->tgid, current->pid, old_cpu, new_cpu, res);
+			current->tgid, current->pid, old_cpu, current_cpu, res);
 		return -EIO;
 	}
 
 	if (migration_version)
 		*migration_version = call.rdx_out;
+	if (new_cpu)
+		*new_cpu = current_cpu;
+
+	return 0;
+}
+
+static int deko_refresh_launch_app_context(struct svsm_call *call,
+					   struct svsm_ca **caa)
+{
+	*caa = svsm_get_caa();
+	if (unlikely(!*caa))
+		return -ENODEV;
+
+	call->caa = *caa;
+	call->r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 
 	return 0;
 }
 
 static int deko_prepare_launch_app_call(struct svsm_call *call,
+					struct svsm_ca *caa,
 					const struct pt_regs *regs,
 					u64 migration_version)
 {
-	call->caa = svsm_get_caa();
-	if (unlikely(!call->caa))
+	if (unlikely(!caa))
 		return -ENODEV;
 
-	memcpy(call->caa->svsm_buffer, regs, sizeof(*regs));
-	call->r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	memcpy(caa->svsm_buffer, regs, sizeof(*regs));
 	call->r8 = migration_version;
 
 	return 0;
@@ -697,14 +663,15 @@ void deko_proxy_loop(struct callback_head *work)
 	u64 handled_syscall_nr = 0;
 	bool normal_exit = false;
 	enum es_result res;
-	unsigned long flags;
+	struct svsm_ca *caa;
 
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
 
 	pr_info("launch app CR3 snapshot pid=%d hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px\n",
 		current->pid, (unsigned long long)read_cr3_pa(),
-		current->mm ? (unsigned long long)__sme_pa(current->mm->pgd) : 0ULL,
+		current->mm ? (unsigned long long)__sme_pa(current->mm->pgd) :
+			      0ULL,
 		current->mm ? current->mm->pgd : NULL);
 
 	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
@@ -756,21 +723,25 @@ void deko_proxy_loop(struct callback_head *work)
 
 	current->is_monitored = true;
 	monitored_cpu = smp_processor_id();
+	errno = deko_refresh_launch_app_context(&call, &caa);
+	if (unlikely(errno < 0))
+		goto err_loop;
 
 	/* Application main loop. */
 	for (;;) {
-		local_irq_save(flags);
+		preempt_disable();
 
 		unsigned int current_cpu = smp_processor_id();
 
 		if (unlikely(current_cpu != monitored_cpu)) {
-			local_irq_restore(flags);
+			preempt_enable();
 
 			trace_deko_monitor_migration_detected(
 				current->pid, monitored_cpu, current_cpu);
 			/* Read the version number of the migrated CPU. */
 			errno = deko_notify_monitor_migration(
-				monitored_cpu, current_cpu, &migration_version);
+				monitored_cpu, &current_cpu,
+				&migration_version);
 
 			if (unlikely(errno < 0)) {
 				goto err_loop;
@@ -779,19 +750,22 @@ void deko_proxy_loop(struct callback_head *work)
 			trace_deko_monitor_migration_notified(
 				current->pid, migration_version);
 			monitored_cpu = current_cpu;
+			errno = deko_refresh_launch_app_context(&call, &caa);
+			if (unlikely(errno < 0))
+				goto err_loop;
 			call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 
 			continue;
 		}
-		errno = deko_prepare_launch_app_call(&call, regs,
+		errno = deko_prepare_launch_app_call(&call, caa, regs,
 						     migration_version);
 		if (unlikely(errno < 0)) {
-			local_irq_restore(flags);
+			preempt_enable();
 
 			goto err_loop;
 		}
 		res = svsm_perform_call_protocol(&call);
-		local_irq_restore(flags);
+		preempt_enable();
 		if (res != ES_OK) {
 			pr_err("Failed to perform call launch protocol for task %d, err: %d\n",
 			       current->pid, res);
@@ -877,7 +851,8 @@ int deko_bootstrap(void)
 
 	ret = alloc_isolated_trampoline();
 	if (ret) {
-		pr_err("Failed to allocate isolated trampoline, err: %d\n", ret);
+		pr_err("Failed to allocate isolated trampoline, err: %d\n",
+		       ret);
 		return ret;
 	}
 
