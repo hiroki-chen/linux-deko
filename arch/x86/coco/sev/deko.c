@@ -62,11 +62,6 @@ static struct deko_domain_entry *deko_domain_find_locked(u64 mnt_ns_id)
 	return NULL;
 }
 
-static bool deko_skip_pte_log(unsigned long addr)
-{
-	return addr >= 0x700000000000UL && addr < 0x800000000000UL;
-}
-
 int deko_domain_bind(u64 mnt_ns_id, u32 domain_id)
 {
 	struct deko_domain_entry *entry;
