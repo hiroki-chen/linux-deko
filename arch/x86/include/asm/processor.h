@@ -513,6 +513,12 @@ struct thread_struct {
 	unsigned long		user_rsp;
 	/* Per-thread saved VMPL1 kernel rsp. */
 	unsigned long		kernel_vmpl1_rsp;
+	/*
+	 * Monotonic publication generation for the task-owned Deko restart
+	 * checkpoint. Even values are stable snapshots; odd values indicate an
+	 * in-progress publication.
+	 */
+	u64			deko_checkpoint_generation;
 #endif
 
 #ifdef CONFIG_X86_USER_SHADOW_STACK

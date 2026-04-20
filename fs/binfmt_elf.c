@@ -1430,6 +1430,12 @@ out_free_interp:
 		if (sysctl_enable_vmpl_tramp) {
 			regs->bx = elf_entry;
 			regs->r12 = bprm->p;
+			pr_info("Deko: queue proxy loop pid=%d tgid=%d comm=%s current_cpu=%u elf_entry=0x%lx kernel_vmpl1_rsp=0x%llx bprm_p=0x%lx domain_id=%u mnt_ns_id=%llu\n",
+				current->pid, current->tgid, current->comm,
+				raw_smp_processor_id(), elf_entry,
+				(unsigned long long)current->thread.kernel_vmpl1_rsp,
+				bprm->p, deko_domain_id,
+				(unsigned long long)current->nsproxy->mnt_ns->ns.inum);
 
 			dw = kzalloc(sizeof(*dw), GFP_KERNEL);
 			if (!dw) {
@@ -1441,6 +1447,9 @@ out_free_interp:
 
 			init_task_work(&dw->work, deko_proxy_loop);
 			task_work_add(current, &dw->work, TWA_RESUME);
+			pr_info("Deko: queued proxy loop task_work pid=%d tgid=%d comm=%s current_cpu=%u task=%px work=%px\n",
+				current->pid, current->tgid, current->comm,
+				raw_smp_processor_id(), current, &dw->work);
 		}
 	}
 out_deko:

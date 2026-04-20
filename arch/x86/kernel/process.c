@@ -191,6 +191,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 	p->thread.user_rsp = 0;
 	p->thread.kernel_vmpl1_rsp = 0;
+	p->thread.deko_checkpoint_generation = 0;
 #endif
 	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
 

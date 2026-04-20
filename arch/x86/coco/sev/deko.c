@@ -191,6 +191,27 @@ struct deko_shared_buf {
 	u64 alias_len;
 };
 
+struct deko_handoff_checkpoint {
+	u64 seq;
+	u32 pid;
+	u32 owner_cpu;
+	u64 generation;
+	u64 user_rsp;
+	u64 user_gs_base;
+	u64 kernel_gs_base;
+	bool valid;
+};
+
+struct deko_migration_state {
+	u32 committed_owner_cpu;
+	u64 committed_generation;
+	u32 staged_target_cpu;
+	u32 expected_owner_cpu;
+	u64 expected_source_generation;
+	u64 staged_generation;
+	bool pending;
+};
+
 /* Allocate a hidden reserced user VMA not visible to the application
  * provided as a communication channel between VMPL1 and VMPL2.
  */
@@ -534,17 +555,17 @@ out_err:
  * When the old CPU is detected to be different from the current CPU, we need to notify
  * the monitor of the migration and update the CPU information in the monitor so that
  * the monitor can update the corresponding CPU bitmask and thus ensure the correct VMPL1
- * is scheduled on the new CPU. 
+ * is scheduled on the new CPU.
  */
-static int deko_notify_monitor_migration(unsigned int old_cpu,
-					 unsigned int *new_cpu,
-					 u64 *migration_version)
+static int
+deko_notify_monitor_migration(unsigned int old_cpu,
+			      const struct deko_handoff_checkpoint *checkpoint,
+			      unsigned int *new_cpu, u64 *staged_generation)
 {
 	enum es_result res = ES_OK;
 	struct svsm_call call = { 0 };
 	struct deko_migration_req *req;
 	unsigned int current_cpu;
-	unsigned long old_user_rsp;
 	unsigned long flags;
 
 	if (!current->is_monitored)
@@ -552,12 +573,6 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 
 	local_irq_save(flags);
 	current_cpu = smp_processor_id();
-
-	if (old_cpu == current_cpu) {
-		local_irq_restore(flags);
-
-		return 0;
-	}
 
 	call.caa = svsm_get_caa();
 	if (unlikely(!call.caa)) {
@@ -567,16 +582,12 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 	}
 
 	req = (struct deko_migration_req *)call.caa->svsm_buffer;
-	old_user_rsp = per_cpu(deko_user_rsp, old_cpu);
-	this_cpu_write(deko_user_rsp, old_user_rsp);
-
 	req->old_cpu = old_cpu;
 	req->new_cpu = current_cpu;
 	req->pid = current->tgid;
-
 	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(current_cpu) +
 				    (unsigned long)__per_cpu_start);
-	req->user_gs_base = x86_gsbase_read_task(current);
+	req->user_gs_base = checkpoint->user_gs_base;
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_TASK_MIGRATE);
 	call.r9 = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
@@ -591,8 +602,8 @@ static int deko_notify_monitor_migration(unsigned int old_cpu,
 		return -EIO;
 	}
 
-	if (migration_version)
-		*migration_version = call.rdx_out;
+	if (staged_generation)
+		*staged_generation = call.rdx_out;
 	if (new_cpu)
 		*new_cpu = current_cpu;
 
@@ -626,6 +637,323 @@ static int deko_prepare_launch_app_call(struct svsm_call *call,
 	return 0;
 }
 
+static void
+deko_publish_handoff_checkpoint(struct deko_handoff_checkpoint *checkpoint,
+				const struct deko_migration_state *migration,
+				unsigned int current_cpu)
+{
+	u64 seq = READ_ONCE(checkpoint->seq);
+
+	/* Publish writer-in-progress before rewriting the checkpoint. */
+	WRITE_ONCE(checkpoint->seq, seq + 1);
+	smp_wmb();
+
+	WRITE_ONCE(checkpoint->pid, current->tgid);
+	WRITE_ONCE(checkpoint->owner_cpu, migration->committed_owner_cpu);
+	WRITE_ONCE(checkpoint->generation, migration->committed_generation);
+	WRITE_ONCE(checkpoint->user_rsp, this_cpu_read(deko_user_rsp));
+	WRITE_ONCE(checkpoint->user_gs_base, x86_gsbase_read_task(current));
+	WRITE_ONCE(checkpoint->kernel_gs_base,
+		   (u64)(cpu_kernelmode_gs_base(current_cpu) +
+			 (unsigned long)__per_cpu_start));
+	WRITE_ONCE(checkpoint->valid, true);
+	smp_store_release(&checkpoint->seq, seq + 2);
+}
+
+static bool
+deko_load_handoff_checkpoint(const struct deko_handoff_checkpoint *checkpoint,
+			     struct deko_handoff_checkpoint *snapshot)
+{
+	u64 start_seq, end_seq;
+
+	for (;;) {
+		start_seq = smp_load_acquire(&checkpoint->seq);
+		if (start_seq & 1) {
+			cpu_relax();
+			continue;
+		}
+
+		snapshot->pid = READ_ONCE(checkpoint->pid);
+		snapshot->owner_cpu = READ_ONCE(checkpoint->owner_cpu);
+		snapshot->generation = READ_ONCE(checkpoint->generation);
+		snapshot->user_rsp = READ_ONCE(checkpoint->user_rsp);
+		snapshot->user_gs_base = READ_ONCE(checkpoint->user_gs_base);
+		snapshot->kernel_gs_base =
+			READ_ONCE(checkpoint->kernel_gs_base);
+		snapshot->valid = READ_ONCE(checkpoint->valid);
+
+		end_seq = smp_load_acquire(&checkpoint->seq);
+		if (likely(start_seq == end_seq))
+			break;
+
+		cpu_relax();
+	}
+
+	return snapshot->valid;
+}
+
+static int deko_validate_handoff_checkpoint(
+	const struct deko_handoff_checkpoint *checkpoint,
+	const struct deko_migration_state *migration)
+{
+	if (!checkpoint->valid) {
+		pr_warn("handoff checkpoint invalid for pid=%d\n",
+			current->tgid);
+		return -EINVAL;
+	}
+	if (checkpoint->pid != current->tgid) {
+		pr_warn("handoff checkpoint pid mismatch: expected=%d actual=%u\n",
+			current->tgid, checkpoint->pid);
+		return -EINVAL;
+	}
+	if (checkpoint->owner_cpu != migration->committed_owner_cpu) {
+		pr_warn("handoff checkpoint owner mismatch: expected=%u actual=%u pid=%d\n",
+			migration->committed_owner_cpu, checkpoint->owner_cpu,
+			current->tgid);
+		return -EINVAL;
+	}
+	if (checkpoint->generation != migration->committed_generation) {
+		pr_warn("handoff checkpoint generation mismatch: expected=%llu actual=%llu pid=%d\n",
+			(unsigned long long)migration->committed_generation,
+			(unsigned long long)checkpoint->generation,
+			current->tgid);
+		return -EINVAL;
+	}
+	if (migration->pending &&
+	    (migration->expected_owner_cpu != migration->committed_owner_cpu ||
+	     migration->expected_source_generation !=
+		     migration->committed_generation)) {
+		pr_warn("handoff pending state stale: expected_owner=%u committed_owner=%u expected_gen=%llu committed_gen=%llu pid=%d\n",
+			migration->expected_owner_cpu,
+			migration->committed_owner_cpu,
+			(unsigned long long)
+				migration->expected_source_generation,
+			(unsigned long long)migration->committed_generation,
+			current->tgid);
+		return -EINVAL;
+	}
+	if (migration->pending &&
+	    (checkpoint->owner_cpu != migration->expected_owner_cpu ||
+	     checkpoint->generation != migration->expected_source_generation)) {
+		pr_warn("handoff checkpoint staging mismatch: expected_owner=%u actual_owner=%u expected_gen=%llu actual_gen=%llu pid=%d\n",
+			migration->expected_owner_cpu, checkpoint->owner_cpu,
+			(unsigned long long)
+				migration->expected_source_generation,
+			(unsigned long long)checkpoint->generation,
+			current->tgid);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void deko_restore_local_handoff_state(
+	const struct deko_handoff_checkpoint *checkpoint)
+{
+	this_cpu_write(deko_user_rsp, checkpoint->user_rsp);
+}
+
+static int
+deko_check_and_handle_migration(struct svsm_call *call, struct svsm_ca **caa,
+				struct deko_migration_state *migration,
+				struct deko_handoff_checkpoint *checkpoint)
+{
+	struct deko_handoff_checkpoint snapshot = { 0 };
+	unsigned int current_cpu;
+	int ret;
+
+	current_cpu = smp_processor_id();
+
+	if (!migration->pending &&
+	    current_cpu == migration->committed_owner_cpu)
+		return 0;
+
+	/*
+	 * Before the first successful VMPL1 round there is no published
+	 * checkpoint yet, so passive Linux migration can simply transfer the
+	 * initial owner role to the current CPU instead of trying to repair a
+	 * non-existent handoff.
+	 */
+	if (!migration->pending && !READ_ONCE(checkpoint->valid)) {
+		migration->committed_owner_cpu = current_cpu;
+		ret = deko_refresh_launch_app_context(call, caa);
+		if (unlikely(ret < 0))
+			return ret;
+		call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+		return 0;
+	}
+
+	trace_deko_monitor_migration_detected(
+		current->pid, migration->committed_owner_cpu, current_cpu);
+
+	if (!deko_load_handoff_checkpoint(checkpoint, &snapshot)) {
+		pr_warn("handoff checkpoint missing for pid=%d owner=%u current_cpu=%u\n",
+			current->tgid, migration->committed_owner_cpu,
+			current_cpu);
+		return -EINVAL;
+	}
+
+	ret = deko_validate_handoff_checkpoint(&snapshot, migration);
+	if (unlikely(ret < 0))
+		return ret;
+
+	if (migration->pending || current_cpu != migration->committed_owner_cpu)
+		deko_restore_local_handoff_state(&snapshot);
+
+	ret = deko_refresh_launch_app_context(call, caa);
+	if (unlikely(ret < 0))
+		return ret;
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+
+	if (migration->pending && current_cpu == migration->staged_target_cpu)
+		return 0;
+
+	ret = deko_notify_monitor_migration(migration->committed_owner_cpu,
+					    &snapshot, &current_cpu,
+					    &migration->staged_generation);
+	if (unlikely(ret < 0))
+		return ret;
+
+	trace_deko_monitor_migration_notified(current->pid,
+					      migration->staged_generation);
+
+	migration->staged_target_cpu = current_cpu;
+	migration->expected_owner_cpu = snapshot.owner_cpu;
+	migration->expected_source_generation = snapshot.generation;
+	migration->pending = true;
+
+	return 0;
+}
+
+static void
+deko_commit_handoff_adoption(struct deko_migration_state *migration,
+			     unsigned int current_cpu)
+{
+	pr_info("handoff commit pid=%d old_owner=%u new_owner=%u old_gen=%llu new_gen=%llu\n",
+		current->tgid, migration->committed_owner_cpu, current_cpu,
+		(unsigned long long)migration->committed_generation,
+		(unsigned long long)migration->staged_generation);
+
+	migration->committed_owner_cpu = current_cpu;
+	migration->committed_generation = migration->staged_generation;
+	migration->staged_target_cpu = 0;
+	migration->expected_owner_cpu = 0;
+	migration->expected_source_generation = 0;
+	migration->staged_generation = 0;
+	migration->pending = false;
+}
+
+static int
+deko_finalize_launch_round(struct svsm_call *call,
+			   struct deko_migration_state *migration,
+			   struct deko_handoff_checkpoint *checkpoint,
+			   bool adopting, unsigned int current_cpu)
+{
+	switch (call->rax_out) {
+	case DEKO_SERVICE_APP_ENTER_OK:
+	case DEKO_TIMER_SERVICE:
+		if (adopting)
+			deko_commit_handoff_adoption(migration, current_cpu);
+		if (current_cpu == migration->committed_owner_cpu) {
+			/*
+			 * Publish the VMPL1 exit snapshot before this task is
+			 * allowed to migrate again so passive migration can
+			 * only observe a fresh restart point.
+			 */
+			deko_publish_handoff_checkpoint(checkpoint, migration,
+							current_cpu);
+		}
+		return 0;
+	default:
+		pr_warn("Received unknown call return value: 0x%llx\n",
+			call->rax_out);
+		return -EINVAL;
+	}
+}
+
+static int deko_run_launch_iteration(struct svsm_call *call,
+				     struct svsm_ca *caa,
+				     const struct pt_regs *regs,
+				     struct deko_migration_state *migration,
+				     bool *adopting,
+				     unsigned int *launch_cpu)
+{
+	enum es_result res;
+	unsigned int current_cpu;
+	int ret;
+	u64 generation = 0;
+
+	current_cpu = smp_processor_id();
+	*launch_cpu = current_cpu;
+	*adopting = false;
+
+	if (migration->pending && current_cpu != migration->staged_target_cpu) {
+		return -EAGAIN;
+	}
+
+	if (migration->pending) {
+		generation = migration->staged_generation;
+		*adopting = true;
+	}
+
+	ret = deko_prepare_launch_app_call(call, caa, regs, generation);
+	if (unlikely(ret < 0))
+		return ret;
+
+	res = svsm_perform_call_protocol(call);
+
+	if (res != ES_OK) {
+		pr_err("Failed to perform call launch protocol for task %d, err: %d pending=%d current_cpu=%u staged_target=%u staged_gen=%llu committed_owner=%u committed_gen=%llu\n",
+		       current->pid, res, migration->pending, current_cpu,
+		       migration->staged_target_cpu,
+		       (unsigned long long)migration->staged_generation,
+		       migration->committed_owner_cpu,
+		       (unsigned long long)migration->committed_generation);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
+					 struct deko_shared_buf *buf,
+					 bool *normal_exit)
+{
+	u64 handled_syscall_nr;
+	int ret;
+
+	*normal_exit = false;
+
+	switch (call->rax_out) {
+	case DEKO_SERVICE_APP_ENTER_OK:
+		/* Handle system calls; if any. */
+		handled_syscall_nr = buf->syscall_body.ax;
+		ret = deko_app_handle_system_calls(&buf->syscall_body);
+		if (ret != 0) {
+			pr_err("Error handling system calls: %d\n", ret);
+			return ret;
+		}
+
+		*normal_exit = is_exit_syscall(handled_syscall_nr);
+		break;
+
+	case DEKO_TIMER_SERVICE:
+		trace_deko_timer_service(current->pid);
+
+		/* Timer is hot-path: avoid log storm and always offer a
+		 * voluntary reschedule point to keep RCU/softirq forward progress. */
+		cond_resched();
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (!*normal_exit)
+		call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+
+	return 0;
+}
+
 struct deko_map_vmpl1_state {
 	int ret;
 };
@@ -648,26 +976,26 @@ void deko_proxy_loop(struct callback_head *work)
 	int errno = 0;
 	struct svsm_call call = { 0 };
 	struct pt_regs *regs = task_pt_regs(current);
+	unsigned long long iteration = 0;
 	pid_t tgid = current->tgid;
 	struct deko_shared_buf *buf = NULL;
 	int pinned_count;
 	struct page **pages = NULL;
 	unsigned long alias_addr = 0;
-	unsigned int monitored_cpu;
-	u64 migration_version = 0;
-	u64 handled_syscall_nr = 0;
 	bool normal_exit = false;
-	enum es_result res;
+	bool adopting = false;
+	bool iteration_cpu_pinned = false;
+	unsigned int launch_cpu = 0;
 	struct svsm_ca *caa;
+	struct deko_migration_state migration = { 0 };
+	struct deko_handoff_checkpoint checkpoint = { 0 };
 
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
 
-	pr_info("launch app CR3 snapshot pid=%d hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px\n",
-		current->pid, (unsigned long long)read_cr3_pa(),
-		current->mm ? (unsigned long long)__sme_pa(current->mm->pgd) :
-			      0ULL,
-		current->mm ? current->mm->pgd : NULL);
+	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d\n",
+		current->pid, current->tgid, current->comm, current,
+		raw_smp_processor_id(), current->is_monitored);
 
 	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
 					     DEKO_DEFAULT_SHARED_BUF_SIZE);
@@ -717,96 +1045,75 @@ void deko_proxy_loop(struct callback_head *work)
 	call.r8 = 0;
 
 	current->is_monitored = true;
-	monitored_cpu = smp_processor_id();
+	migration.committed_owner_cpu = smp_processor_id();
 	errno = deko_refresh_launch_app_context(&call, &caa);
 	if (unlikely(errno < 0))
 		goto err_loop;
 
 	/* Application main loop. */
 	for (;;) {
-		preempt_disable();
+		iteration++;
+		migrate_disable();
+		iteration_cpu_pinned = true;
 
-		unsigned int current_cpu = smp_processor_id();
+		errno = deko_check_and_handle_migration(&call, &caa, &migration,
+							&checkpoint);
+		if (errno == -EAGAIN) {
+			migrate_enable();
+			iteration_cpu_pinned = false;
 
-		if (unlikely(current_cpu != monitored_cpu)) {
-			preempt_enable();
-
-			trace_deko_monitor_migration_detected(
-				current->pid, monitored_cpu, current_cpu);
-			/* Read the version number of the migrated CPU. */
-			errno = deko_notify_monitor_migration(
-				monitored_cpu, &current_cpu,
-				&migration_version);
-
-			if (unlikely(errno < 0)) {
-				goto err_loop;
-			}
-
-			trace_deko_monitor_migration_notified(
-				current->pid, migration_version);
-			monitored_cpu = current_cpu;
-			errno = deko_refresh_launch_app_context(&call, &caa);
-			if (unlikely(errno < 0))
-				goto err_loop;
-			call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
-
+			cond_resched();
 			continue;
 		}
-		errno = deko_prepare_launch_app_call(&call, caa, regs,
-						     migration_version);
 		if (unlikely(errno < 0)) {
-			preempt_enable();
-
-			goto err_loop;
-		}
-		res = svsm_perform_call_protocol(&call);
-		preempt_enable();
-		if (res != ES_OK) {
-			pr_err("Failed to perform call launch protocol for task %d, err: %d\n",
-			       current->pid, res);
-			errno = -EINVAL;
+			migrate_enable();
+			iteration_cpu_pinned = false;
+			pr_err("Deko proxy migration check failed pid=%d iter=%llu err=%d cpu=%u pending=%d committed_owner=%u staged_target=%u\n",
+			       current->pid, iteration, errno,
+			       raw_smp_processor_id(), migration.pending,
+			       migration.committed_owner_cpu,
+			       migration.staged_target_cpu);
 			goto err_loop;
 		}
 
-		migration_version = 0;
-		switch (call.rax_out) {
-		case DEKO_SERVICE_APP_ENTER_OK:
-			/* Handle system calls; if any. */
-			handled_syscall_nr = buf->syscall_body.ax;
-			if ((errno = deko_app_handle_system_calls(
-				     &buf->syscall_body)) != 0) {
-				pr_err("Error handling system calls: %d\n",
-				       errno);
-				goto err_loop;
-			}
-
-			break;
-
-		case DEKO_TIMER_SERVICE:
-			trace_deko_timer_service(current->pid);
-
-			/* Timer is hot-path: avoid log storm and always offer a
-			 * voluntary reschedule point to keep RCU/softirq forward progress. */
+		errno = deko_run_launch_iteration(&call, caa, regs, &migration,
+						  &adopting, &launch_cpu);
+		if (errno == -EAGAIN) {
+			migrate_enable();
+			iteration_cpu_pinned = false;
 			cond_resched();
-
-			break;
-		default:
-			pr_warn("Received unknown call return value: 0x%llx\n",
-				call.rax_out);
-			errno = -EINVAL;
+			continue;
+		}
+		if (unlikely(errno < 0)) {
+			migrate_enable();
+			iteration_cpu_pinned = false;
+			pr_err("Deko proxy launch failed pid=%d iter=%llu err=%d cpu=%u pending=%d staged_target=%u committed_owner=%u\n",
+			       current->pid, iteration, errno,
+			       raw_smp_processor_id(), migration.pending,
+			       migration.staged_target_cpu,
+			       migration.committed_owner_cpu);
 			goto err_loop;
 		}
 
-		if (is_exit_syscall(handled_syscall_nr)) {
-			normal_exit = true;
-			goto err_loop;
-		}
+		errno = deko_finalize_launch_round(&call, &migration,
+						   &checkpoint, adopting,
+						   launch_cpu);
+		migrate_enable();
+		iteration_cpu_pinned = false;
 
-		/* Call again the protocol until the application requests exit. */
-		call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+		if (unlikely(errno < 0))
+			goto err_loop;
+
+		errno = deko_handle_vmpl1_exit_reason(&call, buf, &normal_exit);
+
+		if (unlikely(errno < 0) || normal_exit)
+			goto err_loop;
 	}
 
 err_loop:
+	if (iteration_cpu_pinned)
+		migrate_enable();
+
 	if (buf)
 		kfree(buf->buf);
 
