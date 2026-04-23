@@ -100,6 +100,13 @@ struct deko_new_app_req {
 	struct deko_base_region_desc regions[DEKO_MAX_BASE_REGIONS];
 } __attribute__((aligned(8)));
 
+struct deko_launch_app_req {
+	struct pt_regs regs;
+	u64 fs_base;
+	u64 user_gs_base;
+	u64 kernel_gs_base;
+} __attribute__((aligned(8)));
+
 struct deko_load_policy_req {
 	u32 domain_id;
 	u32 reserved;
