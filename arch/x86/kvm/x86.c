@@ -128,6 +128,8 @@ static u64 __read_mostly cr4_reserved_bits = CR4_RESERVED_BITS;
 #define KVM_X2APIC_API_VALID_FLAGS (KVM_X2APIC_API_USE_32BIT_IDS | \
                                     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)
 
+#define KVM_VMPL_TIMER_VECTOR 0xec
+
 static void update_cr8_intercept(struct kvm_vcpu *vcpu);
 static void process_nmi(struct kvm_vcpu *vcpu);
 static void __kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
@@ -159,6 +161,9 @@ EXPORT_SYMBOL_GPL(report_ignored_msrs);
 
 unsigned int min_timer_period_us = 200;
 module_param(min_timer_period_us, uint, 0644);
+
+bool __read_mostly enable_timer = true;
+module_param(enable_timer, bool, 0644);
 
 static bool __read_mostly kvmclock_periodic_sync = true;
 module_param(kvmclock_periodic_sync, bool, 0444);
@@ -11305,16 +11310,101 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
 		!vcpu->arch.apf.halted);
 }
 
+static bool
+kvm_queue_vmpl2_timer_irq_to_vmpl1(struct kvm_vcpu_vmpl_state *vcpu_parent)
+{
+	struct kvm_vcpu *vcpu;
+
+	if (!vcpu_parent)
+		return false;
+
+	vcpu = vcpu_parent->vcpu_vmpl[SVM_SEV_VMPL1];
+	if (vcpu_parent->max_vmpl < SVM_SEV_VMPL2 || !vcpu)
+		return false;
+
+	kvm_queue_interrupt(vcpu, KVM_VMPL_TIMER_VECTOR, false);
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+	pr_debug_ratelimited("deko timer: queue vmpl1 irq vcpu=%d current=%d target=%d req_event=%d\n",
+			     vcpu->vcpu_id,
+			     READ_ONCE(vcpu_parent->current_vmpl),
+			     READ_ONCE(vcpu_parent->target_vmpl),
+			     kvm_test_request(KVM_REQ_EVENT, vcpu));
+
+	return true;
+}
+
+static bool kvm_can_notify_vmpl1_vmpl2_timer(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+	bool exc_pending;
+	bool irq_pending;
+	bool req_event;
+	bool same_vcpu;
+
+	if (!vcpu_parent) {
+		pr_debug_ratelimited("deko timer: skip notify, no parent vcpu=%d\n",
+				     vcpu->vcpu_id);
+		return false;
+	}
+
+	exc_pending = kvm_is_exception_pending(vcpu);
+	irq_pending = kvm_cpu_has_interrupt(vcpu);
+	req_event = kvm_test_request(KVM_REQ_EVENT, vcpu);
+	same_vcpu = vcpu == vcpu_parent->vcpu_vmpl[SVM_SEV_VMPL1];
+
+	if (vcpu_parent->max_vmpl < SVM_SEV_VMPL2 ||
+	    vcpu_parent->current_vmpl != SVM_SEV_VMPL1 ||
+	    vcpu_parent->target_vmpl != SVM_SEV_VMPL1 ||
+	    !same_vcpu || exc_pending || irq_pending || req_event) {
+		pr_debug_ratelimited("deko timer: skip notify vcpu=%d max=%d current=%d target=%d same=%d exc=%d irq=%d req_event=%d\n",
+				     vcpu->vcpu_id, vcpu_parent->max_vmpl,
+				     READ_ONCE(vcpu_parent->current_vmpl),
+				     READ_ONCE(vcpu_parent->target_vmpl),
+				     same_vcpu, exc_pending, irq_pending,
+				     req_event);
+		return false;
+	}
+
+	return true;
+}
+
+static void kvm_try_notify_vmpl1_vmpl2_timer(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+
+	if (!READ_ONCE(enable_timer))
+		return;
+
+	if (!kvm_vmpl_test_timer_expired(vcpu_parent, SVM_SEV_VMPL2))
+		return;
+
+	if (!kvm_can_notify_vmpl1_vmpl2_timer(vcpu))
+		return;
+
+	if (kvm_queue_vmpl2_timer_irq_to_vmpl1(vcpu_parent))
+		kvm_vmpl_test_and_clear_timer_expired(vcpu_parent,
+						      SVM_SEV_VMPL2);
+}
+
 /* Called within kvm->srcu read side.  */
 static int vcpu_run(struct kvm_vcpu *vcpu)
 {
 	int r;
 	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+	struct kvm_vcpu *timer_vcpu;
+	bool vmpl2_timer_marked;
 	int vmpl;
 
 	vcpu->common->run->exit_reason = KVM_EXIT_UNKNOWN;
 
 	for (;;) {
+		/*
+		 * VMPL1 can return to userspace before the post-exit timer scan
+		 * below.  Consume the explicit VMPL2 timer marker before entry so
+		 * a one-shot lapic pending state is still translated to VMPL1.
+		 */
+		kvm_try_notify_vmpl1_vmpl2_timer(vcpu);
+
 		/*
 		 * If another guest vCPU requests a PV TLB flush in the middle
 		 * of instruction emulation, the rest of the emulation could
@@ -11341,8 +11431,18 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		 * is ready.
 		 */
 		for (vmpl = 0; vmpl <= vcpu_parent->max_vmpl; ++vmpl) {
-			if (kvm_cpu_has_pending_timer(vcpu_parent->vcpu_vmpl[vmpl]))
-				kvm_inject_pending_timer_irqs(vcpu_parent->vcpu_vmpl[vmpl]);
+			timer_vcpu = vcpu_parent->vcpu_vmpl[vmpl];
+			if (!timer_vcpu)
+				continue;
+
+			if (kvm_cpu_has_pending_timer(timer_vcpu))
+				kvm_inject_pending_timer_irqs(timer_vcpu);
+
+			vmpl2_timer_marked = vmpl == SVM_SEV_VMPL2 &&
+					     kvm_vmpl_test_timer_expired(
+						     vcpu_parent, SVM_SEV_VMPL2);
+			if (vmpl2_timer_marked)
+				kvm_try_notify_vmpl1_vmpl2_timer(vcpu);
 		}
 
 		if (dm_request_for_irq_injection(vcpu) &&

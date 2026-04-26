@@ -423,7 +423,37 @@ struct kvm_vcpu_vmpl_state {
 	int max_vmpl;
 	int current_vmpl;
 	int target_vmpl;
+	unsigned long timer_expired_vmpl_mask;
 };
+
+static inline void kvm_vmpl_mark_timer_expired(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+
+	if (!vcpu_parent || vcpu->vmpl < 0 || vcpu->vmpl >= 4)
+		return;
+
+	set_bit(vcpu->vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
+
+static inline bool
+kvm_vmpl_test_and_clear_timer_expired(struct kvm_vcpu_vmpl_state *vcpu_parent,
+				      int vmpl)
+{
+	if (!vcpu_parent || vmpl < 0 || vmpl >= 4)
+		return false;
+
+	return test_and_clear_bit(vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
+
+static inline bool
+kvm_vmpl_test_timer_expired(struct kvm_vcpu_vmpl_state *vcpu_parent, int vmpl)
+{
+	if (!vcpu_parent || vmpl < 0 || vmpl >= 4)
+		return false;
+
+	return test_bit(vmpl, &vcpu_parent->timer_expired_vmpl_mask);
+}
 
 /*
  * Start accounting time towards a guest.

@@ -166,6 +166,14 @@ static bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu)
 
 bool kvm_can_use_hv_timer(struct kvm_vcpu *vcpu)
 {
+	/*
+	 * VMPL2 can be preempted by VMPL1 for long stretches.  Keep its APIC
+	 * timer backed by KVM's software timer so expiry is observable even
+	 * while VMPL2 is not the VMSA currently running on the host CPU.
+	 */
+	if (READ_ONCE(enable_timer) && vcpu->vmpl == SVM_SEV_VMPL2)
+		return false;
+
 	return kvm_x86_ops.set_hv_timer
 	       && !(kvm_mwait_in_guest(vcpu->kvm) ||
 		    kvm_can_post_timer_interrupt(vcpu));
@@ -1908,6 +1916,19 @@ static void apic_timer_expired(struct kvm_lapic *apic, bool from_timer_fn)
 	struct kvm_vcpu *vcpu = apic->vcpu;
 	struct kvm_timer *ktimer = &apic->lapic_timer;
 
+	if (READ_ONCE(enable_timer))
+		kvm_vmpl_mark_timer_expired(vcpu);
+
+	if (READ_ONCE(enable_timer) && vcpu->vmpl == SVM_SEV_VMPL2) {
+		struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+
+		pr_debug_ratelimited("deko timer: vmpl2 expired vcpu=%d from_timer=%d pending=%d current=%d target=%d\n",
+				     vcpu->vcpu_id, from_timer_fn,
+				     atomic_read(&apic->lapic_timer.pending),
+				     vcpu_parent ? READ_ONCE(vcpu_parent->current_vmpl) : -1,
+				     vcpu_parent ? READ_ONCE(vcpu_parent->target_vmpl) : -1);
+	}
+
 	if (atomic_read(&apic->lapic_timer.pending))
 		return;
 
@@ -1937,8 +1958,27 @@ static void apic_timer_expired(struct kvm_lapic *apic, bool from_timer_fn)
 
 	atomic_inc(&apic->lapic_timer.pending);
 	kvm_make_request(KVM_REQ_UNBLOCK, vcpu);
-	if (from_timer_fn)
-		kvm_vcpu_kick(vcpu);
+	if (from_timer_fn) {
+		struct kvm_vcpu_vmpl_state *vcpu_parent = vcpu->vcpu_parent;
+		struct kvm_vcpu *kick_vcpu = vcpu;
+		int current_vmpl;
+
+		/*
+		 * VMPL siblings have independent struct kvm_vcpu instances.  A
+		 * VMPL2 timer can expire while the same logical CPU is running
+		 * a VMPL1 VMSA.  Kick VMPL1 so KVM gets a VM-Exit and can scan
+		 * VMPL2's pending timer, then inject the timer doorbell to VMPL1.
+		 */
+		if (READ_ONCE(enable_timer) && vcpu_parent &&
+		    vcpu->vmpl == SVM_SEV_VMPL2) {
+			current_vmpl = READ_ONCE(vcpu_parent->current_vmpl);
+			if (current_vmpl == SVM_SEV_VMPL1 &&
+			    vcpu_parent->vcpu_vmpl[SVM_SEV_VMPL1])
+				kick_vcpu = vcpu_parent->vcpu_vmpl[SVM_SEV_VMPL1];
+		}
+
+		kvm_vcpu_kick(kick_vcpu);
+	}
 }
 
 static void start_sw_tscdeadline(struct kvm_lapic *apic)

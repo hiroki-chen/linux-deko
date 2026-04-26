@@ -376,6 +376,8 @@ static inline bool kvm_mpx_supported(void)
 
 extern unsigned int min_timer_period_us;
 
+extern bool enable_timer;
+
 extern bool enable_vmware_backdoor;
 
 extern int pi_inject_timer;
