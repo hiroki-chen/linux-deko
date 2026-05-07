@@ -24,6 +24,7 @@
 #include <linux/io.h>
 #include <linux/psp-sev.h>
 #include <linux/dmi.h>
+#include <linux/sizes.h>
 #include <uapi/linux/sev-guest.h>
 #include <crypto/gcm.h>
 
@@ -65,6 +66,12 @@ static phys_addr_t page_l3 = 0, page_l2, page_l1 = 0;
 
 /* The reserved memory for the IFC policy engine. */
 static phys_addr_t deko_ifc_policy_engine_mem = 0;
+
+/*
+ * Policy loads can be larger than the SVSM CAA scratch buffer. Keep the CAA
+ * for the fixed request and stage the policy bytes in guest memory instead.
+ */
+#define DEKO_MAX_POLICY_BLOB_SIZE SZ_1M
 
 /* The base address for the trampoline code's physical address. */
 static phys_addr_t trampoline_pa_base = 0;
@@ -1156,20 +1163,22 @@ static int force_map_va_range(unsigned long va_start, unsigned long va_end,
 int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 {
 	struct svsm_call call = { 0 };
-
-	call.caa = svsm_get_caa();
 	struct deko_load_policy_req *req;
+	void *policy_buf;
 	phys_addr_t req_pa;
 	unsigned long flags;
-	u64 max_blob_len;
 	int ret = 0;
 
 	if (!domain_id || !buf || !len)
 		return -EINVAL;
-
-	max_blob_len = sizeof_field(struct svsm_ca, svsm_buffer) - sizeof(*req);
-	if (len > max_blob_len)
+	if (len > DEKO_MAX_POLICY_BLOB_SIZE)
 		return -E2BIG;
+
+	policy_buf = alloc_pages_exact(len, GFP_KERNEL);
+	if (!policy_buf)
+		return -ENOMEM;
+
+	memcpy(policy_buf, buf, len);
 
 	local_irq_save(flags);
 
@@ -1178,9 +1187,8 @@ int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 
 	req->domain_id = domain_id;
 	req->reserved = 0;
-	req->blob_gpa = req_pa + sizeof(*req);
+	req->blob_gpa = __pa(policy_buf);
 	req->blob_len = len;
-	memcpy(req + 1, buf, len);
 
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
@@ -1190,6 +1198,7 @@ int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 		ret = -EOPNOTSUPP;
 
 	local_irq_restore(flags);
+	free_pages_exact(policy_buf, len);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
