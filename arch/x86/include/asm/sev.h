@@ -166,6 +166,7 @@ extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    enum deko_new_app_type ty);
 extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
+extern int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm);
 extern int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len);
 extern int deko_domain_bind(u64 mnt_ns_id, u32 domain_id);
 extern int deko_domain_lookup(u64 mnt_ns_id, u32 *domain_id);

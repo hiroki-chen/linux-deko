@@ -90,6 +90,13 @@ static int deko_svsm_call_locked(struct svsm_call *call,
 	int ret;
 
 	migrate_disable();
+
+	if (current->mm) {
+		ret = svsm_prepare_vmpl1_current_mm(current->mm);
+		if (ret < 0)
+			goto out_migrate;
+	}
+
 	local_lock_irqsave(&deko_svsm_caa_lock, flags);
 
 	caa = svsm_get_caa();
@@ -107,6 +114,7 @@ static int deko_svsm_call_locked(struct svsm_call *call,
 
 out:
 	local_unlock_irqrestore(&deko_svsm_caa_lock, flags);
+out_migrate:
 	migrate_enable();
 
 	return ret;

@@ -210,6 +210,9 @@ struct svsm_map_ifc_req {
 	struct svsm_map_ifc_single_req reqs[16];
 } __attribute__((packed, aligned(8)));
 
+static struct svsm_map_ifc_single_req svsm_vmpl1_global_maps[16];
+static u16 svsm_vmpl1_global_map_count;
+
 /*
  * SVSM related information:
  *   When running under an SVSM, the VMPL that Linux is executing at must be
@@ -1290,11 +1293,28 @@ static void make_va_decrypted(unsigned long va)
 	make_va_decrypted_in_pgd(init_mm.pgd, va);
 }
 
-static int prepare_vmpl1_current_mm(struct mm_struct *mm)
+int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 {
 	unsigned long ghcb_va = this_cpu_read(svsm_vmpl1_ghcb_va);
 	unsigned long db_va = this_cpu_read(svsm_vmpl1_db_va);
+	u16 i, map_count = READ_ONCE(svsm_vmpl1_global_map_count);
 	int ret;
+
+	if (!mm)
+		return -EINVAL;
+
+	for (i = 0; i < map_count; i++) {
+		struct svsm_map_ifc_single_req *map = &svsm_vmpl1_global_maps[i];
+
+		ret = force_map_va_range_in_pgd(mm->pgd, map->va_start,
+						map->va_end, map->pa_start,
+						0x163);
+		if (ret) {
+			pr_err("SVSM: failed to map VMPL1 global VA %llx..%llx into current mm, PA %llx ret=%d\n",
+			       map->va_start, map->va_end, map->pa_start, ret);
+			return ret;
+		}
+	}
 
 	ret = map_vmpl1_percpu_current_mm(mm);
 	if (ret)
@@ -1308,6 +1328,7 @@ static int prepare_vmpl1_current_mm(struct mm_struct *mm)
 	__flush_tlb_all();
 	return 0;
 }
+EXPORT_SYMBOL_GPL(svsm_prepare_vmpl1_current_mm);
 
 static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 {
@@ -1316,12 +1337,17 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 	int cpu;
 	u64 ghcb_va, db_va;
 	unsigned long calculated_va;
+	u16 global_map_count = 0;
 
 	for (i = 0; i < req->req_len; i++) {
 		cur = &req->reqs[i];
 
 		if (!cur->is_per_cpu) {
 			if (smp_processor_id() == 0) {
+				if (global_map_count <
+				    ARRAY_SIZE(svsm_vmpl1_global_maps))
+					svsm_vmpl1_global_maps[global_map_count++] =
+						*cur;
 				force_map_va_range(cur->va_start, cur->va_end,
 						   cur->pa_start, 0x163);
 			}
@@ -1339,6 +1365,8 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 				pr_err("Mapping PER-CPU failed.");
 		}
 	}
+	if (smp_processor_id() == 0)
+		WRITE_ONCE(svsm_vmpl1_global_map_count, global_map_count);
 
 	ghcb_va = req->ghcb_va;
 	db_va = req->db_va;
@@ -1617,7 +1645,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	}
 
 	if (task->mm) {
-		if (task == current && prepare_vmpl1_current_mm(task->mm)) {
+		if (task == current && svsm_prepare_vmpl1_current_mm(task->mm)) {
 			local_irq_restore(flags);
 			return ES_UNSUPPORTED;
 		}
