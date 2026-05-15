@@ -184,6 +184,9 @@ static unsigned long snp_tsc_freq_khz __ro_after_init;
 
 DEFINE_PER_CPU(struct sev_es_runtime_data *, runtime_data);
 DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
+static DEFINE_PER_CPU(phys_addr_t, svsm_vmpl1_percpu_pa);
+static DEFINE_PER_CPU(unsigned long, svsm_vmpl1_ghcb_va);
+static DEFINE_PER_CPU(unsigned long, svsm_vmpl1_db_va);
 
 struct svsm_sev_trampoline_setup_req {
 	u64 syscall_enter_addr;
@@ -1104,8 +1107,9 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 	return ret;
 }
 
-static int force_map_va_range(unsigned long va_start, unsigned long va_end,
-			      phys_addr_t pa_start, unsigned long flags)
+static int force_map_va_range_in_pgd(pgd_t *pgd_base, unsigned long va_start,
+				     unsigned long va_end, phys_addr_t pa_start,
+				     unsigned long flags)
 {
 	unsigned long addr;
 	phys_addr_t paddr = pa_start;
@@ -1118,7 +1122,7 @@ static int force_map_va_range(unsigned long va_start, unsigned long va_end,
 	for (addr = va_start; addr < va_end;
 	     addr += PAGE_SIZE, paddr += PAGE_SIZE) {
 		/* --- Level 4: PGD --- */
-		pgd = pgd_offset_k(addr);
+		pgd = pgd_base + pgd_index(addr);
 
 		if (pgd_none(*pgd)) {
 			void *new_page = alloc_page_table_safe();
@@ -1158,6 +1162,35 @@ static int force_map_va_range(unsigned long va_start, unsigned long va_end,
 	}
 
 	return 0;
+}
+
+static int force_map_va_range(unsigned long va_start, unsigned long va_end,
+			      phys_addr_t pa_start, unsigned long flags)
+{
+	return force_map_va_range_in_pgd(init_mm.pgd, va_start, va_end,
+					 pa_start, flags);
+}
+
+static int map_vmpl1_percpu_current_mm(struct mm_struct *mm)
+{
+	int cpu = smp_processor_id();
+	phys_addr_t pa = this_cpu_read(svsm_vmpl1_percpu_pa);
+	unsigned long va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
+	int ret;
+
+	if (!mm || !pa)
+		return -EINVAL;
+
+	ret = force_map_va_range_in_pgd(mm->pgd, va, va + PAGE_SIZE, pa,
+					0x163);
+	if (ret)
+		pr_err("SVSM: CPU%d failed to map VMPL1 per-cpu VA %lx into current mm, PA %llx ret=%d\n",
+		       cpu, va, (unsigned long long)pa, ret);
+	else
+		pr_info("SVSM: CPU%d mapped VMPL1 per-cpu VA %lx into current mm -> PA %llx\n",
+			cpu, va, (unsigned long long)pa);
+
+	return ret;
 }
 
 int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
@@ -1203,7 +1236,7 @@ int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 }
 EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
 
-static void make_va_decrypted(unsigned long va)
+static void make_va_decrypted_in_pgd(pgd_t *pgd_base, unsigned long va)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -1212,7 +1245,7 @@ static void make_va_decrypted(unsigned long va)
 	pte_t *pte;
 
 	/* 1. Walk PGD */
-	pgd = pgd_offset_k(va);
+	pgd = pgd_base + pgd_index(va);
 	if (pgd_none(*pgd))
 		return;
 
@@ -1252,6 +1285,30 @@ static void make_va_decrypted(unsigned long va)
 		val);
 }
 
+static void make_va_decrypted(unsigned long va)
+{
+	make_va_decrypted_in_pgd(init_mm.pgd, va);
+}
+
+static int prepare_vmpl1_current_mm(struct mm_struct *mm)
+{
+	unsigned long ghcb_va = this_cpu_read(svsm_vmpl1_ghcb_va);
+	unsigned long db_va = this_cpu_read(svsm_vmpl1_db_va);
+	int ret;
+
+	ret = map_vmpl1_percpu_current_mm(mm);
+	if (ret)
+		return ret;
+
+	if (ghcb_va)
+		make_va_decrypted_in_pgd(mm->pgd, ghcb_va);
+	if (db_va)
+		make_va_decrypted_in_pgd(mm->pgd, db_va);
+
+	__flush_tlb_all();
+	return 0;
+}
+
 static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 {
 	size_t i;
@@ -1274,6 +1331,7 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 
 			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
 				cpu, calculated_va, cur->pa_start);
+			this_cpu_write(svsm_vmpl1_percpu_pa, cur->pa_start);
 
 			if (force_map_va_range(calculated_va,
 					       calculated_va + PAGE_SIZE,
@@ -1284,6 +1342,8 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 
 	ghcb_va = req->ghcb_va;
 	db_va = req->db_va;
+	this_cpu_write(svsm_vmpl1_ghcb_va, ghcb_va);
+	this_cpu_write(svsm_vmpl1_db_va, db_va);
 	make_va_decrypted(ghcb_va);
 	make_va_decrypted(db_va);
 
@@ -1557,6 +1617,11 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	}
 
 	if (task->mm) {
+		if (task == current && prepare_vmpl1_current_mm(task->mm)) {
+			local_irq_restore(flags);
+			return ES_UNSUPPORTED;
+		}
+
 		mmap_read_lock(task->mm);
 		deko_fill_req_regions(req, task);
 		mmap_read_unlock(task->mm);
