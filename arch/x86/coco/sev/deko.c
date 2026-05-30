@@ -24,9 +24,11 @@
 #include <linux/kernel.h>
 #include <linux/local_lock.h>
 #include <linux/mutex.h>
+#include <linux/irqflags.h>
 #include <linux/sizes.h>
 #include <linux/smp.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 #include <linux/sched/task_stack.h>
 #include <linux/types.h>
 #include <linux/syscalls.h>
@@ -1101,6 +1103,7 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					 bool *normal_exit)
 {
 	u64 handled_syscall_nr;
+	unsigned long flags;
 	int ret;
 
 	*normal_exit = false;
@@ -1121,9 +1124,21 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 	case DEKO_TIMER_SERVICE:
 		trace_deko_timer_service(current->pid);
 
-		/* Timer is hot-path: avoid log storm and always offer a
-		 * voluntary reschedule point to keep RCU/softirq forward progress. */
+		/*
+		 * VMPL1 consumes the restricted timer event outside Linux's
+		 * normal irq-entry tick path. Synthesize the reschedule bit that
+		 * the tick would otherwise set, then use the regular voluntary
+		 * reschedule point. Keep the VMPL1 task pinned while doing so:
+		 * timer delivery is per-CPU doorbell state, and passive migration
+		 * in the middle of this synthetic tick can strand the next event
+		 * on the wrong CPU.
+		 */
+		migrate_disable();
+		local_irq_save(flags);
+		set_need_resched_current();
+		local_irq_restore(flags);
 		cond_resched();
+		migrate_enable();
 		break;
 	default:
 		return -EINVAL;
