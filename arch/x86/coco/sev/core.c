@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/cpumask.h>
+#include <linux/string.h>
 #include <linux/efi.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
@@ -1477,120 +1478,118 @@ static u16 deko_region_perm_from_vma(const struct vm_area_struct *vma)
 	return perm;
 }
 
+static u16 deko_region_kind_from_vma(const struct vm_area_struct *vma,
+				     const struct mm_struct *mm)
+{
+	if (vma_is_initial_stack(vma))
+		return DEKO_BASE_REGION_STACK;
+	if (vma->vm_flags & VM_EXEC)
+		return DEKO_BASE_REGION_CODE;
+	if (!(vma->vm_flags & VM_WRITE))
+		return vma->vm_file ? DEKO_BASE_REGION_RODATA :
+				      DEKO_BASE_REGION_DATA;
+	if (mm && vma->vm_start < mm->brk && vma->vm_end > mm->start_brk)
+		return DEKO_BASE_REGION_HEAP;
+	return DEKO_BASE_REGION_DATA;
+}
+
+static bool deko_should_log_report_vmas(const char *launch_identity)
+{
+	return launch_identity &&
+	       (!strcmp(launch_identity, "redis-server") ||
+		!strcmp(launch_identity, "ycsb") ||
+		!strcmp(launch_identity, "ycsb.sh"));
+}
+
+static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
+					struct task_struct *task)
+{
+	struct mm_struct *mm = task->mm;
+	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
+	int i = 0;
+
+	if (!mm)
+		return;
+
+	pr_info("report_app vma dump begin: pid=%d comm=%s launch_identity=%s mnt_ns_id=%llu domain_id=%u region_count=%u start_code=0x%lx end_code=0x%lx start_data=0x%lx end_data=0x%lx start_brk=0x%lx brk=0x%lx start_stack=0x%lx total_vm=%lu\n",
+		task->pid, task->comm, req->launch_identity,
+		(unsigned long long)req->mnt_ns_id, req->domain_id,
+		req->region_count, mm->start_code, mm->end_code,
+		mm->start_data, mm->end_data, mm->start_brk, mm->brk,
+		mm->start_stack, mm->total_vm);
+
+	for (i = 0; i < req->region_count; i++) {
+		const struct deko_base_region_desc *r = &req->regions[i];
+
+		pr_info("report_app req_region[%d]: kind=%u perm=0x%x flags=0x%x mapped=[0x%llx-0x%llx) exact=[0x%llx-0x%llx)\n",
+			i, r->kind, r->perm, r->flags,
+			(unsigned long long)r->mapped_start,
+			(unsigned long long)r->mapped_end,
+			(unsigned long long)r->exact_start,
+			(unsigned long long)r->exact_end);
+	}
+
+	i = 0;
+	vma_iter_init(&vmi, mm, 0);
+	for_each_vma(vmi, vma) {
+		u16 perm = deko_region_perm_from_vma(vma);
+
+		if (vma->vm_file) {
+			pr_info("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=%pD\n",
+				i, vma->vm_start, vma->vm_end, vma->vm_flags,
+				perm, vma->vm_pgoff, vma->vm_file);
+		} else {
+			pr_info("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=<anon>\n",
+				i, vma->vm_start, vma->vm_end, vma->vm_flags,
+				perm, vma->vm_pgoff);
+		}
+
+		i++;
+	}
+
+	pr_info("report_app vma dump end: pid=%d comm=%s launch_identity=%s vma_count=%d\n",
+		task->pid, task->comm, req->launch_identity, i);
+}
+
 static void deko_fill_req_regions(struct deko_new_app_req *req,
 				  struct task_struct *task)
 {
 	struct mm_struct *mm = task->mm;
 	struct vm_area_struct *vma;
-	unsigned long data_exact_lo;
-	unsigned long data_exact_hi;
-	unsigned long data_mapped_hi;
-	unsigned long heap_exact_lo;
-	unsigned long heap_exact_hi;
-	unsigned long heap_mapped_lo;
-	unsigned long heap_mapped_hi;
 	struct vma_iterator vmi;
 
 	if (!mm)
 		return;
 
 	vma_iter_init(&vmi, mm, 0);
-	data_exact_lo = mm->start_data;
-	data_exact_hi = mm->end_data;
-	data_mapped_hi = PAGE_ALIGN(mm->end_data);
-	heap_exact_lo = mm->start_brk;
-	heap_exact_hi = mm->brk;
-	heap_mapped_lo = heap_exact_lo & PAGE_MASK;
-	heap_mapped_hi = PAGE_ALIGN(heap_exact_hi);
 
 	for_each_vma(vmi, vma) {
 		u16 perm = deko_region_perm_from_vma(vma);
+		u16 kind;
 		u32 flags = 0;
 		unsigned long start = vma->vm_start;
 		unsigned long end = vma->vm_end;
 
-		if (vma_is_initial_stack(vma)) {
-			if (vma->vm_flags & VM_GROWSDOWN)
-				flags |= DEKO_REGION_F_GROWSDOWN;
-			deko_append_region(req, DEKO_BASE_REGION_STACK, perm,
-					   flags, start, end, start, end);
+		if (!perm)
 			continue;
-		}
 
-		if (vma->vm_flags & VM_EXEC) {
-			deko_append_region(req, DEKO_BASE_REGION_CODE, perm, 0,
-					   start, end, start, end);
-			continue;
-		}
+		kind = deko_region_kind_from_vma(vma, mm);
 
-		if ((vma->vm_flags & VM_READ) && !(vma->vm_flags & VM_WRITE) &&
-		    !(vma->vm_flags & VM_EXEC) && vma->vm_file) {
-			deko_append_region(req, DEKO_BASE_REGION_RODATA, perm,
-					   0, start, end, start, end);
-			continue;
-		}
+		if (kind == DEKO_BASE_REGION_STACK &&
+		    (vma->vm_flags & VM_GROWSDOWN))
+			flags |= DEKO_REGION_F_GROWSDOWN;
+		else if (kind == DEKO_BASE_REGION_DATA &&
+			 (vma->vm_flags & VM_WRITE))
+			flags |= DEKO_REGION_F_TEMPLATE_RW;
 
-		if ((vma->vm_flags & (VM_WRITE | VM_SHARED | VM_STACK)) ==
-		    VM_WRITE) {
-			unsigned long exact_lo;
-			unsigned long exact_hi;
-
-			exact_lo = max(start, data_exact_lo);
-			exact_hi = min(end, data_exact_hi);
-			if (exact_lo < exact_hi) {
-				deko_append_region(req, DEKO_BASE_REGION_DATA,
-						   perm,
-						   DEKO_REGION_F_TEMPLATE_RW,
-						   start,
-						   min(end, data_mapped_hi),
-						   exact_lo, exact_hi);
-			}
-
-			if (!vma->vm_file && data_mapped_hi < heap_exact_lo) {
-				unsigned long bss_mapped_lo;
-				unsigned long bss_mapped_hi;
-				unsigned long bss_exact_lo;
-				unsigned long bss_exact_hi;
-
-				bss_mapped_lo = max(start, data_mapped_hi);
-				bss_mapped_hi = min(end, heap_mapped_lo);
-				bss_exact_lo = bss_mapped_lo;
-				bss_exact_hi = min(end, heap_exact_lo);
-				if (bss_mapped_lo < bss_mapped_hi &&
-				    bss_exact_lo < bss_exact_hi) {
-					deko_append_region(
-						req, DEKO_BASE_REGION_BSS, perm,
-						DEKO_REGION_F_ZERO_INIT |
-							DEKO_REGION_F_TEMPLATE_RW,
-						bss_mapped_lo, bss_mapped_hi,
-						bss_exact_lo, bss_exact_hi);
-				}
-			}
-		}
-
-		{
-			unsigned long heap_exact_vma_lo;
-			unsigned long heap_exact_vma_hi;
-			unsigned long heap_mapped_vma_lo;
-			unsigned long heap_mapped_vma_hi;
-
-			heap_exact_vma_lo = max(start, heap_exact_lo);
-			heap_exact_vma_hi = min(end, heap_exact_hi);
-			heap_mapped_vma_lo = max(start, heap_mapped_lo);
-			heap_mapped_vma_hi = min(end, heap_mapped_hi);
-			if (heap_mapped_vma_lo < heap_mapped_vma_hi &&
-			    heap_exact_vma_lo < heap_exact_vma_hi) {
-				deko_append_region(req, DEKO_BASE_REGION_HEAP,
-						   perm, 0, heap_mapped_vma_lo,
-						   heap_mapped_vma_hi,
-						   heap_exact_vma_lo,
-						   heap_exact_vma_hi);
-			}
-		}
+		deko_append_region(req, kind, perm, flags, start, end, start,
+				   end);
 	}
 }
 
 enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
+				     const char *launch_identity,
 				     bool creation, unsigned long *token_low,
 				     unsigned long *token_high,
 				     enum deko_new_app_type ty)
@@ -1628,7 +1627,10 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->app_type = ty;
 
 	strscpy(req->comm, task->comm, sizeof(req->comm));
-	strscpy(req->launch_identity, task->comm, sizeof(req->launch_identity));
+	if (launch_identity && launch_identity[0])
+		strscpy(req->launch_identity, launch_identity, sizeof(req->launch_identity));
+	else
+		strscpy(req->launch_identity, task->comm, sizeof(req->launch_identity));
 
 	if (task->nsproxy && task->nsproxy->mnt_ns)
 		req->mnt_ns_id = ns_id;
@@ -1652,6 +1654,8 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 		mmap_read_lock(task->mm);
 		deko_fill_req_regions(req, task);
+		if (deko_should_log_report_vmas(req->launch_identity))
+			deko_log_report_vmas_locked(req, task);
 		mmap_read_unlock(task->mm);
 	}
 

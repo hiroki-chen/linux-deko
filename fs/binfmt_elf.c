@@ -1398,6 +1398,7 @@ out_free_interp:
 	is_app = false;
 	{
 		u32 deko_domain_id = 0;
+		const char *deko_launch_identity = kbasename(bprm->filename);
 
 		if (current->flags & PF_KTHREAD)
 			goto out_deko;
@@ -1413,6 +1414,7 @@ out_free_interp:
 
 		res = svsm_deko_new_app_req(current,
 					    current->nsproxy->mnt_ns->ns.inum,
+					    deko_launch_identity,
 					    true, &regs->cx, &regs->dx,
 					    DEKO_DOCKER_APPS);
 		if (res != ES_OK) {

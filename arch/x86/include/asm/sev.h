@@ -43,7 +43,7 @@ enum deko_new_app_type {
 };
 
 #define DEKO_NEW_APP_REQ_VERSION_V3 3
-#define DEKO_MAX_BASE_REGIONS 16
+#define DEKO_MAX_BASE_REGIONS 96
 
 enum deko_base_region_kind {
 	DEKO_BASE_REGION_CODE = 1,
@@ -160,6 +160,7 @@ struct real_mode_header;
 enum stack_type;
 
 extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
+					    const char *launch_identity,
 					    bool creation,
 					    unsigned long *token_low,
 					    unsigned long *token_high,

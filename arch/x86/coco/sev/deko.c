@@ -512,6 +512,19 @@ static inline int mprotect_post_handler(struct mm_struct *mm,
 	return eager_fault_user_range(mm, start_addr, length, prot, "mprotect");
 }
 
+static inline int madvise_post_handler(struct mm_struct *mm,
+				       unsigned long start_addr,
+				       unsigned long length,
+				       unsigned long advice,
+				       unsigned long ax)
+{
+	if (!mm || IS_ERR_VALUE(ax) || advice != MADV_DONTNEED)
+		return 0;
+
+	return eager_fault_user_range(mm, start_addr, length,
+				      PROT_READ | PROT_WRITE, "madvise");
+}
+
 static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 {
 	struct svsm_call call = { 0 };
@@ -558,6 +571,13 @@ static int deko_app_handle_system_calls_post(
 	case __NR_pkey_mprotect:
 		ret = mprotect_post_handler(mm, syscall_body->di,
 					    syscall_body->si, syscall_body->dx);
+		if (ret < 0)
+			return ret;
+		break;
+	case __NR_madvise:
+		ret = madvise_post_handler(mm, syscall_body->di,
+					   syscall_body->si, syscall_body->dx,
+					   ax);
 		if (ret < 0)
 			return ret;
 		break;
