@@ -1113,7 +1113,7 @@ static int snp_set_vmsa(void *va, void *caa, int apic_id, bool make_vmsa)
 
 static int force_map_va_range_in_pgd(pgd_t *pgd_base, unsigned long va_start,
 				     unsigned long va_end, phys_addr_t pa_start,
-				     unsigned long flags)
+				     unsigned long flags, bool overwrite_present)
 {
 	unsigned long addr;
 	phys_addr_t paddr = pa_start;
@@ -1162,6 +1162,9 @@ static int force_map_va_range_in_pgd(pgd_t *pgd_base, unsigned long va_start,
 		/* --- Level 1: PTE --- */
 		pte = pte_offset_kernel(pmd, addr);
 
+		if (!overwrite_present && !pte_none(*pte))
+			continue;
+
 		set_pte(pte, __pte(paddr | 0x167 | _ENC));
 	}
 
@@ -1172,7 +1175,7 @@ static int force_map_va_range(unsigned long va_start, unsigned long va_end,
 			      phys_addr_t pa_start, unsigned long flags)
 {
 	return force_map_va_range_in_pgd(init_mm.pgd, va_start, va_end,
-					 pa_start, flags);
+					 pa_start, flags, true);
 }
 
 static int map_vmpl1_percpu_current_mm(struct mm_struct *mm)
@@ -1186,7 +1189,7 @@ static int map_vmpl1_percpu_current_mm(struct mm_struct *mm)
 		return -EINVAL;
 
 	ret = force_map_va_range_in_pgd(mm->pgd, va, va + PAGE_SIZE, pa,
-					0x163);
+					0x163, true);
 	if (ret)
 		pr_err("SVSM: CPU%d failed to map VMPL1 per-cpu VA %lx into current mm, PA %llx ret=%d\n",
 		       cpu, va, (unsigned long long)pa, ret);
@@ -1309,7 +1312,7 @@ int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 
 		ret = force_map_va_range_in_pgd(mm->pgd, map->va_start,
 						map->va_end, map->pa_start,
-						0x163);
+						0x163, false);
 		if (ret) {
 			pr_err("SVSM: failed to map VMPL1 global VA %llx..%llx into current mm, PA %llx ret=%d\n",
 			       map->va_start, map->va_end, map->pa_start, ret);
@@ -1485,7 +1488,7 @@ static u16 deko_region_kind_from_vma(const struct vm_area_struct *vma,
 		return DEKO_BASE_REGION_STACK;
 	if (vma->vm_flags & VM_EXEC)
 		return DEKO_BASE_REGION_CODE;
-	if (!(vma->vm_flags & VM_WRITE))
+	if (!(deko_region_perm_from_vma(vma) & DEKO_REGION_W))
 		return vma->vm_file ? DEKO_BASE_REGION_RODATA :
 				      DEKO_BASE_REGION_DATA;
 	if (mm && vma->vm_start < mm->brk && vma->vm_end > mm->start_brk)
@@ -1580,7 +1583,7 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 		    (vma->vm_flags & VM_GROWSDOWN))
 			flags |= DEKO_REGION_F_GROWSDOWN;
 		else if (kind == DEKO_BASE_REGION_DATA &&
-			 (vma->vm_flags & VM_WRITE))
+			 (perm & DEKO_REGION_W))
 			flags |= DEKO_REGION_F_TEMPLATE_RW;
 
 		deko_append_region(req, kind, perm, flags, start, end, start,
@@ -1590,7 +1593,7 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 
 enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 				     const char *launch_identity,
-				     bool creation, unsigned long *token_low,
+				     u64 report_kind, unsigned long *token_low,
 				     unsigned long *token_high,
 				     enum deko_new_app_type ty)
 {
@@ -1598,6 +1601,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	phys_addr_t req_pa;
 	struct deko_new_app_req *req;
 	struct svsm_call call = { 0 };
+	bool creation = report_kind != DEKO_REPORT_APP_LIFECYCLE;
 
 	call.caa = svsm_get_caa();
 	unsigned long flags;
@@ -1612,7 +1616,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
 	req->req_size = sizeof(*req);
 	req->pid = task->pid;
-	req->ppid = task->real_parent->pid;
+	req->ppid = (task == current) ? task->real_parent->pid : current->pid;
 	req->tgid = task->tgid;
 	req->uid = current_cred()->uid.val;
 	req->domain_id = 0;
@@ -1661,7 +1665,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
-	call.r8 = creation ? 1 : 0;
+	call.r8 = report_kind;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
 	pr_info("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",

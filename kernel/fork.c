@@ -112,6 +112,9 @@
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#endif
 
 /* For dup_mmap(). */
 #include "../mm/internal.h"
@@ -2678,6 +2681,16 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		lru_gen_add_mm(p->mm);
 		task_unlock(p);
 	}
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	{
+		int ret = deko_prepare_clone_child_before_wake(p);
+
+		if (unlikely(ret < 0))
+			pr_warn("Deko failed to prepare clone child before wake: parent pid=%d child pid=%d ret=%d\n",
+				current->pid, nr, ret);
+	}
+#endif
 
 	wake_up_new_task(p);
 

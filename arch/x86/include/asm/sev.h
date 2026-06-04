@@ -43,7 +43,21 @@ enum deko_new_app_type {
 };
 
 #define DEKO_NEW_APP_REQ_VERSION_V3 3
+#define DEKO_PROTOCOL_NEGOTIATE_REQ_VERSION_V1 1
+#define DEKO_PAGE_FAULT_REQ_VERSION_V1 1
+#define DEKO_PAGE_FAULT_RESP_VERSION_V1 1
+#define DEKO_ASPACE_OP_REQ_VERSION_V1 1
 #define DEKO_MAX_BASE_REGIONS 96
+#define DEKO_REPORT_APP_LIFECYCLE 0
+#define DEKO_REPORT_APP_EXEC_CREATE 1
+#define DEKO_REPORT_APP_FORK_CREATE 2
+
+enum deko_launch_type {
+	DEKO_LAUNCH_TYPE_LEGACY = 0,
+	DEKO_LAUNCH_TYPE_EXEC = 1,
+	DEKO_LAUNCH_TYPE_PROCESS_FORK = 2,
+	DEKO_LAUNCH_TYPE_THREAD = 3,
+};
 
 enum deko_base_region_kind {
 	DEKO_BASE_REGION_CODE = 1,
@@ -64,6 +78,58 @@ enum deko_region_flags {
 	DEKO_REGION_F_ZERO_INIT = 1u << 0,
 	DEKO_REGION_F_GROWSDOWN = 1u << 1,
 	DEKO_REGION_F_TEMPLATE_RW = 1u << 2,
+	DEKO_REGION_F_LAZY = 1u << 3,
+	DEKO_REGION_F_COW_ELIGIBLE = 1u << 4,
+	DEKO_REGION_F_MEASURE_ON_FAULT = 1u << 5,
+};
+
+enum deko_feature_flags {
+	DEKO_FEATURE_PAGE_FAULT_EXIT = 1ULL << 0,
+	DEKO_FEATURE_MONITOR_COW = 1ULL << 1,
+	DEKO_FEATURE_NO_EAGER_FAULT = 1ULL << 2,
+	DEKO_FEATURE_SHADOW_USER_CR3 = 1ULL << 3,
+	DEKO_FEATURE_ASPACE_VERSIONING = 1ULL << 4,
+	DEKO_FEATURE_FAST_ROLLBACK = 1ULL << 5,
+	DEKO_FEATURE_REWIND = 1ULL << 6,
+};
+
+enum deko_page_fault_access {
+	DEKO_PF_ACCESS_PRESENT = 1u << 0,
+	DEKO_PF_ACCESS_WRITE = 1u << 1,
+	DEKO_PF_ACCESS_USER = 1u << 2,
+	DEKO_PF_ACCESS_RSVD = 1u << 3,
+	DEKO_PF_ACCESS_INSTR = 1u << 4,
+};
+
+enum deko_page_fault_reason {
+	DEKO_PF_REASON_UNKNOWN = 0,
+	DEKO_PF_REASON_DEMAND = 1,
+	DEKO_PF_REASON_COW = 2,
+	DEKO_PF_REASON_PERMISSION = 3,
+	DEKO_PF_REASON_MEASURE = 4,
+};
+
+enum deko_page_fault_resolution {
+	DEKO_PF_RESOLUTION_NONE = 0,
+	DEKO_PF_RESOLUTION_ANON_PRIVATE = 1,
+	DEKO_PF_RESOLUTION_ZERO_PAGE = 2,
+	DEKO_PF_RESOLUTION_FILE_BACKED = 3,
+	DEKO_PF_RESOLUTION_DENY = 4,
+};
+
+enum deko_page_fault_resolve_flags {
+	DEKO_PF_RESOLVE_F_FRESH_PAGE = 1u << 0,
+	DEKO_PF_RESOLVE_F_ZEROED = 1u << 1,
+	DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE = 1u << 2,
+	DEKO_PF_RESOLVE_F_FILE_BACKED = 1u << 3,
+};
+
+enum deko_aspace_op {
+	DEKO_ASPACE_OP_CREATE_CHECKPOINT = 1,
+	DEKO_ASPACE_OP_ROLLBACK = 2,
+	DEKO_ASPACE_OP_REWIND = 3,
+	DEKO_ASPACE_OP_DROP_VERSION = 4,
+	DEKO_ASPACE_OP_FORK_VERSION = 5,
 };
 
 struct deko_base_region_desc {
@@ -102,9 +168,79 @@ struct deko_new_app_req {
 
 struct deko_launch_app_req {
 	struct pt_regs regs;
+	u32 launch_type;
+	u32 _reserved;
 	u64 fs_base;
 	u64 user_gs_base;
 	u64 kernel_gs_base;
+} __attribute__((aligned(8)));
+
+struct deko_protocol_negotiate_req {
+	u16 version;
+	u16 flags;
+	u32 req_size;
+	u16 linux_abi_major;
+	u16 linux_abi_minor;
+	u16 monitor_abi_major;
+	u16 monitor_abi_minor;
+	u64 required_features;
+	u64 requested_features;
+	u64 linux_features;
+	u64 monitor_features;
+	u64 negotiated_features;
+} __attribute__((aligned(8)));
+
+struct deko_page_fault_req {
+	u16 version;
+	u16 flags;
+	u32 req_size;
+	u64 seq;
+	u32 pid;
+	u32 tgid;
+	u32 access;
+	u32 reason;
+	u64 fault_va;
+	u64 page_va;
+	u64 error_code;
+	u64 rip;
+	u64 rsp;
+	u64 address_space_id;
+	u64 version_id;
+} __attribute__((aligned(8)));
+
+struct deko_page_fault_resp {
+	u16 version;
+	u16 flags;
+	u32 resp_size;
+	u64 seq;
+	s64 status;
+	u32 resolution;
+	u32 page_flags;
+	u64 page_va;
+	u64 page_gpa;
+	u64 page_len;
+	u64 backing_id;
+	u64 backing_offset;
+} __attribute__((aligned(8)));
+
+struct deko_page_fault_frame {
+	struct deko_page_fault_req req;
+	struct deko_page_fault_resp resp;
+} __attribute__((aligned(8)));
+
+struct deko_address_space_op_req {
+	u16 version;
+	u16 op;
+	u32 req_size;
+	u64 flags;
+	u32 pid;
+	u32 tgid;
+	u64 address_space_id;
+	u64 base_version_id;
+	u64 target_version_id;
+	u64 out_version_id;
+	u64 checkpoint_id;
+	u64 vmsa_gpa;
 } __attribute__((aligned(8)));
 
 struct deko_load_policy_req {
@@ -161,10 +297,11 @@ enum stack_type;
 
 extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    const char *launch_identity,
-					    bool creation,
+					    u64 report_kind,
 					    unsigned long *token_low,
 					    unsigned long *token_high,
 					    enum deko_new_app_type ty);
+extern int deko_prepare_clone_child_before_wake(struct task_struct *child);
 extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
 extern int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm);
@@ -444,6 +581,7 @@ struct svsm_ca {
 #define SVSM_PVALIDATE_FAIL_SIZEMISMATCH 0x80001006
 
 #define DEKO_TIMER_SERVICE 0x70000001
+#define DEKO_PAGE_FAULT_SERVICE 0x70000002
 #define DEKO_SERVICE_APP_ENTER_OK 0x0
 
 /*
@@ -523,6 +661,7 @@ struct svsm_call {
 
 struct deko_task_work {
 	struct callback_head work;
+	u32 launch_type;
 };
 
 extern struct svsm_ca *svsm_get_caa(void);
@@ -554,6 +693,10 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_EXTEND_MAP_IFC 4
 #define SVSM_EXTEND_TASK_MIGRATE 5
 #define SVSM_EXTEND_LOAD_POLICY 8
+#define SVSM_EXTEND_CONFIG_LOG_LEVEL 9
+#define SVSM_EXTEND_NEGOTIATE_PROTOCOL 10
+#define SVSM_EXTEND_PAGE_FAULT 11
+#define SVSM_EXTEND_ASPACE_OP 12
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

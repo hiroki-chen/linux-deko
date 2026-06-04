@@ -1415,7 +1415,8 @@ out_free_interp:
 		res = svsm_deko_new_app_req(current,
 					    current->nsproxy->mnt_ns->ns.inum,
 					    deko_launch_identity,
-					    true, &regs->cx, &regs->dx,
+					    DEKO_REPORT_APP_EXEC_CREATE,
+					    &regs->cx, &regs->dx,
 					    DEKO_DOCKER_APPS);
 		if (res != ES_OK) {
 			pr_err("Deko: SVSM rejected process %s (App=%d, res=%d, mnt_ns_id=%llu, domain_id=%u)\n",
@@ -1448,10 +1449,12 @@ out_free_interp:
 			}
 
 			init_task_work(&dw->work, deko_proxy_loop);
+			dw->launch_type = DEKO_LAUNCH_TYPE_EXEC;
 			task_work_add(current, &dw->work, TWA_RESUME);
-			pr_info("Deko: queued proxy loop task_work pid=%d tgid=%d comm=%s current_cpu=%u task=%px work=%px\n",
+			pr_info("Deko: queued proxy loop task_work pid=%d tgid=%d comm=%s current_cpu=%u task=%px work=%px launch_type=%u\n",
 				current->pid, current->tgid, current->comm,
-				raw_smp_processor_id(), current, &dw->work);
+				raw_smp_processor_id(), current, &dw->work,
+				dw->launch_type);
 		}
 	}
 out_deko:

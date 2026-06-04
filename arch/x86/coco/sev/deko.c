@@ -20,7 +20,9 @@
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/mm_types.h>
+#include <linux/mnt_namespace.h>
 #include <linux/mmap_lock.h>
+#include <linux/ns_common.h>
 #include <linux/kernel.h>
 #include <linux/local_lock.h>
 #include <linux/mutex.h>
@@ -29,21 +31,27 @@
 #include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task_stack.h>
+#include <linux/task_work.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <asm-generic/mman-common.h>
 #include <asm/mem_encrypt.h>
 #include <asm/processor.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
+#include <asm/trap_pf.h>
 #include <asm/current.h>
+#include <uapi/linux/sched.h>
 
 extern char __per_cpu_start[];
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
 #define DEKO_DOMAIN_BITS 8
+#define DEKO_PIN_PREFAULT_MAX_RETRIES 3
 
 struct deko_domain_entry {
 	u64 mnt_ns_id;
@@ -55,9 +63,11 @@ static DEFINE_HASHTABLE(deko_domain_table, DEKO_DOMAIN_BITS);
 static DEFINE_MUTEX(deko_domain_lock);
 static DEFINE_PER_CPU(local_lock_t,
 		      deko_svsm_caa_lock) = INIT_LOCAL_LOCK(deko_svsm_caa_lock);
+static bool deko_no_eager_fault = true;
 
 struct deko_launch_app_call_args {
 	const struct pt_regs *regs;
+	u32 launch_type;
 	u64 migration_version;
 };
 
@@ -134,7 +144,7 @@ static int deko_prepare_exit_call(struct svsm_call *call, struct svsm_ca *caa,
 	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
 	req->req_size = sizeof(*req);
 	req->tgid = current->tgid;
-	req->pid = current->tgid;
+	req->pid = current->pid;
 	req->ppid = current->real_parent->pid;
 	req->app_type = DEKO_DOCKER_APPS;
 
@@ -283,6 +293,16 @@ struct deko_shared_buf {
 	void *buf;
 	void *alias_buf;
 	u64 alias_len;
+	struct deko_page_fault_frame page_fault;
+};
+
+struct deko_page_fault_progress {
+	u64 fault_va;
+	u64 rip;
+	u64 error_code;
+	u32 access;
+	u32 reason;
+	unsigned int repeats;
 };
 
 struct deko_handoff_checkpoint {
@@ -350,6 +370,7 @@ static void deko_log_vma_attrs_for_range(struct mm_struct *mm,
 {
 	struct vm_area_struct *vma;
 	VMA_ITERATOR(vmi, mm, start_addr);
+	bool saw_overlap = false;
 
 	if (!mm)
 		return;
@@ -363,18 +384,65 @@ static void deko_log_vma_attrs_for_range(struct mm_struct *mm,
 		if (overlap_start >= overlap_end)
 			continue;
 
+		saw_overlap = true;
 		if (vma->vm_file) {
-			pr_warn("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx overlap=[0x%lx-0x%lx) vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=%pD\n",
+			pr_err("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx overlap=[0x%lx-0x%lx) vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=%pD\n",
 				reason, start_addr, end_addr, prot,
 				overlap_start, overlap_end, vma->vm_start,
 				vma->vm_end, vma->vm_flags, vma->vm_pgoff,
 				vma->vm_file);
 		} else {
-			pr_warn("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx overlap=[0x%lx-0x%lx) vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=<anon>\n",
+			pr_err("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx overlap=[0x%lx-0x%lx) vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=<anon>\n",
 				reason, start_addr, end_addr, prot,
 				overlap_start, overlap_end, vma->vm_start,
 				vma->vm_end, vma->vm_flags, vma->vm_pgoff);
 		}
+	}
+
+	if (!saw_overlap) {
+		vma = find_vma(mm, start_addr);
+		if (!vma) {
+			pr_err("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx no following vma\n",
+			       reason, start_addr, end_addr, prot);
+		} else if (vma->vm_file) {
+			pr_err("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx no overlap next_vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=%pD\n",
+			       reason, start_addr, end_addr, prot,
+			       vma->vm_start, vma->vm_end, vma->vm_flags,
+			       vma->vm_pgoff, vma->vm_file);
+		} else {
+			pr_err("Populate failure attrs for %s: req=[0x%lx-0x%lx) prot=0x%lx no overlap next_vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=<anon>\n",
+			       reason, start_addr, end_addr, prot,
+			       vma->vm_start, vma->vm_end, vma->vm_flags,
+			       vma->vm_pgoff);
+		}
+	}
+}
+
+static void deko_log_pin_failure_vma(struct mm_struct *mm, unsigned long addr,
+				     unsigned long end_addr,
+				     unsigned long prot, const char *reason)
+{
+	struct vm_area_struct *vma;
+
+	if (!mm)
+		return;
+
+	vma = find_vma(mm, addr);
+	if (!vma) {
+		pr_err("Pin failure VMA for %s: addr=0x%lx end=0x%lx prot=0x%lx no following vma\n",
+		       reason, addr, end_addr, prot);
+		return;
+	}
+
+	if (vma->vm_file) {
+		pr_err("Pin failure VMA for %s: addr=0x%lx end=0x%lx prot=0x%lx covered=%d vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=%pD\n",
+		       reason, addr, end_addr, prot, addr >= vma->vm_start,
+		       vma->vm_start, vma->vm_end, vma->vm_flags, vma->vm_pgoff,
+		       vma->vm_file);
+	} else {
+		pr_err("Pin failure VMA for %s: addr=0x%lx end=0x%lx prot=0x%lx covered=%d vma=[0x%lx-0x%lx) flags=0x%lx pgoff=0x%lx file=<anon>\n",
+		       reason, addr, end_addr, prot, addr >= vma->vm_start,
+		       vma->vm_start, vma->vm_end, vma->vm_flags, vma->vm_pgoff);
 	}
 }
 
@@ -424,6 +492,79 @@ out:
 	mmap_read_unlock(mm);
 }
 
+static int deko_pin_prefault_user_range(struct mm_struct *mm,
+					unsigned long start_addr,
+					unsigned long end_addr,
+					unsigned long prot,
+					const char *reason)
+{
+	struct page *pages[64];
+	unsigned long cur = start_addr;
+	unsigned int gup_flags = FOLL_FORCE;
+
+	if (!mm || start_addr >= end_addr)
+		return 0;
+
+	if (prot & PROT_WRITE)
+		gup_flags |= FOLL_WRITE;
+
+	while (cur < end_addr) {
+		unsigned long remaining = (end_addr - cur) >> PAGE_SHIFT;
+		unsigned long chunk_pages = min_t(unsigned long, remaining,
+						  ARRAY_SIZE(pages));
+		long pinned;
+		unsigned int attempt;
+
+		for (attempt = 0; attempt <= DEKO_PIN_PREFAULT_MAX_RETRIES;
+		     attempt++) {
+			int locked = 1;
+
+			mmap_read_lock(mm);
+			pinned = pin_user_pages_remote(mm, cur, chunk_pages,
+						       gup_flags, pages,
+						       &locked);
+			if (locked)
+				mmap_read_unlock(mm);
+			if (pinned != -EINTR && pinned != -EAGAIN)
+				break;
+			if (fatal_signal_pending(current)) {
+				pr_info("Interrupted pin-prefault range for %s at 0x%lx due to pending fatal signal\n",
+					reason, cur);
+				return -EINTR;
+			}
+			cond_resched();
+		}
+		if (pinned < 0) {
+			pr_err("Failed to pin-prefault range for %s at 0x%lx pages 0x%lx, err: %ld\n",
+				reason, cur, chunk_pages, pinned);
+			mmap_read_lock(mm);
+			deko_log_pin_failure_vma(mm, cur, end_addr, prot, reason);
+			mmap_read_unlock(mm);
+			return (int)pinned;
+		}
+		if (!pinned) {
+			pr_err("Failed to pin-prefault range for %s at 0x%lx: zero pages pinned\n",
+				reason, cur);
+			mmap_read_lock(mm);
+			deko_log_pin_failure_vma(mm, cur, end_addr, prot, reason);
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		unpin_user_pages(pages, pinned);
+		cur += (unsigned long)pinned << PAGE_SHIFT;
+		cond_resched();
+	}
+
+	if (cur < end_addr) {
+		pr_err("Incomplete pin-prefault range for %s: requested [0x%lx-0x%lx), stopped at 0x%lx\n",
+			reason, start_addr, end_addr, cur);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
 static int eager_fault_user_range(struct mm_struct *mm,
 				  unsigned long start_addr,
 				  unsigned long length, unsigned long prot,
@@ -431,6 +572,9 @@ static int eager_fault_user_range(struct mm_struct *mm,
 {
 	unsigned long end_addr;
 	int ret;
+
+	if (READ_ONCE(deko_no_eager_fault))
+		return 0;
 
 	if (!mm || !length || !prot)
 		return 0;
@@ -453,12 +597,20 @@ static int eager_fault_user_range(struct mm_struct *mm,
 
 	ret = __mm_populate(start_addr, end_addr - start_addr, 0);
 	if (ret < 0) {
-		pr_warn("Failed to populate range for %s at 0x%lx len 0x%lx, err: %d\n",
+		pr_err("Failed to populate range for %s at 0x%lx len 0x%lx, err: %d\n",
 			reason, start_addr, end_addr - start_addr, ret);
 		mmap_read_lock(mm);
 		deko_log_vma_attrs_for_range(mm, start_addr, end_addr, prot,
 					     reason);
 		mmap_read_unlock(mm);
+		return ret;
+	}
+
+	ret = deko_pin_prefault_user_range(mm, start_addr, end_addr, prot, reason);
+	if (ret < 0) {
+		pr_err("Prefault range failed for %s: start=0x%lx end=0x%lx length=0x%lx prot=0x%lx ret=%d\n",
+			reason, start_addr, end_addr, length, prot, ret);
+		return ret;
 	}
 
 	return 0;
@@ -504,8 +656,12 @@ static inline int mremap_post_handler(struct mm_struct *mm,
 static inline int mprotect_post_handler(struct mm_struct *mm,
 					unsigned long start_addr,
 					unsigned long length,
-					unsigned long prot)
+					unsigned long prot,
+					unsigned long ax)
 {
+	if (IS_ERR_VALUE(ax))
+		return 0;
+
 	if (!mm || !length || !(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
 		return 0;
 
@@ -525,7 +681,292 @@ static inline int madvise_post_handler(struct mm_struct *mm,
 				      PROT_READ | PROT_WRITE, "madvise");
 }
 
-static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
+static bool deko_vma_is_populatable(struct vm_area_struct *vma,
+				    unsigned long prot)
+{
+	if (!vma_is_accessible(vma))
+		return false;
+	if ((vma->vm_flags & (VM_IO | VM_PFNMAP)))
+		return false;
+	if ((prot & PROT_WRITE) && !(vma->vm_flags & VM_WRITE))
+		return false;
+
+	return true;
+}
+
+static bool deko_vma_needs_write_prefault(struct vm_area_struct *vma)
+{
+	if (vma->vm_flags & VM_WRITE)
+		return true;
+
+	return (vma->vm_flags & VM_MAYWRITE) &&
+	       !(vma->vm_flags & (VM_EXEC | VM_SHARED));
+}
+
+static int eager_fault_populatable_user_range(struct mm_struct *mm,
+					      unsigned long start_addr,
+					      unsigned long length,
+					      unsigned long prot,
+					      const char *reason)
+{
+	struct vm_area_struct *vma;
+	unsigned long end_addr;
+	unsigned long cur;
+	bool populated = false;
+	int ret;
+
+	if (READ_ONCE(deko_no_eager_fault))
+		return 0;
+
+	if (!mm || !length)
+		return 0;
+
+	if (check_add_overflow(start_addr, length, &end_addr))
+		return -EINVAL;
+
+	end_addr = PAGE_ALIGN(end_addr);
+	start_addr = PAGE_ALIGN_DOWN(start_addr);
+	if (start_addr >= end_addr)
+		return 0;
+
+	cur = start_addr;
+	while (cur < end_addr) {
+		unsigned long sub_start;
+		unsigned long sub_end;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, cur);
+		if (!vma) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		if (cur < vma->vm_start)
+			cur = vma->vm_start;
+		if (cur >= end_addr) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		sub_start = max(cur, vma->vm_start);
+		sub_end = min(end_addr, vma->vm_end);
+		if (!deko_vma_is_populatable(vma, prot)) {
+			mmap_read_unlock(mm);
+			cur = sub_end;
+			continue;
+		}
+		mmap_read_unlock(mm);
+
+		ret = eager_fault_user_range(mm, sub_start, sub_end - sub_start,
+					     prot, reason);
+		if (ret < 0)
+			return ret;
+
+		populated = true;
+		cur = sub_end;
+	}
+
+	return populated ? 0 : -EFAULT;
+}
+
+static int eager_fault_vma_containing_addr(struct mm_struct *mm,
+					   unsigned long addr,
+					   unsigned long prot,
+					   const char *reason)
+{
+	struct vm_area_struct *vma;
+	unsigned long start;
+	unsigned long length;
+
+	if (READ_ONCE(deko_no_eager_fault))
+		return 0;
+
+	if (!mm || !addr)
+		return 0;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, addr);
+	if (!vma || addr < vma->vm_start) {
+		mmap_read_unlock(mm);
+		return -EFAULT;
+	}
+	if (!deko_vma_is_populatable(vma, prot)) {
+		mmap_read_unlock(mm);
+		return -EFAULT;
+	}
+
+	start = vma->vm_start;
+	length = vma->vm_end - vma->vm_start;
+	mmap_read_unlock(mm);
+
+	return eager_fault_user_range(mm, start, length, prot, reason);
+}
+
+static int clone_stack_pre_handler(struct mm_struct *mm,
+				   const struct deko_syscall_body *syscall_body,
+				   unsigned long syscall_nr)
+{
+	if (!mm || !syscall_body)
+		return 0;
+
+	if (syscall_nr == __NR_clone3) {
+		struct clone_args args = {};
+		size_t size = min_t(size_t, syscall_body->si, sizeof(args));
+
+		if (!syscall_body->di ||
+		    size < offsetofend(struct clone_args, stack_size))
+			return 0;
+
+		if (copy_from_user(&args, (void __user *)syscall_body->di,
+				   size)) {
+			pr_warn("failed to copy clone3 args for deko pre-clone stack prefault: pid=%d\n",
+				current->pid);
+			return 0;
+		}
+
+		if (!(args.flags & CLONE_THREAD) || !args.stack ||
+		    !args.stack_size)
+			return 0;
+
+		return eager_fault_populatable_user_range(mm,
+							  (unsigned long)args.stack,
+							  (unsigned long)args.stack_size,
+							  PROT_READ | PROT_WRITE,
+							  "clone_stack_pre");
+	}
+
+	if (syscall_nr == __NR_clone) {
+		unsigned long clone_flags = syscall_body->di;
+		unsigned long sp = syscall_body->si;
+
+		if (!(clone_flags & CLONE_THREAD) || sp <= PAGE_SIZE)
+			return 0;
+
+		return eager_fault_vma_containing_addr(mm, sp - 1,
+						       PROT_READ | PROT_WRITE,
+						       "clone_stack_pre");
+	}
+
+	return 0;
+}
+
+static int deko_queue_proxy_loop_for_task(struct task_struct *task,
+					  const char *reason,
+					  u32 launch_type)
+{
+	struct deko_task_work *dw;
+	int ret;
+
+	if (!task || !task->mm)
+		return -EINVAL;
+
+	dw = kzalloc(sizeof(*dw), GFP_KERNEL);
+	if (!dw)
+		return -ENOMEM;
+
+	init_task_work(&dw->work, deko_proxy_loop);
+	dw->launch_type = launch_type;
+	ret = task_work_add(task, &dw->work, TWA_RESUME);
+	if (ret) {
+		kfree(dw);
+		return ret;
+	}
+
+	pr_info("queued proxy loop for %s child pid=%d tgid=%d comm=%s task=%px current_cpu=%u kernel_vmpl1_rsp=0x%lx launch_type=%u\n",
+		reason, task->pid, task->tgid, task->comm, task,
+		raw_smp_processor_id(), task->thread.kernel_vmpl1_rsp,
+		launch_type);
+
+	return 0;
+}
+
+static int deko_register_current_clone_child(void)
+{
+	unsigned long token_low = 0;
+	unsigned long token_high = 0;
+	u64 mnt_ns_id = 0;
+	enum es_result res;
+
+	if (current->nsproxy && current->nsproxy->mnt_ns)
+		mnt_ns_id = from_mnt_ns(current->nsproxy->mnt_ns)->inum;
+
+	res = svsm_deko_new_app_req(current, mnt_ns_id, current->comm,
+				    DEKO_REPORT_APP_FORK_CREATE,
+				    &token_low, &token_high, DEKO_DOCKER_APPS);
+	if (res != ES_OK) {
+		pr_warn("failed to register current deko clone child pid=%d tgid=%d res=%d\n",
+			current->pid, current->tgid, res);
+		return -EIO;
+	}
+
+	current->thread.user_rsp = 0;
+	current->thread.kernel_vmpl1_rsp = token_low;
+	current->thread.deko_checkpoint_generation = 0;
+	this_cpu_write(deko_user_rsp, current->thread.user_rsp);
+	this_cpu_write(deko_kernel_vmpl1_rsp,
+		       current->thread.kernel_vmpl1_rsp);
+
+	return 0;
+}
+
+int deko_prepare_clone_child_before_wake(struct task_struct *child)
+{
+	unsigned long token_low = 0;
+	unsigned long token_high = 0;
+	u64 mnt_ns_id = 0;
+	enum es_result res;
+	int ret;
+
+	if (!current->is_monitored || !child)
+		return 0;
+
+	if (!child->mm) {
+		pr_warn("skip deko proxy loop for clone child without mm pid=%d tgid=%d parent pid=%d tgid=%d\n",
+			child->pid, child->tgid, current->pid, current->tgid);
+		return 0;
+	}
+
+	child->is_monitored = true;
+
+	if (child->tgid != current->tgid || child->mm != current->mm) {
+		child->thread.user_rsp = 0;
+		child->thread.kernel_vmpl1_rsp = 0;
+		child->thread.deko_checkpoint_generation = 0;
+
+		ret = deko_queue_proxy_loop_for_task(
+			child, "fork", DEKO_LAUNCH_TYPE_PROCESS_FORK);
+		if (ret < 0)
+			child->is_monitored = false;
+		return ret;
+	}
+
+	if (child->nsproxy && child->nsproxy->mnt_ns)
+		mnt_ns_id = from_mnt_ns(child->nsproxy->mnt_ns)->inum;
+
+	res = svsm_deko_new_app_req(child, mnt_ns_id, child->comm,
+				    DEKO_REPORT_APP_FORK_CREATE,
+				    &token_low, &token_high, DEKO_DOCKER_APPS);
+	if (res != ES_OK) {
+		pr_warn("failed to register deko clone child pid=%d tgid=%d parent pid=%d tgid=%d res=%d\n",
+			child->pid, child->tgid, current->pid, current->tgid,
+			res);
+		child->is_monitored = false;
+		return -EIO;
+	}
+
+	child->thread.user_rsp = 0;
+	child->thread.kernel_vmpl1_rsp = token_low;
+	child->thread.deko_checkpoint_generation = 0;
+
+	ret = deko_queue_proxy_loop_for_task(
+		child, "clone", DEKO_LAUNCH_TYPE_THREAD);
+	if (ret < 0)
+		child->is_monitored = false;
+
+	return ret;
+}
+
+static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 {
 	struct svsm_call call = { 0 };
 	int ret;
@@ -538,6 +979,37 @@ static int exit_post_handler(struct mm_struct *mm, unsigned long ax)
 		pr_err("Failed to report app exit to SVSM for process %s (pid: %d), err: %d\n",
 		       current->comm, current->pid, ret);
 		return ret;
+	}
+
+	return 0;
+}
+
+static int deko_app_handle_system_calls_pre(
+	struct mm_struct *mm, const struct deko_syscall_body *syscall_body,
+	unsigned long syscall_nr)
+{
+	int ret;
+
+	switch (syscall_nr) {
+	case __NR_clone:
+	case __NR_clone3:
+		ret = clone_stack_pre_handler(mm, syscall_body, syscall_nr);
+		if (ret < 0)
+			return ret;
+		break;
+	case __NR_exit:
+	case __NR_exit_group:
+		/*
+		 * exit()/exit_group() do not return to the post-syscall path, so
+		 * lifecycle cleanup has to be reported before entering Linux's
+		 * exit handler.
+		 */
+		ret = exit_lifecycle_handler(mm, 0);
+		if (ret < 0)
+			return ret;
+		break;
+	default:
+		break;
 	}
 
 	return 0;
@@ -570,7 +1042,8 @@ static int deko_app_handle_system_calls_post(
 	case __NR_mprotect:
 	case __NR_pkey_mprotect:
 		ret = mprotect_post_handler(mm, syscall_body->di,
-					    syscall_body->si, syscall_body->dx);
+					    syscall_body->si, syscall_body->dx,
+					    ax);
 		if (ret < 0)
 			return ret;
 		break;
@@ -584,7 +1057,7 @@ static int deko_app_handle_system_calls_post(
 	case __NR_exit:
 	case __NR_exit_group:
 		/* Notify us that this thread has exited. */
-		ret = exit_post_handler(mm, ax);
+		ret = exit_lifecycle_handler(mm, ax);
 		if (ret < 0)
 			return ret;
 		break;
@@ -604,6 +1077,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	unsigned long syscall_nr;
 	unsigned long sys_retval;
 	unsigned long old_brk = 0;
+	int ret;
 
 	syscall_nr = syscall_body->ax;
 
@@ -627,6 +1101,11 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	if (current->mm)
 		old_brk = current->mm->brk;
 
+	ret = deko_app_handle_system_calls_pre(current->mm, syscall_body,
+					       syscall_nr);
+	if (ret < 0)
+		return ret;
+
 	syscall_fn = sys_call_table[syscall_nr];
 	if (unlikely(!syscall_fn)) {
 		pr_warn("Missing syscall handler for syscall number %lu\n",
@@ -643,7 +1122,8 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 		current->mm, syscall_body, syscall_nr, sys_retval, old_brk);
 }
 
-static int deko_pin_pages(struct mm_struct *mm, struct page ***pages)
+static int __maybe_unused deko_pin_pages(struct mm_struct *mm,
+					 struct page ***pages)
 {
 	struct vm_area_struct *vma;
 	unsigned long expected_pages;
@@ -708,13 +1188,15 @@ retry:
 			continue;
 		}
 
-		if (vma->vm_flags & VM_WRITE)
+		if (deko_vma_needs_write_prefault(vma))
 			gup_flags |= FOLL_WRITE;
 
 		remaining = nr_pages;
 		cur = start;
 
 		while (remaining) {
+			int locked = 1;
+
 			chunk_pages = min(remaining, 256UL);
 			if (chunk_pages > expected_pages - total_pinned) {
 				ret = -EOVERFLOW;
@@ -727,7 +1209,17 @@ retry:
 			ret = pin_user_pages_remote(mm, cur, chunk_pages,
 						    gup_flags,
 						    (*pages) + total_pinned,
-						    NULL);
+						    &locked);
+			if (!locked) {
+				pr_info("Restarting Deko VMA pin walk after GUP dropped mmap_lock at 0x%lx\n",
+					cur);
+				if (ret > 0)
+					unpin_user_pages((*pages) + total_pinned,
+							 ret);
+				if (ret == 0)
+					ret = 1;
+				goto out_retry_unlocked;
+			}
 			if (ret < 0) {
 				pr_err("Failed to pin VMA [0x%lx-0x%lx] chunk at 0x%lx, err: %d\n",
 				       start, end, cur, ret);
@@ -760,11 +1252,17 @@ retry:
 out_err:
 	mmap_read_unlock(mm);
 
+out_retry_unlocked:
 	if (total_pinned > 0)
 		unpin_user_pages(*pages, total_pinned);
 
 	kvfree(*pages);
 	*pages = NULL;
+
+	if (ret > 0) {
+		cond_resched();
+		goto retry;
+	}
 
 	return ret;
 }
@@ -794,8 +1292,8 @@ deko_notify_monitor_migration(unsigned int old_cpu,
 	ret = deko_svsm_call_locked(&call, deko_prepare_monitor_migration_call,
 				    &args);
 	if (unlikely(ret < 0)) {
-		pr_warn("Failed to notify monitor for task migration (app_id=%d, pid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
-			current->tgid, current->pid, old_cpu, args.current_cpu,
+		pr_warn("Failed to notify monitor for task migration (tid=%d, tgid=%d, old_cpu=%u, new_cpu=%u, err=%d)\n",
+			current->pid, current->tgid, old_cpu, args.current_cpu,
 			ret);
 		return ret;
 	}
@@ -821,7 +1319,7 @@ static int deko_prepare_monitor_migration_call(struct svsm_call *call,
 	req = (struct deko_migration_req *)caa->svsm_buffer;
 	req->old_cpu = migration->old_cpu;
 	req->new_cpu = current_cpu;
-	req->pid = current->tgid;
+	req->pid = current->pid;
 	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(current_cpu) +
 				    (unsigned long)__per_cpu_start);
 	req->user_gs_base = migration->checkpoint->user_gs_base;
@@ -840,7 +1338,9 @@ static int deko_prepare_launch_app_call(struct svsm_call *call,
 
 	current_cpu = raw_smp_processor_id();
 	req = (struct deko_launch_app_req *)caa->svsm_buffer;
+	memset(req, 0, sizeof(*req));
 	memcpy(&req->regs, launch->regs, sizeof(*launch->regs));
+	req->launch_type = launch->launch_type;
 	req->fs_base = x86_fsbase_read_task(current);
 	req->user_gs_base = x86_gsbase_read_task(current);
 	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(current_cpu) +
@@ -861,7 +1361,7 @@ deko_publish_handoff_checkpoint(struct deko_handoff_checkpoint *checkpoint,
 	WRITE_ONCE(checkpoint->seq, seq + 1);
 	smp_wmb();
 
-	WRITE_ONCE(checkpoint->pid, current->tgid);
+	WRITE_ONCE(checkpoint->pid, current->pid);
 	WRITE_ONCE(checkpoint->owner_cpu, migration->committed_owner_cpu);
 	WRITE_ONCE(checkpoint->generation, migration->committed_generation);
 	WRITE_ONCE(checkpoint->user_rsp, this_cpu_read(deko_user_rsp));
@@ -911,25 +1411,25 @@ static int deko_validate_handoff_checkpoint(
 {
 	if (!checkpoint->valid) {
 		pr_warn("handoff checkpoint invalid for pid=%d\n",
-			current->tgid);
+			current->pid);
 		return -EINVAL;
 	}
-	if (checkpoint->pid != current->tgid) {
+	if (checkpoint->pid != current->pid) {
 		pr_warn("handoff checkpoint pid mismatch: expected=%d actual=%u\n",
-			current->tgid, checkpoint->pid);
+			current->pid, checkpoint->pid);
 		return -EINVAL;
 	}
 	if (checkpoint->owner_cpu != migration->committed_owner_cpu) {
 		pr_warn("handoff checkpoint owner mismatch: expected=%u actual=%u pid=%d\n",
 			migration->committed_owner_cpu, checkpoint->owner_cpu,
-			current->tgid);
+			current->pid);
 		return -EINVAL;
 	}
 	if (checkpoint->generation != migration->committed_generation) {
 		pr_warn("handoff checkpoint generation mismatch: expected=%llu actual=%llu pid=%d\n",
 			(unsigned long long)migration->committed_generation,
 			(unsigned long long)checkpoint->generation,
-			current->tgid);
+			current->pid);
 		return -EINVAL;
 	}
 	if (migration->pending &&
@@ -942,7 +1442,7 @@ static int deko_validate_handoff_checkpoint(
 			(unsigned long long)
 				migration->expected_source_generation,
 			(unsigned long long)migration->committed_generation,
-			current->tgid);
+			current->pid);
 		return -EINVAL;
 	}
 	if (migration->pending &&
@@ -953,7 +1453,7 @@ static int deko_validate_handoff_checkpoint(
 			(unsigned long long)
 				migration->expected_source_generation,
 			(unsigned long long)checkpoint->generation,
-			current->tgid);
+			current->pid);
 		return -EINVAL;
 	}
 
@@ -998,7 +1498,7 @@ deko_check_and_handle_migration(struct svsm_call *call,
 
 	if (!deko_load_handoff_checkpoint(checkpoint, &snapshot)) {
 		pr_warn("handoff checkpoint missing for pid=%d owner=%u current_cpu=%u\n",
-			current->tgid, migration->committed_owner_cpu,
+			current->pid, migration->committed_owner_cpu,
 			current_cpu);
 		return -EINVAL;
 	}
@@ -1037,7 +1537,7 @@ static void deko_commit_handoff_adoption(struct deko_migration_state *migration,
 {
 	pr_debug(
 		"handoff commit pid=%d old_owner=%u new_owner=%u old_gen=%llu new_gen=%llu\n",
-		current->tgid, migration->committed_owner_cpu, current_cpu,
+		current->pid, migration->committed_owner_cpu, current_cpu,
 		(unsigned long long)migration->committed_generation,
 		(unsigned long long)migration->staged_generation);
 
@@ -1059,6 +1559,7 @@ deko_finalize_launch_round(struct svsm_call *call,
 	switch (call->rax_out) {
 	case DEKO_SERVICE_APP_ENTER_OK:
 	case DEKO_TIMER_SERVICE:
+	case DEKO_PAGE_FAULT_SERVICE:
 		if (adopting)
 			deko_commit_handoff_adoption(migration, current_cpu);
 		if (current_cpu == migration->committed_owner_cpu) {
@@ -1078,13 +1579,125 @@ deko_finalize_launch_round(struct svsm_call *call,
 	}
 }
 
+static unsigned int
+deko_page_fault_flags_from_req(const struct deko_page_fault_req *req)
+{
+	unsigned int flags = FAULT_FLAG_USER;
+
+	if (req->access & DEKO_PF_ACCESS_WRITE)
+		flags |= FAULT_FLAG_WRITE;
+	if (req->access & DEKO_PF_ACCESS_INSTR)
+		flags |= FAULT_FLAG_INSTRUCTION;
+
+	return flags;
+}
+
+static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
+{
+	struct deko_page_fault_frame *frame;
+	struct deko_page_fault_req *req;
+	struct deko_page_fault_resp *resp;
+	struct mm_struct *mm = current->mm;
+
+	unsigned int flags;
+	bool unlocked = false;
+	int ret;
+
+	if (unlikely(!buf || !mm))
+		return -EFAULT;
+
+	frame = &buf->page_fault;
+	req = &frame->req;
+	resp = &frame->resp;
+
+	resp->version = DEKO_PAGE_FAULT_RESP_VERSION_V1;
+	resp->resp_size = sizeof(*resp);
+	resp->seq = req->seq;
+	resp->status = -EINVAL;
+	resp->resolution = DEKO_PF_RESOLUTION_DENY;
+	resp->page_flags = 0;
+	resp->page_va = req->page_va;
+	resp->page_gpa = 0;
+	resp->page_len = 0;
+	resp->backing_id = 0;
+	resp->backing_offset = 0;
+
+	if (unlikely(req->version != DEKO_PAGE_FAULT_REQ_VERSION_V1 ||
+		     req->req_size != sizeof(*req)))
+		return -EINVAL;
+	if (unlikely(req->access & DEKO_PF_ACCESS_RSVD))
+		return -EFAULT;
+	if (unlikely(req->fault_va >= TASK_SIZE_MAX))
+		return -EFAULT;
+	if (unlikely(req->pid && req->pid != current->pid))
+		pr_warn("page fault pid mismatch req_pid=%u current_pid=%d fault=0x%llx\n",
+			req->pid, current->pid,
+			(unsigned long long)req->fault_va);
+
+	flags = deko_page_fault_flags_from_req(req);
+
+	mmap_read_lock(mm);
+	ret = fixup_user_fault(mm, req->fault_va, flags, &unlocked);
+	mmap_read_unlock(mm);
+
+	resp->status = ret;
+	resp->resolution = ret ? DEKO_PF_RESOLUTION_DENY :
+		((req->reason == DEKO_PF_REASON_COW) ?
+			 DEKO_PF_RESOLUTION_ANON_PRIVATE :
+			 DEKO_PF_RESOLUTION_NONE);
+	resp->page_flags = flags;
+	resp->page_len = ret ? 0 : PAGE_SIZE;
+
+	if (unlikely(ret))
+		pr_warn("page fault resolve failed pid=%d fault=0x%llx access=0x%x reason=%u ret=%d\n",
+			current->pid, (unsigned long long)req->fault_va,
+			req->access, req->reason, ret);
+
+	return ret;
+}
+
+static int
+deko_track_page_fault_progress(struct deko_shared_buf *buf,
+			       struct deko_page_fault_progress *progress)
+{
+	struct deko_page_fault_req *req = &buf->page_fault.req;
+	struct deko_page_fault_resp *resp = &buf->page_fault.resp;
+
+	if (req->fault_va == progress->fault_va &&
+	    req->rip == progress->rip &&
+	    req->error_code == progress->error_code &&
+	    req->access == progress->access &&
+	    req->reason == progress->reason) {
+		progress->repeats++;
+	} else {
+		progress->fault_va = req->fault_va;
+		progress->rip = req->rip;
+		progress->error_code = req->error_code;
+		progress->access = req->access;
+		progress->reason = req->reason;
+		progress->repeats = 1;
+	}
+
+	if (progress->repeats <= 256)
+		return 0;
+
+	pr_err("Deko page fault made no progress pid=%d fault=0x%llx rip=0x%llx access=0x%x reason=%u error=0x%llx seq=%llu status=%lld resolution=%u\n",
+	       current->pid, (unsigned long long)req->fault_va,
+	       (unsigned long long)req->rip, req->access, req->reason,
+	       (unsigned long long)req->error_code,
+	       (unsigned long long)req->seq, resp->status, resp->resolution);
+	return -ELOOP;
+}
+
 static int deko_run_launch_iteration(struct svsm_call *call,
 				     const struct pt_regs *regs,
+				     u32 launch_type,
 				     struct deko_migration_state *migration,
 				     bool *adopting, unsigned int *launch_cpu)
 {
 	struct deko_launch_app_call_args args = {
 		.regs = regs,
+		.launch_type = launch_type,
 	};
 	unsigned int current_cpu;
 	int ret;
@@ -1160,6 +1773,12 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 		cond_resched();
 		migrate_enable();
 		break;
+	case DEKO_PAGE_FAULT_SERVICE:
+		ret = deko_handle_page_fault_service(buf);
+		if (ret != 0)
+			return ret;
+		cond_resched();
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1193,10 +1812,9 @@ void deko_proxy_loop(struct callback_head *work)
 	struct svsm_call call = { 0 };
 	struct pt_regs *regs = task_pt_regs(current);
 	unsigned long long iteration = 0;
-	pid_t tgid = current->tgid;
+	u64 launch_identity = ((u64)(u32)current->tgid << 32) |
+			      (u32)current->pid;
 	struct deko_shared_buf *buf = NULL;
-	int pinned_count;
-	struct page **pages = NULL;
 	unsigned long alias_addr = 0;
 	bool normal_exit = false;
 	bool adopting = false;
@@ -1204,13 +1822,31 @@ void deko_proxy_loop(struct callback_head *work)
 	unsigned int launch_cpu = 0;
 	struct deko_migration_state migration = { 0 };
 	struct deko_handoff_checkpoint checkpoint = { 0 };
+	struct deko_page_fault_progress page_fault_progress = { 0 };
 
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
 
-	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d\n",
+	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
 		current->pid, current->tgid, current->comm, current,
-		raw_smp_processor_id(), current->is_monitored);
+		raw_smp_processor_id(), current->is_monitored,
+		dw->launch_type);
+
+	if (unlikely(!current->mm || fatal_signal_pending(current))) {
+		pr_info("Skipping Deko proxy loop for exiting task pid=%d tgid=%d comm=%s mm=%px fatal_signal=%d\n",
+			current->pid, current->tgid, current->comm, current->mm,
+			fatal_signal_pending(current));
+		kfree(dw);
+		return;
+	}
+
+	if (unlikely(!current->thread.kernel_vmpl1_rsp)) {
+		errno = deko_register_current_clone_child();
+		if (errno < 0) {
+			current->is_monitored = false;
+			goto err_pin;
+		}
+	}
 
 	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
 					     DEKO_DEFAULT_SHARED_BUF_SIZE);
@@ -1221,18 +1857,10 @@ void deko_proxy_loop(struct callback_head *work)
 	}
 
 	/*
-	 * At first we need to pin all the memories of the newly launched
-	 * application to prevent page fault that cannot be handled inside
-	 * VMPL1 and thus the application will crash immediately. This is
-	 * because by default Linux lazily loads the application code.
-	 *
-	 * The hidden alias VMA must already exist here so it is included in
-	 * the pinned user range visible to VMPL1.
+	 * Do not prefault or pin application memory here. VMPL1 page faults
+	 * are reported back through DEKO_PAGE_FAULT_SERVICE and resolved by
+	 * Linux on demand before VMPL1 retries the faulting instruction.
 	 */
-	if ((pinned_count = deko_pin_pages(current->mm, &pages)) < 0) {
-		errno = pinned_count;
-		goto err_alias_vma;
-	}
 
 	buf = kzalloc(sizeof(struct deko_shared_buf), GFP_KERNEL);
 	if (!buf) {
@@ -1256,7 +1884,7 @@ void deko_proxy_loop(struct callback_head *work)
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	/* Shared buffer between VMPL1 and VMPL2. */
 	call.rcx = (u64)buf;
-	call.rdx = tgid;
+	call.rdx = launch_identity;
 	call.r8 = 0;
 
 	current->is_monitored = true;
@@ -1264,6 +1892,13 @@ void deko_proxy_loop(struct callback_head *work)
 	/* Application main loop. */
 	for (;;) {
 		iteration++;
+		if (fatal_signal_pending(current)) {
+			errno = -EINTR;
+			pr_info("Deko proxy loop exiting pid=%d tgid=%d comm=%s due to pending fatal signal\n",
+				current->pid, current->tgid, current->comm);
+			goto err_loop;
+		}
+
 		migrate_disable();
 		iteration_cpu_pinned = true;
 
@@ -1287,8 +1922,9 @@ void deko_proxy_loop(struct callback_head *work)
 			goto err_loop;
 		}
 
-		errno = deko_run_launch_iteration(&call, regs, &migration,
-						  &adopting, &launch_cpu);
+		errno = deko_run_launch_iteration(
+			&call, regs, dw->launch_type, &migration, &adopting,
+			&launch_cpu);
 		if (errno == -EAGAIN) {
 			migrate_enable();
 			iteration_cpu_pinned = false;
@@ -1318,6 +1954,14 @@ void deko_proxy_loop(struct callback_head *work)
 
 		if (unlikely(errno < 0) || normal_exit)
 			goto err_loop;
+		if (call.rax_out == DEKO_PAGE_FAULT_SERVICE) {
+			errno = deko_track_page_fault_progress(
+				buf, &page_fault_progress);
+			if (unlikely(errno < 0))
+				goto err_loop;
+		} else {
+			page_fault_progress.repeats = 0;
+		}
 	}
 
 err_loop:
@@ -1331,10 +1975,6 @@ err_inner_buf:
 err_alias:
 	kfree(buf);
 
-	unpin_user_pages(pages, pinned_count);
-	kvfree(pages);
-
-err_alias_vma:
 	deko_free_hidden_user_alias(alias_addr, DEKO_DEFAULT_SHARED_BUF_SIZE);
 
 err_pin:
@@ -1349,8 +1989,10 @@ err_pin:
 	 * the latter case, we should kill the process with the appropriate error code.
 	 *
 	 */
-	if (!normal_exit)
+	if (!normal_exit) {
+		exit_lifecycle_handler(current->mm, errno);
 		do_exit(errno);
+	}
 }
 
 int deko_bootstrap(void)
