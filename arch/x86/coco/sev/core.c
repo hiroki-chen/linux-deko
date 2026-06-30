@@ -1194,8 +1194,8 @@ static int map_vmpl1_percpu_current_mm(struct mm_struct *mm)
 		pr_err("SVSM: CPU%d failed to map VMPL1 per-cpu VA %lx into current mm, PA %llx ret=%d\n",
 		       cpu, va, (unsigned long long)pa, ret);
 	else
-		pr_info("SVSM: CPU%d mapped VMPL1 per-cpu VA %lx into current mm -> PA %llx\n",
-			cpu, va, (unsigned long long)pa);
+		pr_debug("SVSM: CPU%d mapped VMPL1 per-cpu VA %lx into current mm -> PA %llx\n",
+			 cpu, va, (unsigned long long)pa);
 
 	return ret;
 }
@@ -1275,8 +1275,8 @@ static void make_va_decrypted_in_pgd(pgd_t *pgd_base, unsigned long va)
 
 		val &= ~_ENC;
 		set_pmd(pmd, __pmd(val));
-		pr_info("SVSM: GHCB VA %lx (PMD Huge) marked as Decrypted to %lx.\n",
-			va, val);
+		pr_debug("SVSM: GHCB VA %lx (PMD Huge) marked as Decrypted to %lx.\n",
+			 va, val);
 		return;
 	}
 
@@ -1288,8 +1288,8 @@ static void make_va_decrypted_in_pgd(pgd_t *pgd_base, unsigned long va)
 	val &= ~_ENC;
 	set_pte(pte, __pte(val));
 
-	pr_info("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va,
-		val);
+	pr_debug("SVSM: GHCB VA %lx (PTE 4K) marked as Decrypted to %lx.\n", va,
+		 val);
 }
 
 static void make_va_decrypted(unsigned long va)
@@ -1359,8 +1359,8 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 			cpu = smp_processor_id();
 			calculated_va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
 
-			pr_info("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
-				cpu, calculated_va, cur->pa_start);
+			pr_debug("SVSM: CPU%d Mapping Per-CPU VA %lx -> PA %llx\n",
+				 cpu, calculated_va, cur->pa_start);
 			this_cpu_write(svsm_vmpl1_percpu_pa, cur->pa_start);
 
 			if (force_map_va_range(calculated_va,
@@ -1430,7 +1430,7 @@ static void set_pte_enc(pte_t *kpte, int level, void *va)
 	set_pte_enc_mask(kpte, d.pfn, d.new_pgprot);
 }
 
-static void deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
+static bool deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
 			       u32 flags, unsigned long mapped_start,
 			       unsigned long mapped_end,
 			       unsigned long exact_start,
@@ -1440,7 +1440,7 @@ static void deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
 	u16 idx;
 
 	if (mapped_start >= mapped_end || exact_start >= exact_end)
-		return;
+		return true;
 
 	if (req->region_count > 0) {
 		prev = &req->regions[req->region_count - 1];
@@ -1449,12 +1449,12 @@ static void deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
 		    prev->exact_end == exact_start) {
 			prev->mapped_end = mapped_end;
 			prev->exact_end = exact_end;
-			return;
+			return true;
 		}
 	}
 
 	if (req->region_count >= DEKO_MAX_BASE_REGIONS)
-		return;
+		return false;
 
 	idx = req->region_count;
 	req->regions[idx].kind = kind;
@@ -1465,6 +1465,8 @@ static void deko_append_region(struct deko_new_app_req *req, u16 kind, u16 perm,
 	req->regions[idx].exact_start = exact_start;
 	req->regions[idx].exact_end = exact_end;
 	req->region_count = idx + 1;
+
+	return true;
 }
 
 static u16 deko_region_perm_from_vma(const struct vm_area_struct *vma)
@@ -1498,10 +1500,8 @@ static u16 deko_region_kind_from_vma(const struct vm_area_struct *vma,
 
 static bool deko_should_log_report_vmas(const char *launch_identity)
 {
-	return launch_identity &&
-	       (!strcmp(launch_identity, "redis-server") ||
-		!strcmp(launch_identity, "ycsb") ||
-		!strcmp(launch_identity, "ycsb.sh"));
+	(void)launch_identity;
+	return false;
 }
 
 static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
@@ -1574,8 +1574,11 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 		unsigned long start = vma->vm_start;
 		unsigned long end = vma->vm_end;
 
-		if (!perm)
+		if (!perm) {
+			if (req->region_count >= DEKO_MAX_BASE_REGIONS)
+				break;
 			continue;
+		}
 
 		kind = deko_region_kind_from_vma(vma, mm);
 
@@ -1586,8 +1589,9 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 			 (perm & DEKO_REGION_W))
 			flags |= DEKO_REGION_F_TEMPLATE_RW;
 
-		deko_append_region(req, kind, perm, flags, start, end, start,
-				   end);
+		if (!deko_append_region(req, kind, perm, flags, start, end,
+					start, end))
+			break;
 	}
 }
 
@@ -1600,113 +1604,142 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	enum es_result ret = ES_OK;
 	phys_addr_t req_pa;
 	struct deko_new_app_req *req;
+	struct deko_new_app_req *tmp;
 	struct svsm_call call = { 0 };
 	bool creation = report_kind != DEKO_REPORT_APP_LIFECYCLE;
-
-	call.caa = svsm_get_caa();
 	unsigned long flags;
+	int call_ret;
+
+	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
+	if (!tmp)
+		return ES_UNSUPPORTED;
+
+	tmp->version = DEKO_NEW_APP_REQ_VERSION_V3;
+	tmp->req_size = sizeof(*tmp);
+	tmp->pid = task->pid;
+	tmp->ppid = (task == current) ? task->real_parent->pid : current->pid;
+	tmp->tgid = task->tgid;
+	tmp->uid = current_cred()->uid.val;
+	tmp->domain_id = 0;
+	tmp->mnt_ns_id = 0;
+	tmp->start_brk = task->mm ? task->mm->start_brk : 0;
+	tmp->brk = task->mm ? task->mm->brk : 0;
+
+	tmp->fs_base = x86_fsbase_read_task(task);
+	tmp->gs_base = x86_gsbase_read_task(task);
+	tmp->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task)) +
+		(unsigned long)__per_cpu_start;
+	tmp->app_type = ty;
+
+	strscpy(tmp->comm, task->comm, sizeof(tmp->comm));
+	if (launch_identity && launch_identity[0])
+		strscpy(tmp->launch_identity, launch_identity,
+			sizeof(tmp->launch_identity));
+	else
+		strscpy(tmp->launch_identity, task->comm,
+			sizeof(tmp->launch_identity));
+
+	if (task->nsproxy && task->nsproxy->mnt_ns)
+		tmp->mnt_ns_id = ns_id;
+
+	if (ty == DEKO_DOCKER_APPS) {
+		if (deko_domain_lookup(tmp->mnt_ns_id, &tmp->domain_id)) {
+			pr_err("report_app domain lookup failed: pid=%d comm=%s mnt_ns_id=%llu creation=%u\n",
+			       task->pid, task->comm,
+			       (unsigned long long)tmp->mnt_ns_id,
+			       creation ? 1 : 0);
+			ret = ES_UNSUPPORTED;
+			goto out_free;
+		}
+	}
+
+	if (task->mm) {
+		if (task == current) {
+			int prepare_ret;
+
+			migrate_disable();
+			prepare_ret = svsm_prepare_vmpl1_current_mm(task->mm);
+			migrate_enable();
+			if (prepare_ret) {
+				ret = ES_UNSUPPORTED;
+				goto out_free;
+			}
+		}
+
+		mmap_read_lock(task->mm);
+		deko_fill_req_regions(tmp, task);
+		if (deko_should_log_report_vmas(tmp->launch_identity))
+			deko_log_report_vmas_locked(tmp, task);
+		mmap_read_unlock(task->mm);
+	}
+
+	pr_info("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",
+		task->pid, task->comm, (unsigned long long)read_cr3_pa(),
+		task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) : 0ULL,
+		task->mm ? task->mm->pgd : NULL,
+		(unsigned long long)tmp->fs_base,
+		(unsigned long long)tmp->gs_base,
+		(unsigned long long)tmp->kernel_gs_base,
+		creation ? 1 : 0);
+	log_report_app_cpu_tss_sp2(task, tmp);
 
 	local_irq_save(flags);
 
 	/* Re-use the SVSM buffer for allocating the request body. */
 	req = (struct deko_new_app_req *)(svsm_get_caa()->svsm_buffer);
 	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
-	memset(req, 0, sizeof(*req));
+	memcpy(req, tmp, sizeof(*tmp));
 
-	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
-	req->req_size = sizeof(*req);
-	req->pid = task->pid;
-	req->ppid = (task == current) ? task->real_parent->pid : current->pid;
-	req->tgid = task->tgid;
-	req->uid = current_cred()->uid.val;
-	req->domain_id = 0;
-	req->mnt_ns_id = 0;
-	req->start_brk = task->mm ? task->mm->start_brk : 0;
-	req->brk = task->mm ? task->mm->brk : 0;
-
-	req->fs_base = x86_fsbase_read_task(task);
-	req->gs_base = x86_gsbase_read_task(task);
-	req->kernel_gs_base = cpu_kernelmode_gs_base(task_cpu(task)) +
-		(unsigned long)__per_cpu_start;
-	req->app_type = ty;
-
-	strscpy(req->comm, task->comm, sizeof(req->comm));
-	if (launch_identity && launch_identity[0])
-		strscpy(req->launch_identity, launch_identity, sizeof(req->launch_identity));
-	else
-		strscpy(req->launch_identity, task->comm, sizeof(req->launch_identity));
-
-	if (task->nsproxy && task->nsproxy->mnt_ns)
-		req->mnt_ns_id = ns_id;
-
-	if (ty == DEKO_DOCKER_APPS) {
-		if (deko_domain_lookup(req->mnt_ns_id, &req->domain_id)) {
-			pr_err("report_app domain lookup failed: pid=%d comm=%s mnt_ns_id=%llu creation=%u\n",
-			       task->pid, task->comm,
-			       (unsigned long long)req->mnt_ns_id,
-			       creation ? 1 : 0);
-			local_irq_restore(flags);
-			return ES_UNSUPPORTED;
-		}
-	}
-
-	if (task->mm) {
-		if (task == current && svsm_prepare_vmpl1_current_mm(task->mm)) {
-			local_irq_restore(flags);
-			return ES_UNSUPPORTED;
-		}
-
-		mmap_read_lock(task->mm);
-		deko_fill_req_regions(req, task);
-		if (deko_should_log_report_vmas(req->launch_identity))
-			deko_log_report_vmas_locked(req, task);
-		mmap_read_unlock(task->mm);
-	}
+	pr_info("report_app submitting: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u req_pa=0x%llx mnt_ns_id=%llu domain_id=%u region_count=%u current_pid=%d current_tgid=%d\n",
+		task->pid, task->tgid, tmp->ppid, task->comm,
+		tmp->launch_identity, (unsigned long long)report_kind,
+		tmp->app_type, (unsigned long long)req_pa,
+		(unsigned long long)tmp->mnt_ns_id, tmp->domain_id,
+		tmp->region_count, current->pid, current->tgid);
 
 	call.caa = svsm_get_caa();
 	call.r9 = req_pa;
 	call.r8 = report_kind;
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
-	pr_info("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",
-		task->pid, task->comm, (unsigned long long)read_cr3_pa(),
-		task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) : 0ULL,
-		task->mm ? task->mm->pgd : NULL,
-		(unsigned long long)req->fs_base,
-		(unsigned long long)req->gs_base,
-		(unsigned long long)req->kernel_gs_base,
-		creation ? 1 : 0);
-	log_report_app_cpu_tss_sp2(task, req);
-
-	{
-		int call_ret = svsm_perform_call_protocol(&call);
-
-		if (call_ret) {
-			pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx\n",
-			       task->pid, task->comm, req->launch_identity,
-			       creation ? 1 : 0, call_ret, call.rax_out,
-			       call.rcx_out, call.rdx_out, call.r8_out,
-			       call.r9_out, req->domain_id,
-			       (unsigned long long)req->mnt_ns_id, req->version,
-			       req->req_size, req->region_count,
-			       (unsigned long long)read_cr3_pa(),
-			       task->mm ? (unsigned long long)__sme_pa(
-						  task->mm->pgd) :
-					  0ULL,
-			       (unsigned long long)req->fs_base,
-			       (unsigned long long)req->gs_base,
-			       (unsigned long long)req->kernel_gs_base);
-			ret = ES_UNSUPPORTED;
-		}
-	}
-
-	if (creation && ty == DEKO_DOCKER_APPS) {
-		*token_low = req->kernel_vmpl1_rsp;
-		*token_high = 0;
-	}
+	call_ret = svsm_perform_call_protocol(&call);
+	memcpy(tmp, req, sizeof(*tmp));
 
 	local_irq_restore(flags);
 
+	if (call_ret) {
+		pr_err("report_app rejected: pid=%d comm=%s launch_identity=%s creation=%u call_ret=%d rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu version=%u req_size=%u region_count=%u hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx\n",
+		       task->pid, task->comm, tmp->launch_identity,
+		       creation ? 1 : 0, call_ret, call.rax_out,
+		       call.rcx_out, call.rdx_out, call.r8_out,
+		       call.r9_out, tmp->domain_id,
+		       (unsigned long long)tmp->mnt_ns_id, tmp->version,
+		       tmp->req_size, tmp->region_count,
+		       (unsigned long long)read_cr3_pa(),
+		       task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) :
+				  0ULL,
+		       (unsigned long long)tmp->fs_base,
+		       (unsigned long long)tmp->gs_base,
+		       (unsigned long long)tmp->kernel_gs_base);
+		ret = ES_UNSUPPORTED;
+	} else {
+		pr_info("report_app accepted: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu region_count=%u kernel_vmpl1_rsp=0x%llx\n",
+			task->pid, task->tgid, tmp->ppid, task->comm,
+			tmp->launch_identity, (unsigned long long)report_kind,
+			tmp->app_type, call.rax_out, call.rcx_out,
+			call.rdx_out, call.r8_out, call.r9_out,
+			tmp->domain_id, (unsigned long long)tmp->mnt_ns_id,
+			tmp->region_count,
+			(unsigned long long)tmp->kernel_vmpl1_rsp);
+	}
+
+	if (creation && ty == DEKO_DOCKER_APPS) {
+		*token_low = tmp->kernel_vmpl1_rsp;
+		*token_high = 0;
+	}
+
+out_free:
+	kfree(tmp);
 	return ret;
 }
 

@@ -189,7 +189,8 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	clear_tsk_thread_flag(p, TIF_IO_BITMAP);
 	p->thread.iopl_warn = 0;
 #ifdef CONFIG_AMD_MEM_ENCRYPT
-	if ((clone_flags & CLONE_THREAD) && current->is_monitored) {
+	if ((clone_flags & CLONE_THREAD) && current->is_monitored &&
+	    !args->io_thread && !args->user_worker) {
 		p->thread.user_rsp = current->thread.user_rsp;
 		p->thread.kernel_vmpl1_rsp = current->thread.kernel_vmpl1_rsp;
 		p->thread.deko_checkpoint_generation =

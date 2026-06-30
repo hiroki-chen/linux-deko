@@ -15,6 +15,7 @@
 
 #undef CREATE_TRACE_POINTS
 
+#include <linux/completion.h>
 #include <linux/hashtable.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -24,6 +25,8 @@
 #include <linux/mmap_lock.h>
 #include <linux/ns_common.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/kstrtox.h>
 #include <linux/local_lock.h>
 #include <linux/mutex.h>
 #include <linux/irqflags.h>
@@ -31,7 +34,9 @@
 #include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/sched/prio.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
 #include <linux/task_work.h>
 #include <linux/types.h>
@@ -43,6 +48,7 @@
 #include <asm/sev.h>
 #include <asm/syscall.h>
 #include <asm/trap_pf.h>
+#include <asm/tsc.h>
 #include <asm/current.h>
 #include <uapi/linux/sched.h>
 
@@ -50,6 +56,21 @@ extern char __per_cpu_start[];
 
 #define DEKO_DEFAULT_SHARED_BUF_SIZE SZ_2M
 #define DEKO_RING_CAPACITY 32
+#define DEKO_SYSCALL_RING_MAGIC 0x44535953U
+#define DEKO_SYSCALL_RING_VERSION 2
+#define DEKO_SYSCALL_RING_ENTRY_EMPTY 0
+#define DEKO_SYSCALL_RING_ENTRY_READY 1
+#define DEKO_SYSCALL_RING_ENTRY_DONE 2
+#define DEKO_SYSCALL_RING_ENTRY_CLAIMED 3
+#define DEKO_SYSCALL_RING_ENTRY_FLAG_EPOLL_PEEK 1U
+#define DEKO_POLLER_ASLEEP 0
+#define DEKO_POLLER_AWAKE 1
+#define DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT 30000000ULL
+#define DEKO_RING_POLLER_SLEEP_MS_DEFAULT 1
+#define DEKO_RING_POLLER_AFFINITY_NONE 0
+#define DEKO_RING_POLLER_AFFINITY_SAME 1
+#define DEKO_RING_POLLER_AFFINITY_NEXT 2
+#define DEKO_RING_WAIT_RESCHED_INTERVAL 1024
 #define DEKO_DOMAIN_BITS 8
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
 
@@ -64,6 +85,81 @@ static DEFINE_MUTEX(deko_domain_lock);
 static DEFINE_PER_CPU(local_lock_t,
 		      deko_svsm_caa_lock) = INIT_LOCAL_LOCK(deko_svsm_caa_lock);
 static bool deko_no_eager_fault = true;
+static bool deko_pin_proxy_task = true;
+static bool deko_syscall_ring_enabled;
+static bool deko_ring_poll;
+static u64 deko_ring_poller_idle_cycles = DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT;
+static unsigned int deko_ring_poller_sleep_ms =
+	DEKO_RING_POLLER_SLEEP_MS_DEFAULT;
+static int deko_ring_poller_nice;
+static unsigned int deko_ring_poller_affinity =
+	DEKO_RING_POLLER_AFFINITY_NONE;
+
+static int __init deko_pin_proxy_task_setup(char *str)
+{
+	return kstrtobool(str, &deko_pin_proxy_task) == 0;
+}
+__setup("deko_pin_proxy_task=", deko_pin_proxy_task_setup);
+
+static int __init deko_syscall_ring_setup(char *str)
+{
+	return kstrtobool(str, &deko_syscall_ring_enabled) == 0;
+}
+__setup("deko_syscall_ring=", deko_syscall_ring_setup);
+
+static int __init deko_ring_poll_setup(char *str)
+{
+	return kstrtobool(str, &deko_ring_poll) == 0;
+}
+__setup("deko_ring_poll=", deko_ring_poll_setup);
+
+static int __init deko_ring_poller_idle_cycles_setup(char *str)
+{
+	return kstrtoull(str, 0, &deko_ring_poller_idle_cycles) == 0;
+}
+__setup("deko_ring_poller_idle_cycles=", deko_ring_poller_idle_cycles_setup);
+
+static int __init deko_ring_poller_sleep_ms_setup(char *str)
+{
+	return kstrtouint(str, 0, &deko_ring_poller_sleep_ms) == 0;
+}
+__setup("deko_ring_poller_sleep_ms=", deko_ring_poller_sleep_ms_setup);
+
+static int __init deko_ring_poller_nice_setup(char *str)
+{
+	int nice;
+
+	if (kstrtoint(str, 0, &nice) != 0)
+		return 0;
+	if (nice < MIN_NICE)
+		nice = MIN_NICE;
+	if (nice > MAX_NICE)
+		nice = MAX_NICE;
+	deko_ring_poller_nice = nice;
+	return 1;
+}
+__setup("deko_ring_poller_nice=", deko_ring_poller_nice_setup);
+
+static int __init deko_ring_poller_affinity_setup(char *str)
+{
+	if (!str)
+		return 0;
+	if (!strcmp(str, "none")) {
+		deko_ring_poller_affinity = DEKO_RING_POLLER_AFFINITY_NONE;
+		return 1;
+	}
+	if (!strcmp(str, "same")) {
+		deko_ring_poller_affinity = DEKO_RING_POLLER_AFFINITY_SAME;
+		return 1;
+	}
+	if (!strcmp(str, "next")) {
+		deko_ring_poller_affinity = DEKO_RING_POLLER_AFFINITY_NEXT;
+		return 1;
+	}
+
+	return 0;
+}
+__setup("deko_ring_poller_affinity=", deko_ring_poller_affinity_setup);
 
 struct deko_launch_app_call_args {
 	const struct pt_regs *regs;
@@ -253,17 +349,25 @@ struct deko_syscall_entry {
 	u64 ax;
 	u64 di, si, dx, r10, r8, r9;
 	u64 ret;
+	u32 state;
+	u32 _reserved;
 };
 
-struct deko_ring_buf {
+struct deko_syscall_ring {
+	u32 magic;
+	u16 version;
+	u16 capacity;
 	u32 head;
 	u32 tail;
+	u32 poller_state;
+	u32 _pad;
+	u64 poller_heartbeat;
 	struct deko_syscall_entry entries[DEKO_RING_CAPACITY];
 };
 
 struct deko_shared_ring_buf {
-	struct deko_ring_buf tx;
-	struct deko_ring_buf rx;
+	struct deko_syscall_ring tx;
+	struct deko_syscall_ring rx;
 };
 
 struct deko_syscall_body {
@@ -294,6 +398,16 @@ struct deko_shared_buf {
 	void *alias_buf;
 	u64 alias_len;
 	struct deko_page_fault_frame page_fault;
+};
+
+struct deko_ring_poller {
+	struct deko_shared_buf *buf;
+	struct deko_syscall_ring *ring;
+	struct task_struct *owner;
+	struct task_struct *task;
+	struct completion exited;
+	bool stop;
+	bool started;
 };
 
 struct deko_page_fault_progress {
@@ -361,6 +475,67 @@ static void deko_free_hidden_user_alias(unsigned long alias_addr,
 static inline bool is_exit_syscall(u64 syscall_num)
 {
 	return syscall_num == __NR_exit || syscall_num == __NR_exit_group;
+}
+
+static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
+{
+	switch (syscall_num) {
+	case __NR_read:
+	case __NR_write:
+	case __NR_pread64:
+	case __NR_pwrite64:
+	case __NR_readv:
+	case __NR_writev:
+	case __NR_recvfrom:
+	case __NR_sendto:
+	case __NR_sendfile:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool
+deko_syscall_ring_entry_has_flag(const struct deko_syscall_entry *entry,
+				 u32 flag)
+{
+	return (READ_ONCE(entry->_reserved) & flag) != 0;
+}
+
+static inline bool
+deko_ring_poller_entry_eligible(const struct deko_syscall_entry *entry)
+{
+	u64 syscall_num = READ_ONCE(entry->ax);
+
+	if (deko_ring_poller_syscall_eligible(syscall_num))
+		return true;
+
+	switch (syscall_num) {
+	case __NR_epoll_wait_old:
+	case __NR_epoll_wait:
+	case __NR_epoll_pwait:
+		return deko_syscall_ring_entry_has_flag(
+			entry, DEKO_SYSCALL_RING_ENTRY_FLAG_EPOLL_PEEK);
+	default:
+		return false;
+	}
+}
+
+static inline bool deko_ring_poller_syscall_dangerous(u64 syscall_num)
+{
+	switch (syscall_num) {
+	case __NR_exit:
+	case __NR_exit_group:
+	case __NR_clone:
+	case __NR_clone3:
+	case __NR_fork:
+	case __NR_vfork:
+	case __NR_execve:
+	case __NR_execveat:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static void deko_log_vma_attrs_for_range(struct mm_struct *mm,
@@ -880,6 +1055,27 @@ static int deko_queue_proxy_loop_for_task(struct task_struct *task,
 	return 0;
 }
 
+static int deko_pin_current_proxy_task(void)
+{
+	unsigned int cpu;
+	int ret;
+
+	if (!READ_ONCE(deko_pin_proxy_task))
+		return 0;
+
+	cpu = raw_smp_processor_id();
+	ret = set_cpus_allowed_ptr(current, cpumask_of(cpu));
+	if (ret) {
+		pr_warn("failed to pin Deko proxy task pid=%d tgid=%d comm=%s to cpu=%u ret=%d\n",
+			current->pid, current->tgid, current->comm, cpu, ret);
+		return ret;
+	}
+
+	pr_info("pinned Deko proxy task pid=%d tgid=%d comm=%s to cpu=%u\n",
+		current->pid, current->tgid, current->comm, cpu);
+	return 0;
+}
+
 static int deko_register_current_clone_child(void)
 {
 	unsigned long token_low = 0;
@@ -889,6 +1085,11 @@ static int deko_register_current_clone_child(void)
 
 	if (current->nsproxy && current->nsproxy->mnt_ns)
 		mnt_ns_id = from_mnt_ns(current->nsproxy->mnt_ns)->inum;
+
+	pr_info("Deko registering current clone child pid=%d tgid=%d ppid=%d comm=%s mnt_ns_id=%llu mm=%px launch_type=%u\n",
+		current->pid, current->tgid, current->real_parent->pid,
+		current->comm, (unsigned long long)mnt_ns_id, current->mm,
+		DEKO_LAUNCH_TYPE_PROCESS_FORK);
 
 	res = svsm_deko_new_app_req(current, mnt_ns_id, current->comm,
 				    DEKO_REPORT_APP_FORK_CREATE,
@@ -906,6 +1107,10 @@ static int deko_register_current_clone_child(void)
 	this_cpu_write(deko_kernel_vmpl1_rsp,
 		       current->thread.kernel_vmpl1_rsp);
 
+	pr_info("Deko registered current clone child pid=%d tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx\n",
+		current->pid, current->tgid, token_low, token_high,
+		current->thread.kernel_vmpl1_rsp);
+
 	return 0;
 }
 
@@ -919,6 +1124,20 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 	if (!current->is_monitored || !child)
 		return 0;
+
+	if (child->flags & (PF_IO_WORKER | PF_USER_WORKER)) {
+		child->is_monitored = false;
+		child->thread.user_rsp = 0;
+		child->thread.kernel_vmpl1_rsp = 0;
+		child->thread.deko_checkpoint_generation = 0;
+		pr_debug("skip deko proxy loop for internal worker child_pid=%d child_tgid=%d parent_pid=%d flags=0x%x\n",
+			 child->pid, child->tgid, current->pid, child->flags);
+		return 0;
+	}
+
+	pr_info("Deko prepare clone child before wake parent_pid=%d parent_tgid=%d child_pid=%d child_tgid=%d parent_mm=%px child_mm=%px child_comm=%s\n",
+		current->pid, current->tgid, child->pid, child->tgid,
+		current->mm, child->mm, child->comm);
 
 	if (!child->mm) {
 		pr_warn("skip deko proxy loop for clone child without mm pid=%d tgid=%d parent pid=%d tgid=%d\n",
@@ -935,6 +1154,8 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 		ret = deko_queue_proxy_loop_for_task(
 			child, "fork", DEKO_LAUNCH_TYPE_PROCESS_FORK);
+		pr_info("Deko queued process-fork proxy loop child_pid=%d child_tgid=%d parent_pid=%d ret=%d\n",
+			child->pid, child->tgid, current->pid, ret);
 		if (ret < 0)
 			child->is_monitored = false;
 		return ret;
@@ -942,6 +1163,10 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 	if (child->nsproxy && child->nsproxy->mnt_ns)
 		mnt_ns_id = from_mnt_ns(child->nsproxy->mnt_ns)->inum;
+
+	pr_info("Deko reporting same-mm clone child pid=%d tgid=%d parent_pid=%d parent_tgid=%d mnt_ns_id=%llu\n",
+		child->pid, child->tgid, current->pid, current->tgid,
+		(unsigned long long)mnt_ns_id);
 
 	res = svsm_deko_new_app_req(child, mnt_ns_id, child->comm,
 				    DEKO_REPORT_APP_FORK_CREATE,
@@ -960,6 +1185,9 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 	ret = deko_queue_proxy_loop_for_task(
 		child, "clone", DEKO_LAUNCH_TYPE_THREAD);
+	pr_info("Deko queued same-mm clone proxy loop child_pid=%d child_tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx ret=%d\n",
+		child->pid, child->tgid, token_low, token_high,
+		child->thread.kernel_vmpl1_rsp, ret);
 	if (ret < 0)
 		child->is_monitored = false;
 
@@ -1120,6 +1348,427 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 
 	return deko_app_handle_system_calls_post(
 		current->mm, syscall_body, syscall_nr, sys_retval, old_brk);
+}
+
+static void deko_syscall_ring_init(struct deko_syscall_ring *ring)
+{
+	BUILD_BUG_ON(sizeof(*ring) > DEKO_DEFAULT_SHARED_BUF_SIZE);
+
+	memset(ring, 0, sizeof(*ring));
+	if (!READ_ONCE(deko_syscall_ring_enabled)) {
+		pr_debug("Deko syscall ring disabled; using legacy syscall buffer\n");
+		return;
+	}
+
+	pr_info_once("Deko syscall ring enabled\n");
+	WRITE_ONCE(ring->magic, DEKO_SYSCALL_RING_MAGIC);
+	WRITE_ONCE(ring->version, DEKO_SYSCALL_RING_VERSION);
+	WRITE_ONCE(ring->capacity, DEKO_RING_CAPACITY);
+	WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
+	WRITE_ONCE(ring->poller_heartbeat, 0);
+}
+
+static bool deko_syscall_ring_available(const struct deko_syscall_ring *ring)
+{
+	return READ_ONCE(ring->magic) == DEKO_SYSCALL_RING_MAGIC &&
+	       READ_ONCE(ring->version) == DEKO_SYSCALL_RING_VERSION &&
+	       READ_ONCE(ring->capacity) == DEKO_RING_CAPACITY;
+}
+
+static inline u32 deko_syscall_ring_next(u32 index)
+{
+	index++;
+	if (index == DEKO_RING_CAPACITY)
+		index = 0;
+	return index;
+}
+
+static u32 deko_syscall_ring_advance_head(struct deko_syscall_ring *ring,
+					  u32 old_head)
+{
+	u32 next = deko_syscall_ring_next(old_head);
+	u32 observed = cmpxchg(&ring->head, old_head, next);
+
+	if (observed == old_head)
+		return next;
+
+	if (observed >= DEKO_RING_CAPACITY) {
+		pr_err("Deko syscall ring head became corrupt pid=%d observed=%u\n",
+		       current->pid, observed);
+		return observed;
+	}
+
+	return observed;
+}
+
+static void deko_syscall_ring_entry_to_body(
+	const struct deko_syscall_entry *entry,
+	struct deko_syscall_body *syscall_body)
+{
+	syscall_body->ax = READ_ONCE(entry->ax);
+	syscall_body->di = READ_ONCE(entry->di);
+	syscall_body->si = READ_ONCE(entry->si);
+	syscall_body->dx = READ_ONCE(entry->dx);
+	syscall_body->r10 = READ_ONCE(entry->r10);
+	syscall_body->r8 = READ_ONCE(entry->r8);
+	syscall_body->r9 = READ_ONCE(entry->r9);
+}
+
+static int deko_syscall_ring_complete_claimed(
+	struct deko_shared_buf *buf, struct deko_syscall_entry *entry, u32 index,
+	bool *normal_exit, bool from_poller)
+{
+	struct deko_syscall_body syscall_body = { 0 };
+	u64 syscall_nr;
+	int ret;
+
+	deko_syscall_ring_entry_to_body(entry, &syscall_body);
+	syscall_nr = syscall_body.ax;
+
+	if (from_poller && !deko_ring_poller_entry_eligible(entry) &&
+	    deko_ring_poller_syscall_dangerous(syscall_nr)) {
+		pr_warn_once("Deko syscall ring poller refused lifecycle syscall pid=%d index=%u syscall=%llu\n",
+			     current->pid, index, (unsigned long long)syscall_nr);
+		syscall_body.ax = (u64)-EAGAIN;
+		WRITE_ONCE(entry->ret, syscall_body.ax);
+		WRITE_ONCE(buf->syscall_body.ax, syscall_body.ax);
+		smp_store_release(&entry->state, DEKO_SYSCALL_RING_ENTRY_DONE);
+		return 0;
+	}
+
+	ret = deko_app_handle_system_calls(&syscall_body);
+	if (ret != 0) {
+		pr_err("Error handling syscall ring entry pid=%d index=%u syscall=%llu ret=%d\n",
+		       current->pid, index, (unsigned long long)syscall_nr, ret);
+		syscall_body.ax = (u64)ret;
+	}
+
+	WRITE_ONCE(entry->ret, syscall_body.ax);
+	WRITE_ONCE(buf->syscall_body.ax, syscall_body.ax);
+	smp_store_release(&entry->state, DEKO_SYSCALL_RING_ENTRY_DONE);
+
+	if (!from_poller && is_exit_syscall(syscall_nr))
+		*normal_exit = true;
+
+	return ret;
+}
+
+static int deko_syscall_ring_wait_done(struct deko_syscall_entry *entry,
+				       u32 index)
+{
+	unsigned int spins = 0;
+
+	for (;;) {
+		u32 state = smp_load_acquire(&entry->state);
+
+		if (state == DEKO_SYSCALL_RING_ENTRY_DONE)
+			return 0;
+
+		if (state != DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
+			pr_err("Deko syscall ring wait saw invalid state pid=%d index=%u state=%u\n",
+			       current->pid, index, state);
+			return -EIO;
+		}
+
+		cpu_relax();
+		spins++;
+		if ((spins & (DEKO_RING_WAIT_RESCHED_INTERVAL - 1)) == 0)
+			cond_resched();
+	}
+}
+
+static bool deko_syscall_ring_has_poller_ready(
+	const struct deko_syscall_ring *ring)
+{
+	u32 head = READ_ONCE(ring->head);
+	u32 tail = READ_ONCE(ring->tail);
+
+	if (head >= DEKO_RING_CAPACITY || tail >= DEKO_RING_CAPACITY)
+		return false;
+
+	while (head != tail) {
+		const struct deko_syscall_entry *entry = &ring->entries[head];
+		u32 state = smp_load_acquire(&entry->state);
+
+		if (state == DEKO_SYSCALL_RING_ENTRY_READY)
+			return deko_ring_poller_entry_eligible(entry);
+		if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED)
+			return false;
+
+		head = deko_syscall_ring_next(head);
+	}
+
+	return false;
+}
+
+static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
+					  bool *normal_exit, bool *handled,
+					  bool *ring_present,
+					  bool from_poller)
+{
+	struct deko_syscall_ring *ring;
+	u32 head, tail;
+	unsigned int drained = 0;
+
+	*handled = false;
+	*ring_present = false;
+	if (!buf || !buf->buf)
+		return 0;
+
+	ring = (struct deko_syscall_ring *)buf->buf;
+	if (!deko_syscall_ring_available(ring))
+		return 0;
+	*ring_present = true;
+
+	head = READ_ONCE(ring->head);
+	tail = READ_ONCE(ring->tail);
+	if (head >= DEKO_RING_CAPACITY || tail >= DEKO_RING_CAPACITY) {
+		pr_err("Deko syscall ring corrupt head/tail pid=%d head=%u tail=%u\n",
+		       current->pid, head, tail);
+		return -EINVAL;
+	}
+
+	while (head != tail) {
+		struct deko_syscall_entry *entry = &ring->entries[head];
+		u32 state;
+		int ret;
+
+		state = smp_load_acquire(&entry->state);
+		if (state == DEKO_SYSCALL_RING_ENTRY_READY) {
+			if (from_poller &&
+			    !deko_ring_poller_entry_eligible(entry))
+				break;
+			if (cmpxchg(&entry->state, DEKO_SYSCALL_RING_ENTRY_READY,
+				    DEKO_SYSCALL_RING_ENTRY_CLAIMED) !=
+			    DEKO_SYSCALL_RING_ENTRY_READY)
+				continue;
+
+			ret = deko_syscall_ring_complete_claimed(
+				buf, entry, head, normal_exit, from_poller);
+		} else if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
+			if (from_poller)
+				break;
+			ret = deko_syscall_ring_wait_done(entry, head);
+			if (ret != 0)
+				return ret;
+		} else if (state == DEKO_SYSCALL_RING_ENTRY_DONE) {
+			ret = 0;
+		} else if (state == DEKO_SYSCALL_RING_ENTRY_EMPTY) {
+			break;
+		} else {
+			pr_err("Deko syscall ring entry invalid pid=%d index=%u state=%u head=%u tail=%u\n",
+			       current->pid, head, state, READ_ONCE(ring->head),
+			       READ_ONCE(ring->tail));
+			return -EIO;
+		}
+
+		*handled = true;
+		drained++;
+		head = deko_syscall_ring_advance_head(ring, head);
+		if (head >= DEKO_RING_CAPACITY)
+			return -EINVAL;
+
+		if (ret != 0)
+			return ret;
+		if (*normal_exit)
+			return 0;
+	}
+
+	if (drained > 1)
+		pr_debug("Deko syscall ring drained %u entries pid=%d\n",
+			 drained, current->pid);
+
+	return 0;
+}
+
+static int deko_syscall_ring_drain(struct deko_shared_buf *buf,
+				   bool *normal_exit, bool *handled,
+				   bool *ring_present)
+{
+	return deko_syscall_ring_drain_common(buf, normal_exit, handled,
+					      ring_present, false);
+}
+
+static int deko_syscall_ring_poller_main(void *data)
+{
+	struct deko_ring_poller *poller = data;
+	struct deko_syscall_ring *ring = poller->ring;
+	u64 idle_since = rdtsc_ordered();
+	char comm[TASK_COMM_LEN] = {};
+
+	snprintf(comm, sizeof(comm), "deko-ring-%d", current->pid);
+	set_task_comm(current, comm);
+
+	for (;;) {
+		bool handled = false;
+		bool normal_exit = false;
+		bool ring_present = false;
+		u64 now;
+		int ret;
+
+		if (READ_ONCE(poller->stop) ||
+		    READ_ONCE(poller->owner->exit_state) ||
+		    (READ_ONCE(poller->owner->flags) & PF_EXITING))
+			break;
+
+		WRITE_ONCE(ring->poller_state, DEKO_POLLER_AWAKE);
+		WRITE_ONCE(ring->poller_heartbeat, rdtsc_ordered());
+
+		ret = deko_syscall_ring_drain_common(poller->buf, &normal_exit,
+						     &handled, &ring_present,
+						     true);
+		if (ret != 0)
+			pr_warn("Deko syscall ring poller drain failed pid=%d ret=%d\n",
+				current->pid, ret);
+
+		now = rdtsc_ordered();
+		WRITE_ONCE(ring->poller_heartbeat, now);
+
+		if (handled) {
+			idle_since = now;
+			cond_resched();
+			continue;
+		}
+
+		if (READ_ONCE(deko_ring_poller_idle_cycles) &&
+		    now >= idle_since &&
+		    now - idle_since > READ_ONCE(deko_ring_poller_idle_cycles)) {
+			unsigned int sleep_ms =
+				READ_ONCE(deko_ring_poller_sleep_ms);
+
+			if (!sleep_ms) {
+				cpu_relax();
+				cond_resched();
+				continue;
+			}
+
+			WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
+			smp_mb();
+			if (deko_syscall_ring_has_poller_ready(ring)) {
+				WRITE_ONCE(ring->poller_state, DEKO_POLLER_AWAKE);
+				idle_since = rdtsc_ordered();
+				continue;
+			}
+			schedule_timeout_interruptible(msecs_to_jiffies(sleep_ms));
+			idle_since = rdtsc_ordered();
+			continue;
+		}
+
+		cpu_relax();
+		cond_resched();
+	}
+
+	WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
+	WRITE_ONCE(ring->poller_heartbeat, 0);
+	complete(&poller->exited);
+	do_exit(0);
+	return 0;
+}
+
+static unsigned int deko_ring_poller_next_cpu(unsigned int owner_cpu)
+{
+	unsigned int cpu;
+
+	cpu = cpumask_next(owner_cpu, cpu_online_mask);
+	if (cpu >= nr_cpu_ids)
+		cpu = cpumask_first(cpu_online_mask);
+	if (cpu >= nr_cpu_ids)
+		return owner_cpu;
+
+	return cpu;
+}
+
+static void deko_ring_poller_configure_task(struct task_struct *task,
+					    unsigned int owner_cpu)
+{
+	unsigned int affinity = READ_ONCE(deko_ring_poller_affinity);
+	unsigned int target_cpu = owner_cpu;
+	int nice = READ_ONCE(deko_ring_poller_nice);
+	int ret;
+
+	if (nice)
+		set_user_nice(task, nice);
+
+	if (affinity == DEKO_RING_POLLER_AFFINITY_NONE)
+		return;
+	if (affinity == DEKO_RING_POLLER_AFFINITY_NEXT)
+		target_cpu = deko_ring_poller_next_cpu(owner_cpu);
+	else if (affinity != DEKO_RING_POLLER_AFFINITY_SAME)
+		return;
+
+	ret = set_cpus_allowed_ptr(task, cpumask_of(target_cpu));
+	if (ret)
+		pr_warn("failed to pin Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u ret=%d\n",
+			task->pid, owner_cpu, target_cpu, ret);
+	else
+		pr_info("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u\n",
+			task->pid, owner_cpu, target_cpu, nice,
+			(unsigned long long)READ_ONCE(deko_ring_poller_idle_cycles),
+			READ_ONCE(deko_ring_poller_sleep_ms), affinity);
+}
+
+static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
+					  struct deko_shared_buf *buf)
+{
+	struct deko_ring_poller *poller;
+	struct task_struct *task;
+	unsigned int owner_cpu;
+
+	if (!poller_out)
+		return -EINVAL;
+	*poller_out = NULL;
+
+	if (!READ_ONCE(deko_ring_poll))
+		return 0;
+	if (!READ_ONCE(deko_syscall_ring_enabled)) {
+		pr_warn_once("Deko ring poll requested without deko_syscall_ring=1\n");
+		return 0;
+	}
+	if (!buf || !buf->buf)
+		return -EINVAL;
+
+	poller = kzalloc(sizeof(*poller), GFP_KERNEL);
+	if (!poller)
+		return -ENOMEM;
+	init_completion(&poller->exited);
+
+	poller->buf = buf;
+	poller->ring = (struct deko_syscall_ring *)buf->buf;
+	poller->owner = get_task_struct(current);
+	owner_cpu = raw_smp_processor_id();
+	task = create_io_thread(deko_syscall_ring_poller_main, poller,
+				NUMA_NO_NODE);
+	if (IS_ERR(task)) {
+		put_task_struct(poller->owner);
+		kfree(poller);
+		return PTR_ERR(task);
+	}
+
+	poller->task = get_task_struct(task);
+	poller->started = true;
+	*poller_out = poller;
+	deko_ring_poller_configure_task(task, owner_cpu);
+	wake_up_new_task(task);
+	pr_info("Deko syscall ring poller started proxy_pid=%d poller_pid=%d\n",
+		current->pid, task->pid);
+
+	return 0;
+}
+
+static void deko_syscall_ring_poller_stop(struct deko_ring_poller *poller)
+{
+	if (!poller || !poller->started || !poller->task)
+		return;
+
+	WRITE_ONCE(poller->stop, true);
+	wake_up_process(poller->task);
+	wait_for_completion(&poller->exited);
+	put_task_struct(poller->task);
+	put_task_struct(poller->owner);
+	poller->task = NULL;
+	poller->owner = NULL;
+	poller->started = false;
+	kfree(poller);
 }
 
 static int __maybe_unused deko_pin_pages(struct mm_struct *mm,
@@ -1592,6 +2241,32 @@ deko_page_fault_flags_from_req(const struct deko_page_fault_req *req)
 	return flags;
 }
 
+static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
+				 unsigned int flags)
+{
+	bool unlocked = false;
+	int ret;
+
+	mmap_read_lock(mm);
+	ret = fixup_user_fault(mm, address, flags, &unlocked);
+	if (ret != -EFAULT) {
+		mmap_read_unlock(mm);
+		return ret;
+	}
+
+	/*
+	 * fixup_user_fault() uses the GUP VMA lookup path, which no longer
+	 * expands grow-down stacks. Mirror the regular user fault path enough
+	 * to grow a valid stack VMA, then fault the page in normally.
+	 */
+	if (!expand_stack(mm, address))
+		return -EFAULT;
+
+	ret = fixup_user_fault(mm, address, flags, &unlocked);
+	mmap_read_unlock(mm);
+	return ret;
+}
+
 static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 {
 	struct deko_page_fault_frame *frame;
@@ -1600,7 +2275,6 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	struct mm_struct *mm = current->mm;
 
 	unsigned int flags;
-	bool unlocked = false;
 	int ret;
 
 	if (unlikely(!buf || !mm))
@@ -1635,10 +2309,7 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 			(unsigned long long)req->fault_va);
 
 	flags = deko_page_fault_flags_from_req(req);
-
-	mmap_read_lock(mm);
-	ret = fixup_user_fault(mm, req->fault_va, flags, &unlocked);
-	mmap_read_unlock(mm);
+	ret = deko_fixup_user_fault(mm, req->fault_va, flags);
 
 	resp->status = ret;
 	resp->resolution = ret ? DEKO_PF_RESOLUTION_DENY :
@@ -1733,7 +2404,8 @@ static int deko_run_launch_iteration(struct svsm_call *call,
 
 static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					 struct deko_shared_buf *buf,
-					 bool *normal_exit)
+					 bool *normal_exit,
+					 struct deko_ring_poller *poller)
 {
 	u64 handled_syscall_nr;
 	unsigned long flags;
@@ -1743,14 +2415,35 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 
 	switch (call->rax_out) {
 	case DEKO_SERVICE_APP_ENTER_OK:
-		/* Handle system calls; if any. */
+		{
+			bool ring_handled = false;
+			bool ring_present = false;
+
+			ret = deko_syscall_ring_drain(buf, normal_exit,
+						      &ring_handled,
+						      &ring_present);
+			if (ret != 0)
+				return ret;
+			if (ring_present && poller && poller->task)
+				wake_up_process(poller->task);
+			if (ring_present) {
+				/*
+				 * A present syscall ring owns ENTER_OK delivery.
+				 * Falling through here can re-execute a stale
+				 * legacy syscall body after the poller already
+				 * completed the ring entry.
+				 */
+				break;
+			}
+		}
+
+		/* Handle one legacy shared-buffer syscall when no ring exists. */
 		handled_syscall_nr = buf->syscall_body.ax;
 		ret = deko_app_handle_system_calls(&buf->syscall_body);
 		if (ret != 0) {
 			pr_err("Error handling system calls: %d\n", ret);
 			return ret;
 		}
-
 		*normal_exit = is_exit_syscall(handled_syscall_nr);
 		break;
 
@@ -1823,14 +2516,10 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_migration_state migration = { 0 };
 	struct deko_handoff_checkpoint checkpoint = { 0 };
 	struct deko_page_fault_progress page_fault_progress = { 0 };
+	struct deko_ring_poller *poller = NULL;
 
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
-
-	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
-		current->pid, current->tgid, current->comm, current,
-		raw_smp_processor_id(), current->is_monitored,
-		dw->launch_type);
 
 	if (unlikely(!current->mm || fatal_signal_pending(current))) {
 		pr_info("Skipping Deko proxy loop for exiting task pid=%d tgid=%d comm=%s mm=%px fatal_signal=%d\n",
@@ -1846,7 +2535,16 @@ void deko_proxy_loop(struct callback_head *work)
 			current->is_monitored = false;
 			goto err_pin;
 		}
+		pr_info("Deko proxy loop registered missing clone context pid=%d tgid=%d kernel_vmpl1_rsp=0x%lx\n",
+			current->pid, current->tgid,
+			current->thread.kernel_vmpl1_rsp);
 	}
+
+	current->is_monitored = true;
+	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
+		current->pid, current->tgid, current->comm, current,
+		raw_smp_processor_id(), current->is_monitored,
+		dw->launch_type);
 
 	errno = deko_alloc_hidden_user_alias(current->mm, &alias_addr,
 					     DEKO_DEFAULT_SHARED_BUF_SIZE);
@@ -1855,6 +2553,9 @@ void deko_proxy_loop(struct callback_head *work)
 		       current->pid, errno);
 		goto err_pin;
 	}
+	pr_info("Deko proxy loop allocated hidden alias pid=%d tgid=%d alias=0x%lx len=0x%lx\n",
+		current->pid, current->tgid, alias_addr,
+		(unsigned long)DEKO_DEFAULT_SHARED_BUF_SIZE);
 
 	/*
 	 * Do not prefault or pin application memory here. VMPL1 page faults
@@ -1877,9 +2578,16 @@ void deko_proxy_loop(struct callback_head *work)
 		errno = -ENOMEM;
 		goto err_inner_buf;
 	}
+	deko_syscall_ring_init((struct deko_syscall_ring *)buf->buf);
 
 	buf->alias_buf = (void *)alias_addr;
 	buf->alias_len = DEKO_DEFAULT_SHARED_BUF_SIZE;
+	pr_info("Deko proxy loop shared buffer pid=%d tgid=%d buf=%px payload=%px alias=%px alias_len=0x%lx ring_enabled=%d ring_poll=%d launch_identity=0x%llx\n",
+		current->pid, current->tgid, buf, buf->buf, buf->alias_buf,
+		(unsigned long)buf->alias_len,
+		READ_ONCE(deko_syscall_ring_enabled) ? 1 : 0,
+		READ_ONCE(deko_ring_poll) ? 1 : 0,
+		(unsigned long long)launch_identity);
 
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	/* Shared buffer between VMPL1 and VMPL2. */
@@ -1887,7 +2595,16 @@ void deko_proxy_loop(struct callback_head *work)
 	call.rdx = launch_identity;
 	call.r8 = 0;
 
-	current->is_monitored = true;
+	errno = deko_pin_current_proxy_task();
+	if (unlikely(errno < 0))
+		goto err_loop;
+
+	errno = deko_syscall_ring_poller_start(&poller, buf);
+	if (unlikely(errno < 0)) {
+		pr_err("Failed to start Deko syscall ring poller pid=%d err=%d\n",
+		       current->pid, errno);
+		goto err_loop;
+	}
 
 	/* Application main loop. */
 	for (;;) {
@@ -1925,6 +2642,11 @@ void deko_proxy_loop(struct callback_head *work)
 		errno = deko_run_launch_iteration(
 			&call, regs, dw->launch_type, &migration, &adopting,
 			&launch_cpu);
+		if (iteration <= 3)
+			pr_info("Deko proxy launch iteration returned pid=%d tgid=%d iter=%llu err=%d rax_out=0x%llx rcx_out=0x%llx launch_cpu=%u adopting=%d\n",
+				current->pid, current->tgid, iteration,
+				errno, call.rax_out, call.rcx_out,
+				launch_cpu, adopting ? 1 : 0);
 		if (errno == -EAGAIN) {
 			migrate_enable();
 			iteration_cpu_pinned = false;
@@ -1950,7 +2672,8 @@ void deko_proxy_loop(struct callback_head *work)
 		if (unlikely(errno < 0))
 			goto err_loop;
 
-		errno = deko_handle_vmpl1_exit_reason(&call, buf, &normal_exit);
+		errno = deko_handle_vmpl1_exit_reason(
+			&call, buf, &normal_exit, poller);
 
 		if (unlikely(errno < 0) || normal_exit)
 			goto err_loop;
@@ -1967,6 +2690,18 @@ void deko_proxy_loop(struct callback_head *work)
 err_loop:
 	if (iteration_cpu_pinned)
 		migrate_enable();
+
+	if (normal_exit)
+		pr_info("Deko proxy loop normal exit pid=%d tgid=%d comm=%s iter=%llu rax_out=0x%llx errno=%d\n",
+			current->pid, current->tgid, current->comm, iteration,
+			call.rax_out, errno);
+	else
+		pr_err("Deko proxy loop abnormal exit pid=%d tgid=%d comm=%s iter=%llu rax_out=0x%llx errno=%d shared_buf=%px payload=%px alias=0x%lx\n",
+		       current->pid, current->tgid, current->comm, iteration,
+		       call.rax_out, errno, buf, buf ? buf->buf : NULL,
+		       alias_addr);
+
+	deko_syscall_ring_poller_stop(poller);
 
 	if (buf)
 		kfree(buf->buf);
