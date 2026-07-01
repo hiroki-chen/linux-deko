@@ -79,6 +79,17 @@ int svsm_process_result_codes(struct svsm_call *call)
 	case SVSM_ERR_INCOMPLETE:
 	case SVSM_ERR_BUSY:
 		return -EAGAIN;
+	case SVSM_ERR_UNSUPPORTED_PROTOCOL:
+	case SVSM_ERR_UNSUPPORTED_CALL:
+		return -ENOSYS;
+	case SVSM_ERR_INVALID_ADDRESS:
+		return -EFAULT;
+	case SVSM_ERR_INVALID_FORMAT:
+	case SVSM_ERR_INVALID_PARAMETER:
+	case SVSM_ERR_INVALID_REQUEST:
+		return -EINVAL;
+	case SVSM_ERR_PERMISSION_DENIED:
+		return -EPERM;
 	default:
 		return -EINVAL;
 	}
