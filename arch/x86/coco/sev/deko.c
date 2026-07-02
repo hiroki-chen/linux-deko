@@ -291,7 +291,7 @@ int deko_domain_bind(u64 mnt_ns_id, u32 domain_id)
 
 	mutex_unlock(&deko_domain_lock);
 
-	pr_info("bind mnt_ns_id=%llu domain_id=%u\n", mnt_ns_id, domain_id);
+	pr_debug("bind mnt_ns_id=%llu domain_id=%u\n", mnt_ns_id, domain_id);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(deko_domain_bind);
@@ -335,8 +335,8 @@ int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id)
 	}
 	hash_del(&entry->node);
 	mutex_unlock(&deko_domain_lock);
-	pr_info("unbind mnt_ns_id=%llu domain_id=%u\n", entry->mnt_ns_id,
-		entry->domain_id);
+	pr_debug("unbind mnt_ns_id=%llu domain_id=%u\n", entry->mnt_ns_id,
+		 entry->domain_id);
 	kfree(entry);
 	return 0;
 }
@@ -654,7 +654,7 @@ static void deko_clamp_file_tail_populate_range(struct mm_struct *mm,
 		file_backed_end = vma->vm_start + (unsigned long)backed_len;
 
 		if (file_backed_end < *end_addr) {
-			pr_info("Clamping populate range for %s: req=[0x%lx-0x%lx) prot=0x%lx file=%pD size=0x%llx pgoff=0x%lx clamped=[0x%lx-0x%lx)\n",
+			pr_debug("Clamping populate range for %s: req=[0x%lx-0x%lx) prot=0x%lx file=%pD size=0x%llx pgoff=0x%lx clamped=[0x%lx-0x%lx)\n",
 				reason, start_addr, orig_end, prot,
 				vma->vm_file, (unsigned long long)file_size,
 				vma->vm_pgoff, start_addr,
@@ -703,7 +703,7 @@ static int deko_pin_prefault_user_range(struct mm_struct *mm,
 			if (pinned != -EINTR && pinned != -EAGAIN)
 				break;
 			if (fatal_signal_pending(current)) {
-				pr_info("Interrupted pin-prefault range for %s at 0x%lx due to pending fatal signal\n",
+				pr_debug("Interrupted pin-prefault range for %s at 0x%lx due to pending fatal signal\n",
 					reason, cur);
 				return -EINTR;
 			}
@@ -1047,7 +1047,7 @@ static int deko_queue_proxy_loop_for_task(struct task_struct *task,
 		return ret;
 	}
 
-	pr_info("queued proxy loop for %s child pid=%d tgid=%d comm=%s task=%px current_cpu=%u kernel_vmpl1_rsp=0x%lx launch_type=%u\n",
+	pr_debug("queued proxy loop for %s child pid=%d tgid=%d comm=%s task=%px current_cpu=%u kernel_vmpl1_rsp=0x%lx launch_type=%u\n",
 		reason, task->pid, task->tgid, task->comm, task,
 		raw_smp_processor_id(), task->thread.kernel_vmpl1_rsp,
 		launch_type);
@@ -1071,7 +1071,7 @@ static int deko_pin_current_proxy_task(void)
 		return ret;
 	}
 
-	pr_info("pinned Deko proxy task pid=%d tgid=%d comm=%s to cpu=%u\n",
+	pr_debug("pinned Deko proxy task pid=%d tgid=%d comm=%s to cpu=%u\n",
 		current->pid, current->tgid, current->comm, cpu);
 	return 0;
 }
@@ -1086,7 +1086,7 @@ static int deko_register_current_clone_child(void)
 	if (current->nsproxy && current->nsproxy->mnt_ns)
 		mnt_ns_id = from_mnt_ns(current->nsproxy->mnt_ns)->inum;
 
-	pr_info("Deko registering current clone child pid=%d tgid=%d ppid=%d comm=%s mnt_ns_id=%llu mm=%px launch_type=%u\n",
+	pr_debug("Deko registering current clone child pid=%d tgid=%d ppid=%d comm=%s mnt_ns_id=%llu mm=%px launch_type=%u\n",
 		current->pid, current->tgid, current->real_parent->pid,
 		current->comm, (unsigned long long)mnt_ns_id, current->mm,
 		DEKO_LAUNCH_TYPE_PROCESS_FORK);
@@ -1107,7 +1107,7 @@ static int deko_register_current_clone_child(void)
 	this_cpu_write(deko_kernel_vmpl1_rsp,
 		       current->thread.kernel_vmpl1_rsp);
 
-	pr_info("Deko registered current clone child pid=%d tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx\n",
+	pr_debug("Deko registered current clone child pid=%d tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx\n",
 		current->pid, current->tgid, token_low, token_high,
 		current->thread.kernel_vmpl1_rsp);
 
@@ -1135,7 +1135,7 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 		return 0;
 	}
 
-	pr_info("Deko prepare clone child before wake parent_pid=%d parent_tgid=%d child_pid=%d child_tgid=%d parent_mm=%px child_mm=%px child_comm=%s\n",
+	pr_debug("Deko prepare clone child before wake parent_pid=%d parent_tgid=%d child_pid=%d child_tgid=%d parent_mm=%px child_mm=%px child_comm=%s\n",
 		current->pid, current->tgid, child->pid, child->tgid,
 		current->mm, child->mm, child->comm);
 
@@ -1154,7 +1154,7 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 		ret = deko_queue_proxy_loop_for_task(
 			child, "fork", DEKO_LAUNCH_TYPE_PROCESS_FORK);
-		pr_info("Deko queued process-fork proxy loop child_pid=%d child_tgid=%d parent_pid=%d ret=%d\n",
+		pr_debug("Deko queued process-fork proxy loop child_pid=%d child_tgid=%d parent_pid=%d ret=%d\n",
 			child->pid, child->tgid, current->pid, ret);
 		if (ret < 0)
 			child->is_monitored = false;
@@ -1164,7 +1164,7 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 	if (child->nsproxy && child->nsproxy->mnt_ns)
 		mnt_ns_id = from_mnt_ns(child->nsproxy->mnt_ns)->inum;
 
-	pr_info("Deko reporting same-mm clone child pid=%d tgid=%d parent_pid=%d parent_tgid=%d mnt_ns_id=%llu\n",
+	pr_debug("Deko reporting same-mm clone child pid=%d tgid=%d parent_pid=%d parent_tgid=%d mnt_ns_id=%llu\n",
 		child->pid, child->tgid, current->pid, current->tgid,
 		(unsigned long long)mnt_ns_id);
 
@@ -1185,7 +1185,7 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 
 	ret = deko_queue_proxy_loop_for_task(
 		child, "clone", DEKO_LAUNCH_TYPE_THREAD);
-	pr_info("Deko queued same-mm clone proxy loop child_pid=%d child_tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx ret=%d\n",
+	pr_debug("Deko queued same-mm clone proxy loop child_pid=%d child_tgid=%d token_low=0x%lx token_high=0x%lx kernel_vmpl1_rsp=0x%lx ret=%d\n",
 		child->pid, child->tgid, token_low, token_high,
 		child->thread.kernel_vmpl1_rsp, ret);
 	if (ret < 0)
@@ -1701,7 +1701,7 @@ static void deko_ring_poller_configure_task(struct task_struct *task,
 		pr_warn("failed to pin Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u ret=%d\n",
 			task->pid, owner_cpu, target_cpu, ret);
 	else
-		pr_info("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u\n",
+		pr_debug("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u\n",
 			task->pid, owner_cpu, target_cpu, nice,
 			(unsigned long long)READ_ONCE(deko_ring_poller_idle_cycles),
 			READ_ONCE(deko_ring_poller_sleep_ms), affinity);
@@ -1749,7 +1749,7 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	*poller_out = poller;
 	deko_ring_poller_configure_task(task, owner_cpu);
 	wake_up_new_task(task);
-	pr_info("Deko syscall ring poller started proxy_pid=%d poller_pid=%d\n",
+	pr_debug("Deko syscall ring poller started proxy_pid=%d poller_pid=%d\n",
 		current->pid, task->pid);
 
 	return 0;
@@ -1860,7 +1860,7 @@ retry:
 						    (*pages) + total_pinned,
 						    &locked);
 			if (!locked) {
-				pr_info("Restarting Deko VMA pin walk after GUP dropped mmap_lock at 0x%lx\n",
+				pr_debug("Restarting Deko VMA pin walk after GUP dropped mmap_lock at 0x%lx\n",
 					cur);
 				if (ret > 0)
 					unpin_user_pages((*pages) + total_pinned,
@@ -1887,14 +1887,14 @@ retry:
 			cond_resched();
 		}
 
-		pr_info("Pinned %lu pages for VMA [0x%lx-0x%lx]\n", nr_pages,
-			start, end);
+		pr_debug("Pinned %lu pages for VMA [0x%lx-0x%lx]\n", nr_pages,
+			 start, end);
 	}
 
 	mmap_read_unlock(mm);
 
-	pr_info("Successfully pinned %lu pages out of total_vm %lu\n",
-		total_pinned, expected_pages);
+	pr_debug("Successfully pinned %lu pages out of total_vm %lu\n",
+		 total_pinned, expected_pages);
 
 	return total_pinned;
 
@@ -2633,7 +2633,7 @@ void deko_proxy_loop(struct callback_head *work)
 		container_of(work, struct deko_task_work, work);
 
 	if (unlikely(!current->mm || fatal_signal_pending(current))) {
-		pr_info("Skipping Deko proxy loop for exiting task pid=%d tgid=%d comm=%s mm=%px fatal_signal=%d\n",
+		pr_debug("Skipping Deko proxy loop for exiting task pid=%d tgid=%d comm=%s mm=%px fatal_signal=%d\n",
 			current->pid, current->tgid, current->comm, current->mm,
 			fatal_signal_pending(current));
 		kfree(dw);
@@ -2646,13 +2646,13 @@ void deko_proxy_loop(struct callback_head *work)
 			current->is_monitored = false;
 			goto err_pin;
 		}
-		pr_info("Deko proxy loop registered missing clone context pid=%d tgid=%d kernel_vmpl1_rsp=0x%lx\n",
+		pr_debug("Deko proxy loop registered missing clone context pid=%d tgid=%d kernel_vmpl1_rsp=0x%lx\n",
 			current->pid, current->tgid,
 			current->thread.kernel_vmpl1_rsp);
 	}
 
 	current->is_monitored = true;
-	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
+	pr_debug("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
 		current->pid, current->tgid, current->comm, current,
 		raw_smp_processor_id(), current->is_monitored,
 		dw->launch_type);
@@ -2664,7 +2664,7 @@ void deko_proxy_loop(struct callback_head *work)
 		       current->pid, errno);
 		goto err_pin;
 	}
-	pr_info("Deko proxy loop allocated hidden alias pid=%d tgid=%d alias=0x%lx len=0x%lx\n",
+	pr_debug("Deko proxy loop allocated hidden alias pid=%d tgid=%d alias=0x%lx len=0x%lx\n",
 		current->pid, current->tgid, alias_addr,
 		(unsigned long)DEKO_DEFAULT_SHARED_BUF_SIZE);
 
@@ -2693,7 +2693,7 @@ void deko_proxy_loop(struct callback_head *work)
 
 	buf->alias_buf = (void *)alias_addr;
 	buf->alias_len = DEKO_DEFAULT_SHARED_BUF_SIZE;
-	pr_info("Deko proxy loop shared buffer pid=%d tgid=%d buf=%px payload=%px alias=%px alias_len=0x%lx ring_enabled=%d ring_poll=%d launch_identity=0x%llx\n",
+	pr_debug("Deko proxy loop shared buffer pid=%d tgid=%d buf=%px payload=%px alias=%px alias_len=0x%lx ring_enabled=%d ring_poll=%d launch_identity=0x%llx\n",
 		current->pid, current->tgid, buf, buf->buf, buf->alias_buf,
 		(unsigned long)buf->alias_len,
 		READ_ONCE(deko_syscall_ring_enabled) ? 1 : 0,
@@ -2722,7 +2722,7 @@ void deko_proxy_loop(struct callback_head *work)
 		iteration++;
 		if (fatal_signal_pending(current)) {
 			errno = -EINTR;
-			pr_info("Deko proxy loop exiting pid=%d tgid=%d comm=%s due to pending fatal signal\n",
+			pr_debug("Deko proxy loop exiting pid=%d tgid=%d comm=%s due to pending fatal signal\n",
 				current->pid, current->tgid, current->comm);
 			goto err_loop;
 		}
@@ -2754,7 +2754,7 @@ void deko_proxy_loop(struct callback_head *work)
 			&call, regs, dw->launch_type, &migration, &adopting,
 			&launch_cpu);
 		if (iteration <= 3)
-			pr_info("Deko proxy launch iteration returned pid=%d tgid=%d iter=%llu err=%d rax_out=0x%llx rcx_out=0x%llx launch_cpu=%u adopting=%d\n",
+			pr_debug("Deko proxy launch iteration returned pid=%d tgid=%d iter=%llu err=%d rax_out=0x%llx rcx_out=0x%llx launch_cpu=%u adopting=%d\n",
 				current->pid, current->tgid, iteration,
 				errno, call.rax_out, call.rcx_out,
 				launch_cpu, adopting ? 1 : 0);
@@ -2803,7 +2803,7 @@ err_loop:
 		migrate_enable();
 
 	if (normal_exit)
-		pr_info("Deko proxy loop normal exit pid=%d tgid=%d comm=%s iter=%llu rax_out=0x%llx errno=%d\n",
+		pr_debug("Deko proxy loop normal exit pid=%d tgid=%d comm=%s iter=%llu rax_out=0x%llx errno=%d\n",
 			current->pid, current->tgid, current->comm, iteration,
 			call.rax_out, errno);
 	else

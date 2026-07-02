@@ -94,7 +94,7 @@ static void log_report_app_cpu_tss_sp2(struct task_struct *task,
 	unsigned long gs_sp2_addr = req->kernel_gs_base + cpu_tss_rw_off + sp2_off;
 	u64 gs_sp2_direct = READ_ONCE(*(u64 *)gs_sp2_addr);
 
-	pr_info("report app cpu_tss_rw snapshot pid=%d comm=%s target_cpu=%d current_cpu=%u kernel_gs_base=0x%lx cpu_tss_rw=%px cpu_tss_rw_off=0x%lx sp2_addr=0x%lx sp2_percpu=0x%llx sp2_direct=0x%llx gs_sp2_addr=0x%lx gs_sp2_direct=0x%llx\n",
+	pr_debug("report app cpu_tss_rw snapshot pid=%d comm=%s target_cpu=%d current_cpu=%u kernel_gs_base=0x%lx cpu_tss_rw=%px cpu_tss_rw_off=0x%lx sp2_addr=0x%lx sp2_percpu=0x%llx sp2_direct=0x%llx gs_sp2_addr=0x%lx gs_sp2_direct=0x%llx\n",
 		task->pid, task->comm, cpu, smp_processor_id(), kernel_gs_base,
 		cpu_tss, cpu_tss_rw_off, sp2_addr,
 		(unsigned long long)sp2_percpu,
@@ -1515,7 +1515,7 @@ static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
 	if (!mm)
 		return;
 
-	pr_info("report_app vma dump begin: pid=%d comm=%s launch_identity=%s mnt_ns_id=%llu domain_id=%u region_count=%u start_code=0x%lx end_code=0x%lx start_data=0x%lx end_data=0x%lx start_brk=0x%lx brk=0x%lx start_stack=0x%lx total_vm=%lu\n",
+	pr_debug("report_app vma dump begin: pid=%d comm=%s launch_identity=%s mnt_ns_id=%llu domain_id=%u region_count=%u start_code=0x%lx end_code=0x%lx start_data=0x%lx end_data=0x%lx start_brk=0x%lx brk=0x%lx start_stack=0x%lx total_vm=%lu\n",
 		task->pid, task->comm, req->launch_identity,
 		(unsigned long long)req->mnt_ns_id, req->domain_id,
 		req->region_count, mm->start_code, mm->end_code,
@@ -1525,7 +1525,7 @@ static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
 	for (i = 0; i < req->region_count; i++) {
 		const struct deko_base_region_desc *r = &req->regions[i];
 
-		pr_info("report_app req_region[%d]: kind=%u perm=0x%x flags=0x%x mapped=[0x%llx-0x%llx) exact=[0x%llx-0x%llx)\n",
+		pr_debug("report_app req_region[%d]: kind=%u perm=0x%x flags=0x%x mapped=[0x%llx-0x%llx) exact=[0x%llx-0x%llx)\n",
 			i, r->kind, r->perm, r->flags,
 			(unsigned long long)r->mapped_start,
 			(unsigned long long)r->mapped_end,
@@ -1539,11 +1539,11 @@ static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
 		u16 perm = deko_region_perm_from_vma(vma);
 
 		if (vma->vm_file) {
-			pr_info("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=%pD\n",
+			pr_debug("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=%pD\n",
 				i, vma->vm_start, vma->vm_end, vma->vm_flags,
 				perm, vma->vm_pgoff, vma->vm_file);
 		} else {
-			pr_info("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=<anon>\n",
+			pr_debug("report_app vma[%d]: range=[0x%lx-0x%lx) flags=0x%lx perm=0x%x pgoff=0x%lx file=<anon>\n",
 				i, vma->vm_start, vma->vm_end, vma->vm_flags,
 				perm, vma->vm_pgoff);
 		}
@@ -1551,7 +1551,7 @@ static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
 		i++;
 	}
 
-	pr_info("report_app vma dump end: pid=%d comm=%s launch_identity=%s vma_count=%d\n",
+	pr_debug("report_app vma dump end: pid=%d comm=%s launch_identity=%s vma_count=%d\n",
 		task->pid, task->comm, req->launch_identity, i);
 }
 
@@ -1676,7 +1676,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 		mmap_read_unlock(task->mm);
 	}
 
-	pr_info("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",
+	pr_debug("report app live state pid=%d comm=%s hw_cr3_pa=0x%llx mm_pgd_pa=0x%llx mm_pgd=%px fs_base=0x%llx gs_base=0x%llx kernel_gs_base=0x%llx creation=%u\n",
 		task->pid, task->comm, (unsigned long long)read_cr3_pa(),
 		task->mm ? (unsigned long long)__sme_pa(task->mm->pgd) : 0ULL,
 		task->mm ? task->mm->pgd : NULL,
@@ -1693,7 +1693,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
 	memcpy(req, tmp, sizeof(*tmp));
 
-	pr_info("report_app submitting: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u req_pa=0x%llx mnt_ns_id=%llu domain_id=%u region_count=%u current_pid=%d current_tgid=%d\n",
+	pr_debug("report_app submitting: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u req_pa=0x%llx mnt_ns_id=%llu domain_id=%u region_count=%u current_pid=%d current_tgid=%d\n",
 		task->pid, task->tgid, tmp->ppid, task->comm,
 		tmp->launch_identity, (unsigned long long)report_kind,
 		tmp->app_type, (unsigned long long)req_pa,
@@ -1726,7 +1726,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 		       (unsigned long long)tmp->kernel_gs_base);
 		ret = ES_UNSUPPORTED;
 	} else {
-		pr_info("report_app accepted: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu region_count=%u kernel_vmpl1_rsp=0x%llx\n",
+		pr_debug("report_app accepted: pid=%d tgid=%d ppid=%d comm=%s launch_identity=%s report_kind=0x%llx app_type=%u rax_out=0x%llx rcx_out=0x%llx rdx_out=0x%llx r8_out=0x%llx r9_out=0x%llx domain_id=%u mnt_ns_id=%llu region_count=%u kernel_vmpl1_rsp=0x%llx\n",
 			task->pid, task->tgid, tmp->ppid, task->comm,
 			tmp->launch_identity, (unsigned long long)report_kind,
 			tmp->app_type, call.rax_out, call.rcx_out,
