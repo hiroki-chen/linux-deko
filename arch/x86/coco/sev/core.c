@@ -1588,6 +1588,9 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 		else if (kind == DEKO_BASE_REGION_DATA &&
 			 (perm & DEKO_REGION_W))
 			flags |= DEKO_REGION_F_TEMPLATE_RW;
+		if ((perm & DEKO_REGION_X) && is_cow_mapping(vma->vm_flags))
+			flags |= DEKO_REGION_F_COW_ELIGIBLE |
+				 DEKO_REGION_F_MEASURE_ON_FAULT;
 
 		if (!deko_append_region(req, kind, perm, flags, start, end,
 					start, end))

@@ -2241,6 +2241,91 @@ deko_page_fault_flags_from_req(const struct deko_page_fault_req *req)
 	return flags;
 }
 
+static bool deko_page_fault_exec_needs_unshare(struct mm_struct *mm,
+					       unsigned long address)
+{
+	struct vm_area_struct *vma;
+	bool needs_unshare = false;
+
+	if (!mm)
+		return false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, address);
+	if (vma && address >= vma->vm_start &&
+	    (vma->vm_flags & VM_EXEC) &&
+	    !(vma->vm_flags & (VM_IO | VM_PFNMAP)) &&
+	    is_cow_mapping(vma->vm_flags))
+		needs_unshare = true;
+	mmap_read_unlock(mm);
+
+	return needs_unshare;
+}
+
+static bool deko_lookup_user_page_state(struct mm_struct *mm,
+					unsigned long address,
+					u64 *page_gpa,
+					bool *anon_exclusive)
+{
+	struct vm_area_struct *vma;
+	spinlock_t *ptl;
+	struct page *page;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t pte;
+	bool ok = false;
+
+	*page_gpa = 0;
+	*anon_exclusive = false;
+
+	if (!mm)
+		return false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, address);
+	if (!vma || address < vma->vm_start)
+		goto out_unlock;
+
+	pgd = pgd_offset(mm, address);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto out_unlock;
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || p4d_bad(*p4d) || p4d_leaf(*p4d))
+		goto out_unlock;
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || pud_bad(*pud) || pud_leaf(*pud))
+		goto out_unlock;
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_leaf(*pmd))
+		goto out_unlock;
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep)
+		goto out_unlock;
+	pte = ptep_get(ptep);
+	if (!pte_present(pte))
+		goto out_pte;
+
+	page = vm_normal_page(vma, address, pte);
+	if (!page)
+		goto out_pte;
+
+	*page_gpa = ((u64)page_to_pfn(page) << PAGE_SHIFT) |
+		    (address & ~PAGE_MASK);
+	*page_gpa = __sme_clr(*page_gpa);
+	*anon_exclusive = PageAnon(page) && PageAnonExclusive(page);
+	ok = true;
+
+out_pte:
+	pte_unmap_unlock(ptep, ptl);
+out_unlock:
+	mmap_read_unlock(mm);
+	return ok;
+}
+
 static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 				 unsigned int flags)
 {
@@ -2250,6 +2335,10 @@ static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 	mmap_read_lock(mm);
 	ret = fixup_user_fault(mm, address, flags, &unlocked);
 	if (ret != -EFAULT) {
+		/*
+		 * fixup_user_fault() may drop and retake mmap_lock internally,
+		 * but it does not return with mmap_lock unlocked.
+		 */
 		mmap_read_unlock(mm);
 		return ret;
 	}
@@ -2262,6 +2351,7 @@ static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 	if (!expand_stack(mm, address))
 		return -EFAULT;
 
+	unlocked = false;
 	ret = fixup_user_fault(mm, address, flags, &unlocked);
 	mmap_read_unlock(mm);
 	return ret;
@@ -2275,6 +2365,10 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	struct mm_struct *mm = current->mm;
 
 	unsigned int flags;
+	unsigned int resolve_flags = 0;
+	u64 page_gpa = 0;
+	bool anon_exclusive = false;
+	bool unshare_exec = false;
 	int ret;
 
 	if (unlikely(!buf || !mm))
@@ -2309,14 +2403,31 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 			(unsigned long long)req->fault_va);
 
 	flags = deko_page_fault_flags_from_req(req);
+	if (req->access & DEKO_PF_ACCESS_INSTR) {
+		unshare_exec = deko_page_fault_exec_needs_unshare(mm,
+								  req->fault_va);
+	}
+
 	ret = deko_fixup_user_fault(mm, req->fault_va, flags);
+	if (!ret && unshare_exec) {
+		ret = deko_fixup_user_fault(mm, req->fault_va,
+					    (flags & ~FAULT_FLAG_WRITE) |
+						    FAULT_FLAG_UNSHARE);
+		if (!ret &&
+		    deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
+						&anon_exclusive) &&
+		    anon_exclusive)
+			resolve_flags |= DEKO_PF_RESOLVE_F_FRESH_PAGE |
+					 DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE;
+	}
 
 	resp->status = ret;
 	resp->resolution = ret ? DEKO_PF_RESOLUTION_DENY :
-		((req->reason == DEKO_PF_REASON_COW) ?
+		((resolve_flags & DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE) ?
 			 DEKO_PF_RESOLUTION_ANON_PRIVATE :
 			 DEKO_PF_RESOLUTION_NONE);
-	resp->page_flags = flags;
+	resp->page_flags = ret ? 0 : resolve_flags;
+	resp->page_gpa = ret ? 0 : page_gpa;
 	resp->page_len = ret ? 0 : PAGE_SIZE;
 
 	if (unlikely(ret))
