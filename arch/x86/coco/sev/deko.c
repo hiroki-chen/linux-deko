@@ -73,6 +73,8 @@ extern char __per_cpu_start[];
 #define DEKO_RING_WAIT_RESCHED_INTERVAL 1024
 #define DEKO_DOMAIN_BITS 8
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
+#define DEKO_EXEC_RANGE_MAX_PAGES 16384UL
+#define DEKO_EXEC_RANGE_MAX_BYTES (DEKO_EXEC_RANGE_MAX_PAGES << PAGE_SHIFT)
 
 struct deko_domain_entry {
 	u64 mnt_ns_id;
@@ -173,8 +175,42 @@ struct deko_migration_call_args {
 	const struct deko_handoff_checkpoint *checkpoint;
 };
 
+struct deko_exec_range_ready_call_args {
+	unsigned long start;
+	unsigned long end;
+};
+
+struct deko_exec_range_unlift_call_args {
+	unsigned long start;
+	unsigned long end;
+	unsigned int page_count;
+	u64 page_gpas[DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES];
+};
+
+struct deko_exec_pin_entry {
+	struct list_head node;
+	struct mm_struct *mm;
+	unsigned long addr;
+	struct page *page;
+};
+
+static LIST_HEAD(deko_exec_pin_list);
+static DEFINE_MUTEX(deko_exec_pin_lock);
+
 static int deko_prepare_monitor_migration_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
+static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
+					     struct svsm_ca *caa, void *arg);
+static int deko_prepare_exec_range_unlift_call(struct svsm_call *call,
+					       struct svsm_ca *caa, void *arg);
+static bool deko_lookup_user_page_state(struct mm_struct *mm,
+					unsigned long address,
+					u64 *page_gpa,
+					bool *anon_exclusive);
+static int deko_prefault_lift_exec_user_range(struct mm_struct *mm,
+					      unsigned long start_addr,
+					      unsigned long length,
+					      const char *reason);
 
 static int deko_refresh_launch_app_context(struct svsm_call *call,
 					   struct svsm_ca *caa)
@@ -227,6 +263,433 @@ out_migrate:
 
 	return ret;
 }
+
+static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
+					     struct svsm_ca *caa, void *arg)
+{
+	struct deko_exec_range_ready_call_args *range = arg;
+	struct deko_exec_range_ready_req *req;
+
+	req = (struct deko_exec_range_ready_req *)caa->svsm_buffer;
+	memset(req, 0, sizeof(*req));
+	req->version = DEKO_EXEC_RANGE_READY_REQ_VERSION_V1;
+	req->req_size = sizeof(*req);
+	req->flags = DEKO_EXEC_RANGE_F_PRIVATE_CANDIDATE;
+	req->pid = current->pid;
+	req->tgid = current->tgid;
+	req->start_va = range->start;
+	req->end_va = range->end;
+
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_EXEC_RANGE_READY);
+
+	return 0;
+}
+
+static int deko_prepare_exec_range_unlift_call(struct svsm_call *call,
+					       struct svsm_ca *caa, void *arg)
+{
+	struct deko_exec_range_unlift_call_args *range = arg;
+	struct deko_exec_range_unlift_req *req;
+
+	if (!range->page_count ||
+	    range->page_count > DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES)
+		return -EINVAL;
+
+	req = (struct deko_exec_range_unlift_req *)caa->svsm_buffer;
+	memset(req, 0, sizeof(*req));
+	req->version = DEKO_EXEC_RANGE_UNLIFT_REQ_VERSION_V1;
+	req->req_size = sizeof(*req);
+	req->pid = current->pid;
+	req->tgid = current->tgid;
+	req->start_va = range->start;
+	req->end_va = range->end;
+	req->page_count = range->page_count;
+	memcpy(req->page_gpas, range->page_gpas,
+	       range->page_count * sizeof(req->page_gpas[0]));
+
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_EXEC_RANGE_UNLIFT);
+
+	return 0;
+}
+
+static int deko_notify_monitor_exec_range_ready(unsigned long start,
+						unsigned long end,
+						const char *reason)
+{
+	struct deko_exec_range_ready_call_args args = {
+		.start = start,
+		.end = end,
+	};
+	struct svsm_call call = { 0 };
+	int ret;
+
+	if (!current->is_monitored)
+		return 0;
+	if (!start || start >= end)
+		return -EINVAL;
+
+	ret = deko_svsm_call_locked(&call, deko_prepare_exec_range_ready_call,
+				    &args);
+	if (ret < 0) {
+		pr_err("Deko %s exec range lift failed pid=%d tgid=%d range=[0x%lx-0x%lx) ret=%d\n",
+		       reason, current->pid, current->tgid, start, end, ret);
+		return ret;
+	}
+
+	pr_debug("Deko %s exec range lifted pid=%d tgid=%d range=[0x%lx-0x%lx)\n",
+		 reason, current->pid, current->tgid, start, end);
+	return 0;
+}
+
+static int deko_notify_monitor_exec_range_unlift(unsigned long start,
+						 unsigned long end,
+						 const u64 *page_gpas,
+						 unsigned int page_count,
+						 const char *reason)
+{
+	struct deko_exec_range_unlift_call_args args = {
+		.start = start,
+		.end = end,
+		.page_count = page_count,
+	};
+	struct svsm_call call = { 0 };
+	int ret;
+
+	if (!current->is_monitored)
+		return 0;
+	if (!start || start >= end || !page_count ||
+	    page_count > DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES)
+		return -EINVAL;
+	memcpy(args.page_gpas, page_gpas, page_count * sizeof(args.page_gpas[0]));
+
+	ret = deko_svsm_call_locked(&call, deko_prepare_exec_range_unlift_call,
+				    &args);
+	if (ret < 0) {
+		pr_err("Deko %s exec range unlift failed pid=%d tgid=%d range=[0x%lx-0x%lx) ret=%d\n",
+		       reason, current->pid, current->tgid, start, end, ret);
+		return ret;
+	}
+
+	pr_debug("Deko %s exec range unlifted pid=%d tgid=%d range=[0x%lx-0x%lx)\n",
+		 reason, current->pid, current->tgid, start, end);
+	return 0;
+}
+
+static struct deko_exec_pin_entry *
+deko_exec_pin_find_locked(struct mm_struct *mm, unsigned long addr)
+{
+	struct deko_exec_pin_entry *entry;
+
+	list_for_each_entry(entry, &deko_exec_pin_list, node) {
+		if (entry->mm == mm && entry->addr == (addr & PAGE_MASK))
+			return entry;
+	}
+
+	return NULL;
+}
+
+static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
+				      const char *reason)
+{
+	struct deko_exec_pin_entry *entry;
+	struct deko_exec_pin_entry *existing;
+	struct page *page = NULL;
+	unsigned long page_addr = addr & PAGE_MASK;
+	u64 page_gpa = 0;
+	bool anon_exclusive = false;
+	long pinned;
+	int locked = 1;
+	int ret = 0;
+
+	if (!mm)
+		return -EINVAL;
+
+	mmap_read_lock(mm);
+	pinned = pin_user_pages_remote(mm, page_addr, 1, FOLL_FORCE, &page,
+				       &locked);
+	if (locked)
+		mmap_read_unlock(mm);
+	if (pinned != 1) {
+		pr_err("Deko %s exec pin failed pid=%d addr=0x%lx pinned=%ld\n",
+		       reason, current->pid, page_addr, pinned);
+		return pinned < 0 ? (int)pinned : -EFAULT;
+	}
+
+	if (!PageAnon(page) || !PageAnonExclusive(page)) {
+		pr_err("Deko %s exec pin rejected non-private page pid=%d addr=0x%lx anon=%d anon_exclusive=%d\n",
+		       reason, current->pid, page_addr, PageAnon(page) ? 1 : 0,
+		       PageAnonExclusive(page) ? 1 : 0);
+		ret = -EFAULT;
+		goto out_unpin;
+	}
+
+	if (!deko_lookup_user_page_state(mm, page_addr, &page_gpa,
+					 &anon_exclusive) ||
+	    !anon_exclusive ||
+	    (page_gpa & PAGE_MASK) != ((u64)page_to_pfn(page) << PAGE_SHIFT)) {
+		pr_err("Deko %s exec pin/PTE mismatch pid=%d addr=0x%lx gpa=0x%llx page_pfn=0x%lx anon_exclusive=%d\n",
+		       reason, current->pid, page_addr,
+		       (unsigned long long)page_gpa, page_to_pfn(page),
+		       anon_exclusive ? 1 : 0);
+		ret = -EFAULT;
+		goto out_unpin;
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		ret = -ENOMEM;
+		goto out_unpin;
+	}
+
+	mutex_lock(&deko_exec_pin_lock);
+	existing = deko_exec_pin_find_locked(mm, page_addr);
+	if (existing) {
+		ret = existing->page == page ? 0 : -EEXIST;
+		mutex_unlock(&deko_exec_pin_lock);
+		kfree(entry);
+		goto out_unpin;
+	}
+
+	entry->mm = mm;
+	entry->addr = page_addr;
+	entry->page = page;
+	list_add(&entry->node, &deko_exec_pin_list);
+	mutex_unlock(&deko_exec_pin_lock);
+
+	return 0;
+
+out_unpin:
+	unpin_user_page(page);
+	return ret;
+}
+
+static unsigned long deko_unpin_exec_user_range_locked(struct mm_struct *mm,
+						       unsigned long start,
+						       unsigned long end)
+{
+	struct deko_exec_pin_entry *entry;
+	struct deko_exec_pin_entry *tmp;
+	unsigned long restored = 0;
+
+	list_for_each_entry_safe(entry, tmp, &deko_exec_pin_list, node) {
+		if (entry->mm != mm)
+			continue;
+		if (entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->node);
+		unpin_user_page(entry->page);
+		kfree(entry);
+		restored++;
+	}
+
+	return restored;
+}
+
+static unsigned long deko_unpin_all_exec_user_ranges_locked(struct mm_struct *mm)
+{
+	struct deko_exec_pin_entry *entry;
+	struct deko_exec_pin_entry *tmp;
+	unsigned long restored = 0;
+
+	list_for_each_entry_safe(entry, tmp, &deko_exec_pin_list, node) {
+		if (entry->mm != mm)
+			continue;
+		list_del(&entry->node);
+		unpin_user_page(entry->page);
+		kfree(entry);
+		restored++;
+	}
+
+	return restored;
+}
+
+static bool deko_exec_pin_next_range_locked(struct mm_struct *mm,
+					    unsigned long start,
+					    unsigned long end,
+					    unsigned long *range_start,
+					    unsigned long *range_end)
+{
+	struct deko_exec_pin_entry *entry;
+	unsigned long first = ULONG_MAX;
+	bool extended;
+
+	list_for_each_entry(entry, &deko_exec_pin_list, node) {
+		if (entry->mm != mm)
+			continue;
+		if (entry->addr < start || entry->addr >= end)
+			continue;
+		if (entry->addr < first)
+			first = entry->addr;
+	}
+
+	if (first == ULONG_MAX)
+		return false;
+
+	*range_start = first;
+	*range_end = first + PAGE_SIZE;
+
+	do {
+		extended = false;
+		list_for_each_entry(entry, &deko_exec_pin_list, node) {
+			if (entry->mm != mm)
+				continue;
+			if (entry->addr == *range_end && *range_end < end) {
+				*range_end += PAGE_SIZE;
+				extended = true;
+				break;
+			}
+		}
+	} while (extended);
+
+	return true;
+}
+
+static unsigned int deko_exec_pin_collect_gpas_locked(struct mm_struct *mm,
+						      unsigned long start,
+						      unsigned long end,
+						      u64 *page_gpas,
+						      unsigned int max_pages)
+{
+	unsigned long addr = start;
+	unsigned int count = 0;
+
+	while (addr < end && count < max_pages) {
+		struct deko_exec_pin_entry *entry;
+
+		entry = deko_exec_pin_find_locked(mm, addr);
+		if (!entry)
+			break;
+
+		page_gpas[count++] = (u64)page_to_pfn(entry->page) << PAGE_SHIFT;
+		addr += PAGE_SIZE;
+	}
+
+	return count;
+}
+
+int deko_unlift_exec_user_range(struct mm_struct *mm, unsigned long start_addr,
+				unsigned long length, const char *reason)
+{
+	unsigned long end_addr;
+	unsigned long cur;
+	unsigned long unpinned;
+	int ret;
+
+	if (!mm || !length)
+		return 0;
+	if (check_add_overflow(start_addr, length, &end_addr))
+		return -EINVAL;
+
+	start_addr = PAGE_ALIGN_DOWN(start_addr);
+	end_addr = PAGE_ALIGN(end_addr);
+	if (start_addr >= end_addr)
+		return 0;
+
+	if (!current->is_monitored) {
+		mutex_lock(&deko_exec_pin_lock);
+		deko_unpin_exec_user_range_locked(mm, start_addr, end_addr);
+		mutex_unlock(&deko_exec_pin_lock);
+		return 0;
+	}
+
+	cur = start_addr;
+	for (;;) {
+		unsigned long sub_start;
+		unsigned long sub_end;
+		unsigned long notify_start;
+		bool found;
+
+		mutex_lock(&deko_exec_pin_lock);
+		found = deko_exec_pin_next_range_locked(mm, cur, end_addr,
+							&sub_start, &sub_end);
+		mutex_unlock(&deko_exec_pin_lock);
+		if (!found)
+			break;
+
+		notify_start = sub_start;
+		while (notify_start < sub_end) {
+			u64 page_gpas[DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES];
+			unsigned int page_count;
+			unsigned long notify_end;
+
+			mutex_lock(&deko_exec_pin_lock);
+			page_count = deko_exec_pin_collect_gpas_locked(
+				mm, notify_start, sub_end, page_gpas,
+				DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES);
+			mutex_unlock(&deko_exec_pin_lock);
+			if (!page_count)
+				return -EFAULT;
+			notify_end = notify_start + page_count * PAGE_SIZE;
+			ret = deko_notify_monitor_exec_range_unlift(notify_start,
+								   notify_end,
+								   page_gpas,
+								   page_count,
+								   reason);
+			if (ret < 0)
+				return ret;
+			notify_start = notify_end;
+		}
+
+		if (sub_end <= cur)
+			return -EFAULT;
+		cur = sub_end;
+	}
+
+	mutex_lock(&deko_exec_pin_lock);
+	unpinned = deko_unpin_exec_user_range_locked(mm, start_addr, end_addr);
+	mutex_unlock(&deko_exec_pin_lock);
+
+	if (unpinned)
+		pr_debug("Deko %s exec range unpinned pid=%d range=[0x%lx-0x%lx) pages=%lu\n",
+			 reason, current->pid, start_addr, end_addr, unpinned);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(deko_unlift_exec_user_range);
+
+int deko_unlift_all_exec_user_ranges(struct mm_struct *mm, const char *reason)
+{
+	unsigned long start = 0;
+	int ret;
+
+	if (!mm)
+		return 0;
+	if (!current->is_monitored) {
+		mutex_lock(&deko_exec_pin_lock);
+		deko_unpin_all_exec_user_ranges_locked(mm);
+		mutex_unlock(&deko_exec_pin_lock);
+		return 0;
+	}
+
+	for (;;) {
+		unsigned long sub_start;
+		unsigned long sub_end;
+		bool found;
+
+		mutex_lock(&deko_exec_pin_lock);
+		found = deko_exec_pin_next_range_locked(mm, start, TASK_SIZE_MAX,
+							&sub_start, &sub_end);
+		mutex_unlock(&deko_exec_pin_lock);
+		if (!found)
+			break;
+
+		ret = deko_unlift_exec_user_range(mm, sub_start,
+						  sub_end - sub_start, reason);
+		if (ret < 0)
+			return ret;
+
+		if (sub_end <= start)
+			return -EFAULT;
+		start = sub_end;
+	}
+
+	mutex_lock(&deko_exec_pin_lock);
+	deko_unpin_all_exec_user_ranges_locked(mm);
+	mutex_unlock(&deko_exec_pin_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(deko_unlift_all_exec_user_ranges);
 
 static int deko_prepare_exit_call(struct svsm_call *call, struct svsm_ca *caa,
 				  void *arg)
@@ -799,6 +1262,10 @@ static inline int mmap_post_handler(struct mm_struct *mm,
 	if (IS_ERR_VALUE(ax))
 		return 0;
 
+	if (prot & PROT_EXEC)
+		return deko_prefault_lift_exec_user_range(mm, start_addr, length,
+							  "mmap");
+
 	return eager_fault_user_range(mm, start_addr, length, prot, "mmap");
 }
 
@@ -837,7 +1304,22 @@ static inline int mprotect_post_handler(struct mm_struct *mm,
 	if (IS_ERR_VALUE(ax))
 		return 0;
 
-	if (!mm || !length || !(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
+	if (!mm || !length)
+		return 0;
+
+	if (prot & PROT_EXEC)
+		return deko_prefault_lift_exec_user_range(mm, start_addr, length,
+							  "mprotect");
+
+	if (current->is_monitored) {
+		int ret = deko_unlift_exec_user_range(mm, start_addr, length,
+						      "mprotect");
+
+		if (ret < 0)
+			return ret;
+	}
+
+	if (!(prot & (PROT_READ | PROT_WRITE)))
 		return 0;
 
 	return eager_fault_user_range(mm, start_addr, length, prot, "mprotect");
@@ -1199,8 +1681,13 @@ static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 	struct svsm_call call = { 0 };
 	int ret;
 
-	(void)mm;
 	(void)ax;
+
+	if (mm && current->is_monitored) {
+		ret = deko_unlift_all_exec_user_ranges(mm, "exit");
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = deko_svsm_call_locked(&call, deko_prepare_exit_call, NULL);
 	if (ret < 0) {
@@ -2348,13 +2835,209 @@ static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 	 * expands grow-down stacks. Mirror the regular user fault path enough
 	 * to grow a valid stack VMA, then fault the page in normally.
 	 */
-	if (!expand_stack(mm, address))
+	if (!expand_stack(mm, address)) {
+		mmap_read_unlock(mm);
 		return -EFAULT;
+	}
 
 	unlocked = false;
 	ret = fixup_user_fault(mm, address, flags, &unlocked);
 	mmap_read_unlock(mm);
 	return ret;
+}
+
+static int deko_prefault_private_exec_range(struct mm_struct *mm,
+					    unsigned long start,
+					    unsigned long end,
+					    const char *reason)
+{
+	unsigned long cur;
+	unsigned int flags = FAULT_FLAG_USER | FAULT_FLAG_INSTRUCTION;
+	int ret;
+
+	for (cur = start; cur < end; cur += PAGE_SIZE) {
+		u64 page_gpa = 0;
+		bool anon_exclusive = false;
+
+		ret = deko_fixup_user_fault(mm, cur, flags);
+		if (ret < 0) {
+			pr_err("Deko %s exec prefault failed pid=%d addr=0x%lx ret=%d\n",
+			       reason, current->pid, cur, ret);
+			return ret;
+		}
+
+		ret = deko_fixup_user_fault(mm, cur,
+					    flags | FAULT_FLAG_UNSHARE);
+		if (ret < 0) {
+			pr_err("Deko %s exec unshare failed pid=%d addr=0x%lx ret=%d\n",
+			       reason, current->pid, cur, ret);
+			return ret;
+		}
+
+			if (!deko_lookup_user_page_state(mm, cur, &page_gpa,
+							 &anon_exclusive) ||
+			    !anon_exclusive) {
+				pr_err("Deko %s exec prefault did not produce private page pid=%d addr=0x%lx gpa=0x%llx anon_exclusive=%d\n",
+				       reason, current->pid, cur,
+				       (unsigned long long)page_gpa,
+				       anon_exclusive ? 1 : 0);
+				return -EFAULT;
+			}
+
+			ret = deko_pin_private_exec_page(mm, cur, reason);
+			if (ret < 0)
+				return ret;
+		}
+
+		return 0;
+	}
+
+int deko_prefault_private_exec_vmas(struct mm_struct *mm, const char *reason)
+{
+	unsigned long cur = 0;
+
+	if (!mm)
+		return 0;
+
+	for (;;) {
+		struct vm_area_struct *vma;
+		unsigned long start;
+		unsigned long end;
+		vm_flags_t vm_flags;
+		int ret;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, cur);
+		if (!vma) {
+			mmap_read_unlock(mm);
+			return 0;
+		}
+
+		if (cur < vma->vm_start)
+			cur = vma->vm_start;
+		start = cur;
+		end = vma->vm_end;
+		vm_flags = vma->vm_flags;
+		mmap_read_unlock(mm);
+
+		if ((vm_flags & VM_EXEC) && !(vm_flags & (VM_IO | VM_PFNMAP))) {
+			if (!is_cow_mapping(vm_flags)) {
+				pr_err("Deko %s exec VMA is not private-COW eligible pid=%d range=[0x%lx-0x%lx) flags=0x%lx\n",
+				       reason, current->pid, start, end,
+				       vm_flags);
+				return -EACCES;
+			}
+
+			ret = deko_prefault_private_exec_range(mm, start, end,
+							      reason);
+			if (ret < 0)
+				return ret;
+		}
+
+		if (end <= cur)
+			return -EFAULT;
+		cur = end;
+	}
+}
+
+static int deko_prefault_lift_exec_user_range(struct mm_struct *mm,
+					      unsigned long start_addr,
+					      unsigned long length,
+					      const char *reason)
+{
+	unsigned long end_addr;
+	unsigned long cur;
+
+	if (!mm || !length)
+		return 0;
+	if (check_add_overflow(start_addr, length, &end_addr))
+		return -EINVAL;
+
+	start_addr = PAGE_ALIGN_DOWN(start_addr);
+	end_addr = PAGE_ALIGN(end_addr);
+	if (!start_addr || start_addr >= end_addr)
+		return 0;
+
+	cur = start_addr;
+	while (cur < end_addr) {
+		struct vm_area_struct *vma;
+		unsigned long sub_start;
+		unsigned long sub_end;
+		unsigned long next;
+		vm_flags_t vm_flags;
+		int ret;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, cur);
+		if (!vma) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		if (cur < vma->vm_start)
+			cur = vma->vm_start;
+		if (cur >= end_addr) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		sub_start = max(cur, vma->vm_start);
+		sub_end = min(end_addr, vma->vm_end);
+		next = sub_end;
+		vm_flags = vma->vm_flags;
+		if (!(vm_flags & VM_EXEC) || (vm_flags & (VM_IO | VM_PFNMAP))) {
+			mmap_read_unlock(mm);
+			cur = next;
+			continue;
+		}
+		if (!is_cow_mapping(vm_flags)) {
+			pr_err("Deko %s exec range VMA is not private-COW eligible pid=%d range=[0x%lx-0x%lx) vma=[0x%lx-0x%lx) flags=0x%lx\n",
+			       reason, current->pid, sub_start, sub_end,
+			       vma->vm_start, vma->vm_end, vm_flags);
+			mmap_read_unlock(mm);
+			return -EACCES;
+		}
+		mmap_read_unlock(mm);
+
+		deko_clamp_file_tail_populate_range(mm, sub_start, &sub_end,
+						    PROT_READ | PROT_EXEC,
+						    reason);
+			if (sub_start < sub_end) {
+				ret = deko_prefault_private_exec_range(mm, sub_start,
+								      sub_end, reason);
+				if (ret < 0) {
+					mutex_lock(&deko_exec_pin_lock);
+					deko_unpin_exec_user_range_locked(mm,
+									  sub_start,
+									  sub_end);
+					mutex_unlock(&deko_exec_pin_lock);
+					return ret;
+				}
+
+				ret = deko_notify_monitor_exec_range_ready(sub_start,
+									  sub_end,
+									  reason);
+				if (ret < 0) {
+					int cleanup_ret;
+
+					cleanup_ret = deko_unlift_exec_user_range(
+						mm, sub_start, sub_end - sub_start,
+						"lift-fail");
+					if (cleanup_ret < 0)
+						pr_err("Deko %s exec lift cleanup failed pid=%d range=[0x%lx-0x%lx) ret=%d\n",
+						       reason, current->pid,
+						       sub_start, sub_end,
+						       cleanup_ret);
+					return ret;
+				}
+			}
+
+		if (next <= cur)
+			return -EFAULT;
+		cur = next;
+	}
+
+	return 0;
 }
 
 static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
@@ -2407,18 +3090,32 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 		unshare_exec = deko_page_fault_exec_needs_unshare(mm,
 								  req->fault_va);
 	}
+	pr_info("Deko page fault service begin pid=%d seq=%llu fault=0x%llx rip=0x%llx access=0x%x reason=%u flags=0x%x unshare_exec=%d\n",
+		current->pid, (unsigned long long)req->seq,
+		(unsigned long long)req->fault_va,
+		(unsigned long long)req->rip, req->access, req->reason,
+		flags, unshare_exec ? 1 : 0);
 
 	ret = deko_fixup_user_fault(mm, req->fault_va, flags);
+	pr_info("Deko page fault service after fixup pid=%d seq=%llu ret=%d unshare_exec=%d\n",
+		current->pid, (unsigned long long)req->seq, ret,
+		unshare_exec ? 1 : 0);
 	if (!ret && unshare_exec) {
 		ret = deko_fixup_user_fault(mm, req->fault_va,
 					    (flags & ~FAULT_FLAG_WRITE) |
 						    FAULT_FLAG_UNSHARE);
+		pr_info("Deko page fault service after unshare pid=%d seq=%llu ret=%d\n",
+			current->pid, (unsigned long long)req->seq, ret);
 		if (!ret &&
 		    deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
 						&anon_exclusive) &&
-		    anon_exclusive)
+		    anon_exclusive) {
+			pr_info("Deko page fault service private page pid=%d seq=%llu gpa=0x%llx\n",
+				current->pid, (unsigned long long)req->seq,
+				(unsigned long long)page_gpa);
 			resolve_flags |= DEKO_PF_RESOLVE_F_FRESH_PAGE |
 					 DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE;
+		}
 	}
 
 	resp->status = ret;

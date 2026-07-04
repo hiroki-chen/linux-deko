@@ -47,6 +47,8 @@ enum deko_new_app_type {
 #define DEKO_PAGE_FAULT_REQ_VERSION_V1 1
 #define DEKO_PAGE_FAULT_RESP_VERSION_V1 1
 #define DEKO_ASPACE_OP_REQ_VERSION_V1 1
+#define DEKO_EXEC_RANGE_READY_REQ_VERSION_V1 1
+#define DEKO_EXEC_RANGE_UNLIFT_REQ_VERSION_V1 1
 #define DEKO_MAX_BASE_REGIONS 96
 #define DEKO_REPORT_APP_LIFECYCLE 0
 #define DEKO_REPORT_APP_EXEC_CREATE 1
@@ -92,6 +94,12 @@ enum deko_feature_flags {
 	DEKO_FEATURE_FAST_ROLLBACK = 1ULL << 5,
 	DEKO_FEATURE_REWIND = 1ULL << 6,
 };
+
+enum deko_exec_range_flags {
+	DEKO_EXEC_RANGE_F_PRIVATE_CANDIDATE = 1u << 0,
+};
+
+#define DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES	32
 
 enum deko_page_fault_access {
 	DEKO_PF_ACCESS_PRESENT = 1u << 0,
@@ -243,6 +251,30 @@ struct deko_address_space_op_req {
 	u64 vmsa_gpa;
 } __attribute__((aligned(8)));
 
+struct deko_exec_range_ready_req {
+	u16 version;
+	u16 flags;
+	u32 req_size;
+	u32 pid;
+	u32 tgid;
+	u64 start_va;
+	u64 end_va;
+	u64 lifted_pages;
+} __attribute__((aligned(8)));
+
+struct deko_exec_range_unlift_req {
+	u16 version;
+	u16 flags;
+	u32 req_size;
+	u32 pid;
+	u32 tgid;
+	u64 start_va;
+	u64 end_va;
+	u64 page_count;
+	u64 restored_pages;
+	u64 page_gpas[DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES];
+} __attribute__((aligned(8)));
+
 struct deko_load_policy_req {
 	u32 domain_id;
 	u32 reserved;
@@ -301,6 +333,14 @@ extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    unsigned long *token_low,
 					    unsigned long *token_high,
 					    enum deko_new_app_type ty);
+extern int deko_prefault_private_exec_vmas(struct mm_struct *mm,
+					   const char *reason);
+extern int deko_unlift_exec_user_range(struct mm_struct *mm,
+				       unsigned long start_addr,
+				       unsigned long length,
+				       const char *reason);
+extern int deko_unlift_all_exec_user_ranges(struct mm_struct *mm,
+					    const char *reason);
 extern int deko_prepare_clone_child_before_wake(struct task_struct *child);
 extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
@@ -698,6 +738,8 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_EXTEND_NEGOTIATE_PROTOCOL 10
 #define SVSM_EXTEND_PAGE_FAULT 11
 #define SVSM_EXTEND_ASPACE_OP 12
+#define SVSM_EXTEND_EXEC_RANGE_READY 13
+#define SVSM_EXTEND_EXEC_RANGE_UNLIFT 14
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 
