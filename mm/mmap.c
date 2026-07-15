@@ -53,6 +53,7 @@
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
 #include <asm/mmu_context.h>
+#include <asm/sev.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmap.h>
@@ -1258,6 +1259,14 @@ void exit_mmap(struct mm_struct *mm)
 
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
+
+	if (current->is_monitored) {
+		int deko_ret = deko_unlift_all_exec_user_ranges(mm, "exit_mmap");
+
+		if (deko_ret < 0)
+			pr_err("Deko: failed to unlift exec ranges during %s pid=%d ret=%d\n",
+			       __func__, current->pid, deko_ret);
+	}
 
 	mmap_read_lock(mm);
 	arch_exit_mmap(mm);

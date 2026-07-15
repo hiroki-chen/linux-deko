@@ -5731,6 +5731,9 @@ static inline bool should_fault_around(struct vm_fault *vmf)
 	if (uffd_disable_fault_around(vmf->vma))
 		return false;
 
+	if (current->is_monitored && (vmf->vma->vm_flags & VM_EXEC))
+		return false;
+
 	/* A single page implies no faulting 'around' at all. */
 	return fault_around_pages > 1;
 }

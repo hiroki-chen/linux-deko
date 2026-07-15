@@ -6,6 +6,7 @@
 
 #include "vma_internal.h"
 #include "vma.h"
+#include <asm/sev.h>
 
 struct mmap_state {
 	struct mm_struct *mm;
@@ -3243,6 +3244,14 @@ int __vm_munmap(unsigned long start, size_t len, bool unlock)
 
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
+
+	if (current->is_monitored) {
+		ret = deko_unlift_exec_user_range(mm, start, len, "munmap");
+		if (ret < 0) {
+			mmap_write_unlock(mm);
+			return ret;
+		}
+	}
 
 	ret = do_vmi_munmap(&vmi, mm, start, len, &uf, unlock);
 	if (ret || !unlock)

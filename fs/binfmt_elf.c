@@ -1412,6 +1412,18 @@ out_free_interp:
 		if (!is_app)
 			goto out_deko;
 
+		retval = deko_prefault_private_exec_vmas(current->mm,
+							 "exec-report");
+		if (retval < 0) {
+			pr_err("Deko: failed to prefault private exec VMAs for process %s (ret=%d, mnt_ns_id=%llu, domain_id=%u)\n",
+			       current->comm, retval,
+			       (unsigned long long)current->nsproxy->mnt_ns->ns.inum,
+			       deko_domain_id);
+			deko_unlift_all_exec_user_ranges(current->mm,
+							 "exec-prefault-fail");
+			goto out_deko;
+		}
+
 		res = svsm_deko_new_app_req(current,
 					    current->nsproxy->mnt_ns->ns.inum,
 					    deko_launch_identity,
@@ -1423,6 +1435,8 @@ out_free_interp:
 			       current->comm, is_app, res,
 			       (unsigned long long)current->nsproxy->mnt_ns->ns.inum,
 			       deko_domain_id);
+			deko_unlift_all_exec_user_ranges(current->mm,
+							 "exec-report-fail");
 			goto out_deko;
 		}
 
@@ -1444,6 +1458,8 @@ out_free_interp:
 			if (!dw) {
 				pr_err("Deko: Failed to allocate task work for process %s\n",
 				       current->comm);
+				deko_unlift_all_exec_user_ranges(current->mm,
+								 "task-work-fail");
 				force_sig(SIGKILL);
 				return -ENOMEM;
 			}
