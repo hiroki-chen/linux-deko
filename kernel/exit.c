@@ -76,6 +76,9 @@
 
 #include <asm/unistd.h>
 #include <asm/mmu_context.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#endif
 
 #include "exit.h"
 
@@ -900,6 +903,11 @@ void __noreturn do_exit(long code)
 
 	WARN_ON(irqs_disabled());
 	WARN_ON(tsk->plug);
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/* Keep the mm alive until Deko has reported and unlifted this task. */
+	deko_task_exit();
+#endif
 
 	kcov_task_exit(tsk);
 	kmsan_task_exit(tsk);

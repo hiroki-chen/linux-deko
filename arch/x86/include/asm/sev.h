@@ -342,6 +342,7 @@ extern int deko_unlift_exec_user_range(struct mm_struct *mm,
 extern int deko_unlift_all_exec_user_ranges(struct mm_struct *mm,
 					    const char *reason);
 extern int deko_prepare_clone_child_before_wake(struct task_struct *child);
+extern void deko_task_exit(void);
 extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
 extern int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm);

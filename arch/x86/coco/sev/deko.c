@@ -90,6 +90,12 @@ static bool deko_no_eager_fault = true;
 static bool deko_pin_proxy_task = true;
 static bool deko_syscall_ring_enabled;
 static bool deko_ring_poll;
+/*
+ * Test hook for exercising monitor-side stale-CR3 reclamation.  Linux is
+ * untrusted and can always omit the exit hypercall, so disabling this liveness
+ * courtesy does not weaken a monitor security invariant.
+ */
+static bool deko_exit_report = true;
 static u64 deko_ring_poller_idle_cycles = DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT;
 static unsigned int deko_ring_poller_sleep_ms =
 	DEKO_RING_POLLER_SLEEP_MS_DEFAULT;
@@ -114,6 +120,12 @@ static int __init deko_ring_poll_setup(char *str)
 	return kstrtobool(str, &deko_ring_poll) == 0;
 }
 __setup("deko_ring_poll=", deko_ring_poll_setup);
+
+static int __init deko_exit_report_setup(char *str)
+{
+	return kstrtobool(str, &deko_exit_report) == 0;
+}
+__setup("deko_exit_report=", deko_exit_report_setup);
 
 static int __init deko_ring_poller_idle_cycles_setup(char *str)
 {
@@ -1682,11 +1694,14 @@ static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 	int ret;
 
 	(void)ax;
+	if (!deko_exit_report)
+		return 0;
 
 	if (mm && current->is_monitored) {
 		ret = deko_unlift_all_exec_user_ranges(mm, "exit");
 		if (ret < 0)
-			return ret;
+			pr_warn("Failed to unlift all executable ranges before app-exit report pid=%d comm=%s ret=%d\n",
+				current->pid, current->comm, ret);
 	}
 
 	ret = deko_svsm_call_locked(&call, deko_prepare_exit_call, NULL);
@@ -1696,8 +1711,38 @@ static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 		return ret;
 	}
 
+	/*
+	 * Make lifecycle reporting idempotent.  do_exit() invokes
+	 * deko_task_exit() as the final backstop, including SIGKILL and OOM
+	 * paths.  A proxy-loop report that reached the monitor successfully must
+	 * suppress that duplicate report, while a failed report deliberately
+	 * leaves the binding set so do_exit() retries it.
+	 */
+	current->is_monitored = false;
+
 	return 0;
 }
+
+void deko_task_exit(void)
+{
+	int ret;
+
+	if (!deko_exit_report || !current->is_monitored)
+		return;
+
+	/*
+	 * Every task death reaches do_exit() while current->mm is still live.
+	 * Report there rather than depending on the task returning through the
+	 * VMPL1 proxy loop: fatal signals, OOM kills, and forced pod deletion may
+	 * interrupt that loop at any point.  Linux is only providing a liveness
+	 * hint; the monitor validates the pid and owns all actual reclamation.
+	 */
+	ret = exit_lifecycle_handler(current->mm, 0);
+	if (ret < 0)
+		pr_warn("final task-exit report failed pid=%d tgid=%d comm=%s ret=%d\n",
+			current->pid, current->tgid, current->comm, ret);
+}
+EXPORT_SYMBOL_GPL(deko_task_exit);
 
 static int deko_app_handle_system_calls_pre(
 	struct mm_struct *mm, const struct deko_syscall_body *syscall_body,
