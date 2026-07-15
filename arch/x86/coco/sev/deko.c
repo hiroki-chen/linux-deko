@@ -2130,6 +2130,13 @@ static int deko_syscall_ring_poller_main(void *data)
 
 	snprintf(comm, sizeof(comm), "deko-ring-%d", current->pid);
 	set_task_comm(current, comm);
+	/*
+	 * The I/O thread inherits the owner's task fields, but it is monitor
+	 * infrastructure rather than a separately admitted application.  In
+	 * particular, its do_exit() must not send an app-exit report using the
+	 * poller's pid after the owner has already reclaimed the application.
+	 */
+	current->is_monitored = false;
 
 	for (;;) {
 		bool handled = false;
@@ -2142,6 +2149,17 @@ static int deko_syscall_ring_poller_main(void *data)
 		    READ_ONCE(poller->owner->exit_state) ||
 		    (READ_ONCE(poller->owner->flags) & PF_EXITING))
 			break;
+
+		/*
+		 * A fatal signal cannot reach do_exit() until the owner returns from
+		 * VMPL1, while the VMPL1 proxy loop only checks the signal after a
+		 * launch iteration returns.  Actively kick a running owner so the
+		 * reschedule interrupt crosses the VMPL boundary and closes that
+		 * circular wait.  The owner remains responsible for reporting its
+		 * lifecycle exit and stopping this poller.
+		 */
+		if (fatal_signal_pending(poller->owner))
+			kick_process(poller->owner);
 
 		WRITE_ONCE(ring->poller_state, DEKO_POLLER_AWAKE);
 		WRITE_ONCE(ring->poller_heartbeat, rdtsc_ordered());
