@@ -1440,7 +1440,18 @@ out_free_interp:
 			goto out_deko;
 		}
 
+		/*
+		 * Exec creates a fresh VMPL1 user context.  The per-thread Deko
+		 * user RSP is migration/runtime state from a previous protected
+		 * execution and can be accidentally inherited through ordinary
+		 * context switches by unmonitored parent tasks.  Reset it together
+		 * with the new monitor-provided VMPL1 kernel stack token before
+		 * the proxy loop enters VMPL1.
+		 */
+		current->thread.user_rsp = 0;
 		current->thread.kernel_vmpl1_rsp = regs->cx;
+		current->thread.deko_checkpoint_generation = 0;
+		this_cpu_write(deko_user_rsp, current->thread.user_rsp);
 		this_cpu_write(deko_kernel_vmpl1_rsp,
 			       current->thread.kernel_vmpl1_rsp);
 

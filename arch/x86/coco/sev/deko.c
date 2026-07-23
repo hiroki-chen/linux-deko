@@ -70,6 +70,7 @@ extern char __per_cpu_start[];
 #define DEKO_RING_POLLER_AFFINITY_NONE 0
 #define DEKO_RING_POLLER_AFFINITY_SAME 1
 #define DEKO_RING_POLLER_AFFINITY_NEXT 2
+#define DEKO_RING_POLLER_CREATE_RETRIES 4
 #define DEKO_RING_WAIT_RESCHED_INTERVAL 1024
 #define DEKO_DOMAIN_BITS 8
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
@@ -1850,6 +1851,21 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	trace_deko_syscall_entry(syscall_nr, syscall_body->di, syscall_body->si,
 				 syscall_body->dx);
 
+	/*
+	 * exit()/exit_group() never return from the syscall table.  Calling them
+	 * here would bypass the proxy-loop cleanup below (ring poller stop,
+	 * shared-buffer release, hidden-alias unmap, task_work free).  Report the
+	 * lifecycle exit now, let the proxy loop unwind normally, and have the
+	 * proxy call do_exit() after cleanup.
+	 */
+	if (is_exit_syscall(syscall_nr)) {
+		ret = exit_lifecycle_handler(current->mm, syscall_body->di);
+		if (ret < 0)
+			return ret;
+		syscall_body->ax = 0;
+		return 0;
+	}
+
 	tmp_regs.di = syscall_body->di;
 	tmp_regs.si = syscall_body->si;
 	tmp_regs.dx = syscall_body->dx;
@@ -1948,7 +1964,7 @@ static void deko_syscall_ring_entry_to_body(
 
 static int deko_syscall_ring_complete_claimed(
 	struct deko_shared_buf *buf, struct deko_syscall_entry *entry, u32 index,
-	bool *normal_exit, bool from_poller)
+	bool *normal_exit, int *exit_code, bool from_poller)
 {
 	struct deko_syscall_body syscall_body = { 0 };
 	u64 syscall_nr;
@@ -1979,8 +1995,11 @@ static int deko_syscall_ring_complete_claimed(
 	WRITE_ONCE(buf->syscall_body.ax, syscall_body.ax);
 	smp_store_release(&entry->state, DEKO_SYSCALL_RING_ENTRY_DONE);
 
-	if (!from_poller && is_exit_syscall(syscall_nr))
+	if (!from_poller && is_exit_syscall(syscall_nr)) {
+		if (exit_code)
+			*exit_code = (int)(syscall_body.di & 0xff);
 		*normal_exit = true;
+	}
 
 	return ret;
 }
@@ -2036,6 +2055,7 @@ static bool deko_syscall_ring_has_poller_ready(
 static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 					  bool *normal_exit, bool *handled,
 					  bool *ring_present,
+					  int *exit_code,
 					  bool from_poller)
 {
 	struct deko_syscall_ring *ring;
@@ -2076,7 +2096,8 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 				continue;
 
 			ret = deko_syscall_ring_complete_claimed(
-				buf, entry, head, normal_exit, from_poller);
+				buf, entry, head, normal_exit, exit_code,
+				from_poller);
 		} else if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
 			if (from_poller)
 				break;
@@ -2115,10 +2136,10 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 
 static int deko_syscall_ring_drain(struct deko_shared_buf *buf,
 				   bool *normal_exit, bool *handled,
-				   bool *ring_present)
+				   bool *ring_present, int *exit_code)
 {
 	return deko_syscall_ring_drain_common(buf, normal_exit, handled,
-					      ring_present, false);
+					      ring_present, exit_code, false);
 }
 
 static int deko_syscall_ring_poller_main(void *data)
@@ -2166,7 +2187,7 @@ static int deko_syscall_ring_poller_main(void *data)
 
 		ret = deko_syscall_ring_drain_common(poller->buf, &normal_exit,
 						     &handled, &ring_present,
-						     true);
+						     NULL, true);
 		if (ret != 0)
 			pr_warn("Deko syscall ring poller drain failed pid=%d ret=%d\n",
 				current->pid, ret);
@@ -2263,6 +2284,8 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	struct deko_ring_poller *poller;
 	struct task_struct *task;
 	unsigned int owner_cpu;
+	int ret;
+	int attempt;
 
 	if (!poller_out)
 		return -EINVAL;
@@ -2286,12 +2309,30 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	poller->ring = (struct deko_syscall_ring *)buf->buf;
 	poller->owner = get_task_struct(current);
 	owner_cpu = raw_smp_processor_id();
-	task = create_io_thread(deko_syscall_ring_poller_main, poller,
-				NUMA_NO_NODE);
+	for (attempt = 0; attempt <= DEKO_RING_POLLER_CREATE_RETRIES; attempt++) {
+		task = create_io_thread(deko_syscall_ring_poller_main, poller,
+					NUMA_NO_NODE);
+		if (!IS_ERR(task))
+			break;
+
+		ret = PTR_ERR(task);
+		if (ret != -ERESTARTNOINTR)
+			break;
+
+		cond_resched();
+	}
 	if (IS_ERR(task)) {
+		ret = PTR_ERR(task);
+		if (ret == -ERESTARTNOINTR) {
+			pr_warn_ratelimited("Deko syscall ring poller creation interrupted by pending signal pid=%d; continuing without background poller\n",
+					    current->pid);
+			put_task_struct(poller->owner);
+			kfree(poller);
+			return 0;
+		}
 		put_task_struct(poller->owner);
 		kfree(poller);
-		return PTR_ERR(task);
+		return ret;
 	}
 
 	poller->task = get_task_struct(task);
@@ -2899,7 +2940,12 @@ static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 	 * to grow a valid stack VMA, then fault the page in normally.
 	 */
 	if (!expand_stack(mm, address)) {
-		mmap_read_unlock(mm);
+		/*
+		 * expand_stack() drops mmap_lock before returning NULL.  Do not
+		 * unlock again here: the bad-address path (for example fault_va
+		 * 0x1) would otherwise corrupt the rwsem state and make later
+		 * cleanup block forever in vm_munmap().
+		 */
 		return -EFAULT;
 	}
 
@@ -3117,7 +3163,7 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	bool unshare_exec = false;
 	int ret;
 
-	if (unlikely(!buf || !mm))
+	if (unlikely(!buf))
 		return -EFAULT;
 
 	frame = &buf->page_fault;
@@ -3136,13 +3182,23 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	resp->backing_id = 0;
 	resp->backing_offset = 0;
 
+	if (unlikely(!mm)) {
+		ret = -EFAULT;
+		goto out_response;
+	}
 	if (unlikely(req->version != DEKO_PAGE_FAULT_REQ_VERSION_V1 ||
-		     req->req_size != sizeof(*req)))
-		return -EINVAL;
-	if (unlikely(req->access & DEKO_PF_ACCESS_RSVD))
-		return -EFAULT;
-	if (unlikely(req->fault_va >= TASK_SIZE_MAX))
-		return -EFAULT;
+		     req->req_size != sizeof(*req))) {
+		ret = -EINVAL;
+		goto out_response;
+	}
+	if (unlikely(req->access & DEKO_PF_ACCESS_RSVD)) {
+		ret = -EFAULT;
+		goto out_response;
+	}
+	if (unlikely(req->fault_va >= TASK_SIZE_MAX)) {
+		ret = -EFAULT;
+		goto out_response;
+	}
 	if (unlikely(req->pid && req->pid != current->pid))
 		pr_warn("page fault pid mismatch req_pid=%u current_pid=%d fault=0x%llx\n",
 			req->pid, current->pid,
@@ -3181,6 +3237,7 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 		}
 	}
 
+out_response:
 	resp->status = ret;
 	resp->resolution = ret ? DEKO_PF_RESOLUTION_DENY :
 		((resolve_flags & DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE) ?
@@ -3195,7 +3252,15 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 			current->pid, (unsigned long long)req->fault_va,
 			req->access, req->reason, ret);
 
-	return ret;
+	/*
+	 * A resolver failure is still a completed VMPL2 service response.  Do
+	 * not abort the proxy loop here: VMPL1 is suspended in the page-fault
+	 * service call and must be relaunched so VMPL0 can consume resp.status
+	 * and clear the pending page-fault state.  Returning an error here
+	 * strands that VMPL1 service frame and turns a bad user fault into a
+	 * vCPU wedge during proxy-loop cleanup.
+	 */
+	return 0;
 }
 
 static int
@@ -3276,6 +3341,7 @@ static int deko_run_launch_iteration(struct svsm_call *call,
 static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					 struct deko_shared_buf *buf,
 					 bool *normal_exit,
+					 int *exit_code,
 					 struct deko_ring_poller *poller)
 {
 	u64 handled_syscall_nr;
@@ -3292,7 +3358,8 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 
 			ret = deko_syscall_ring_drain(buf, normal_exit,
 						      &ring_handled,
-						      &ring_present);
+						      &ring_present,
+						      exit_code);
 			if (ret != 0)
 				return ret;
 			if (ring_present && poller && poller->task)
@@ -3310,6 +3377,8 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 
 		/* Handle one legacy shared-buffer syscall when no ring exists. */
 		handled_syscall_nr = buf->syscall_body.ax;
+		if (is_exit_syscall(handled_syscall_nr) && exit_code)
+			*exit_code = (int)(buf->syscall_body.di & 0xff);
 		ret = deko_app_handle_system_calls(&buf->syscall_body);
 		if (ret != 0) {
 			pr_err("Error handling system calls: %d\n", ret);
@@ -3383,6 +3452,7 @@ void deko_proxy_loop(struct callback_head *work)
 	bool normal_exit = false;
 	bool adopting = false;
 	bool iteration_cpu_pinned = false;
+	int exit_code = 0;
 	unsigned int launch_cpu = 0;
 	struct deko_migration_state migration = { 0 };
 	struct deko_handoff_checkpoint checkpoint = { 0 };
@@ -3412,7 +3482,7 @@ void deko_proxy_loop(struct callback_head *work)
 	}
 
 	current->is_monitored = true;
-	pr_debug("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
+	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
 		current->pid, current->tgid, current->comm, current,
 		raw_smp_processor_id(), current->is_monitored,
 		dw->launch_type);
@@ -3544,7 +3614,7 @@ void deko_proxy_loop(struct callback_head *work)
 			goto err_loop;
 
 		errno = deko_handle_vmpl1_exit_reason(
-			&call, buf, &normal_exit, poller);
+			&call, buf, &normal_exit, &exit_code, poller);
 
 		if (unlikely(errno < 0) || normal_exit)
 			goto err_loop;
@@ -3595,10 +3665,11 @@ err_pin:
 	 * the latter case, we should kill the process with the appropriate error code.
 	 *
 	 */
-	if (!normal_exit) {
-		exit_lifecycle_handler(current->mm, errno);
-		do_exit(errno);
-	}
+	if (normal_exit)
+		do_exit((exit_code & 0xff) << 8);
+
+	exit_lifecycle_handler(current->mm, errno);
+	do_exit(errno);
 }
 
 int deko_bootstrap(void)
