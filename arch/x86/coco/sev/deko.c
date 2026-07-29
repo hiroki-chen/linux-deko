@@ -45,6 +45,7 @@
 #include <asm-generic/mman-common.h>
 #include <asm/mem_encrypt.h>
 #include <asm/processor.h>
+#include <asm/segment.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
 #include <asm/trap_pf.h>
@@ -76,6 +77,8 @@ extern char __per_cpu_start[];
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
 #define DEKO_EXEC_RANGE_MAX_PAGES 16384UL
 #define DEKO_EXEC_RANGE_MAX_BYTES (DEKO_EXEC_RANGE_MAX_PAGES << PAGE_SHIFT)
+#define DEKO_FORK_CHILD_STACK_PREFAULT_BELOW_PAGES 4UL
+#define DEKO_FORK_CHILD_STACK_PREFAULT_ABOVE_PAGES 2UL
 
 struct deko_domain_entry {
 	u64 mnt_ns_id;
@@ -410,7 +413,7 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 	unsigned long page_addr = addr & PAGE_MASK;
 	u64 page_gpa = 0;
 	bool anon_exclusive = false;
-	long pinned;
+	long referenced;
 	int locked = 1;
 	int ret = 0;
 
@@ -418,14 +421,14 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 		return -EINVAL;
 
 	mmap_read_lock(mm);
-	pinned = pin_user_pages_remote(mm, page_addr, 1, FOLL_FORCE, &page,
-				       &locked);
+	referenced = get_user_pages_remote(mm, page_addr, 1, FOLL_FORCE,
+					   &page, &locked);
 	if (locked)
 		mmap_read_unlock(mm);
-	if (pinned != 1) {
-		pr_err("Deko %s exec pin failed pid=%d addr=0x%lx pinned=%ld\n",
-		       reason, current->pid, page_addr, pinned);
-		return pinned < 0 ? (int)pinned : -EFAULT;
+	if (referenced != 1) {
+		pr_err("Deko %s exec page ref failed pid=%d addr=0x%lx referenced=%ld\n",
+		       reason, current->pid, page_addr, referenced);
+		return referenced < 0 ? (int)referenced : -EFAULT;
 	}
 
 	if (!PageAnon(page) || !PageAnonExclusive(page)) {
@@ -433,7 +436,7 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 		       reason, current->pid, page_addr, PageAnon(page) ? 1 : 0,
 		       PageAnonExclusive(page) ? 1 : 0);
 		ret = -EFAULT;
-		goto out_unpin;
+		goto out_put;
 	}
 
 	if (!deko_lookup_user_page_state(mm, page_addr, &page_gpa,
@@ -445,13 +448,13 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 		       (unsigned long long)page_gpa, page_to_pfn(page),
 		       anon_exclusive ? 1 : 0);
 		ret = -EFAULT;
-		goto out_unpin;
+		goto out_put;
 	}
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
 		ret = -ENOMEM;
-		goto out_unpin;
+		goto out_put;
 	}
 
 	mutex_lock(&deko_exec_pin_lock);
@@ -460,7 +463,7 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 		ret = existing->page == page ? 0 : -EEXIST;
 		mutex_unlock(&deko_exec_pin_lock);
 		kfree(entry);
-		goto out_unpin;
+		goto out_put;
 	}
 
 	entry->mm = mm;
@@ -471,8 +474,8 @@ static int deko_pin_private_exec_page(struct mm_struct *mm, unsigned long addr,
 
 	return 0;
 
-out_unpin:
-	unpin_user_page(page);
+out_put:
+	put_page(page);
 	return ret;
 }
 
@@ -490,7 +493,7 @@ static unsigned long deko_unpin_exec_user_range_locked(struct mm_struct *mm,
 		if (entry->addr < start || entry->addr >= end)
 			continue;
 		list_del(&entry->node);
-		unpin_user_page(entry->page);
+		put_page(entry->page);
 		kfree(entry);
 		restored++;
 	}
@@ -508,7 +511,7 @@ static unsigned long deko_unpin_all_exec_user_ranges_locked(struct mm_struct *mm
 		if (entry->mm != mm)
 			continue;
 		list_del(&entry->node);
-		unpin_user_page(entry->page);
+		put_page(entry->page);
 		kfree(entry);
 		restored++;
 	}
@@ -653,7 +656,7 @@ int deko_unlift_exec_user_range(struct mm_struct *mm, unsigned long start_addr,
 	mutex_unlock(&deko_exec_pin_lock);
 
 	if (unpinned)
-		pr_debug("Deko %s exec range unpinned pid=%d range=[0x%lx-0x%lx) pages=%lu\n",
+		pr_debug("Deko %s exec range page refs released pid=%d range=[0x%lx-0x%lx) pages=%lu\n",
 			 reason, current->pid, start_addr, end_addr, unpinned);
 
 	return 0;
@@ -856,7 +859,7 @@ struct deko_syscall_body {
 	u64 r9;
 	u64 rcx;
 	u64 r11;
-	u64 __reserved;
+	u64 user_rsp;
 };
 
 struct deko_migration_req {
@@ -1373,6 +1376,12 @@ static bool deko_vma_needs_write_prefault(struct vm_area_struct *vma)
 	       !(vma->vm_flags & (VM_EXEC | VM_SHARED));
 }
 
+static int deko_unshare_populatable_user_range(struct mm_struct *mm,
+					       unsigned long start_addr,
+					       unsigned long length,
+					       unsigned long prot,
+					       const char *reason);
+
 static int eager_fault_populatable_user_range(struct mm_struct *mm,
 					      unsigned long start_addr,
 					      unsigned long length,
@@ -1520,6 +1529,98 @@ static int clone_stack_pre_handler(struct mm_struct *mm,
 	return 0;
 }
 
+static int deko_prefault_current_fork_child_stack(void)
+{
+	struct pt_regs *regs;
+	unsigned long sp;
+	unsigned long low_page;
+	unsigned long high_page;
+	unsigned long start;
+	unsigned long end;
+	unsigned long below_bytes =
+		(DEKO_FORK_CHILD_STACK_PREFAULT_BELOW_PAGES - 1) << PAGE_SHIFT;
+	unsigned long above_bytes =
+		DEKO_FORK_CHILD_STACK_PREFAULT_ABOVE_PAGES << PAGE_SHIFT;
+
+	if (!current->mm)
+		return 0;
+
+	regs = current_pt_regs();
+	if (!regs)
+		return 0;
+
+	sp = regs->sp;
+	if (sp <= PAGE_SIZE || sp >= TASK_SIZE_MAX)
+		return 0;
+
+	/*
+	 * The child returns to userspace through the libc fork/clone wrapper.
+	 * Near a page boundary, that wrapper may immediately touch words above
+	 * the saved RSP as well as the downward-growing stack below it.  Fault
+	 * both sides through Linux before VMPL1 admission so COW stack pages are
+	 * private to the child and the monitor never has to trust a shared
+	 * post-fork stack mapping.
+	 */
+	low_page = PAGE_ALIGN_DOWN(sp - 1);
+	high_page = PAGE_ALIGN_DOWN(sp);
+	start = low_page;
+	if (below_bytes) {
+		if (start > below_bytes)
+			start -= below_bytes;
+		else
+			start = PAGE_SIZE;
+	}
+
+	if (check_add_overflow(high_page, PAGE_SIZE, &end))
+		return 0;
+	if (end > TASK_SIZE_MAX)
+		end = TASK_SIZE_MAX;
+	else if (above_bytes > TASK_SIZE_MAX - end)
+		end = TASK_SIZE_MAX;
+	else
+		end += above_bytes;
+
+	return deko_unshare_populatable_user_range(current->mm, start,
+						  end - start,
+						  PROT_READ | PROT_WRITE,
+						  "fork_child_stack");
+}
+
+static bool deko_lifecycle_syscall_needs_vmpl1_pt_regs(unsigned long syscall_nr)
+{
+	switch (syscall_nr) {
+	case __NR_clone:
+	case __NR_clone3:
+	case __NR_fork:
+	case __NR_vfork:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void deko_fill_vmpl1_syscall_pt_regs(struct pt_regs *regs,
+					    const struct deko_syscall_body *body,
+					    unsigned long syscall_nr)
+{
+	memset(regs, 0, sizeof(*regs));
+	regs->di = body->di;
+	regs->si = body->si;
+	regs->dx = body->dx;
+	regs->r10 = body->r10;
+	regs->r8 = body->r8;
+	regs->r9 = body->r9;
+	regs->ax = syscall_nr;
+	regs->orig_ax = syscall_nr;
+	regs->cx = body->rcx;
+	regs->r11 = body->r11;
+	regs->ip = body->rcx;
+	regs->flags = body->r11;
+	regs->sp = body->user_rsp;
+	regs->cs = __USER_CS;
+	regs->ss = __USER_DS;
+}
+
 static int deko_queue_proxy_loop_for_task(struct task_struct *task,
 					  const char *reason,
 					  u32 launch_type)
@@ -1577,6 +1678,14 @@ static int deko_register_current_clone_child(void)
 	unsigned long token_high = 0;
 	u64 mnt_ns_id = 0;
 	enum es_result res;
+	int ret;
+
+	ret = deko_prefault_current_fork_child_stack();
+	if (ret < 0) {
+		pr_warn("failed to prefault fork child stack pid=%d tgid=%d ret=%d\n",
+			current->pid, current->tgid, ret);
+		return ret;
+	}
 
 	if (current->nsproxy && current->nsproxy->mnt_ns)
 		mnt_ns_id = from_mnt_ns(current->nsproxy->mnt_ns)->inum;
@@ -1834,10 +1943,13 @@ static int deko_app_handle_system_calls_post(
 static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 {
 	struct pt_regs tmp_regs = { 0 };
+	struct pt_regs saved_current_regs;
+	struct pt_regs *current_regs = NULL;
 	sys_call_ptr_t syscall_fn;
 	unsigned long syscall_nr;
 	unsigned long sys_retval;
 	unsigned long old_brk = 0;
+	bool override_current_regs = false;
 	int ret;
 
 	syscall_nr = syscall_body->ax;
@@ -1866,13 +1978,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 		return 0;
 	}
 
-	tmp_regs.di = syscall_body->di;
-	tmp_regs.si = syscall_body->si;
-	tmp_regs.dx = syscall_body->dx;
-	tmp_regs.r10 = syscall_body->r10;
-	tmp_regs.r8 = syscall_body->r8;
-	tmp_regs.r9 = syscall_body->r9;
-	tmp_regs.orig_ax = syscall_nr;
+	deko_fill_vmpl1_syscall_pt_regs(&tmp_regs, syscall_body, syscall_nr);
 
 	if (current->mm)
 		old_brk = current->mm->brk;
@@ -1890,7 +1996,19 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 		return -EINVAL;
 	}
 
+	override_current_regs =
+		deko_lifecycle_syscall_needs_vmpl1_pt_regs(syscall_nr) &&
+		syscall_body->user_rsp;
+	if (override_current_regs) {
+		current_regs = current_pt_regs();
+		saved_current_regs = *current_regs;
+		*current_regs = tmp_regs;
+	}
+
 	sys_retval = syscall_fn(&tmp_regs);
+
+	if (override_current_regs)
+		*current_regs = saved_current_regs;
 
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
 
@@ -2953,6 +3071,103 @@ static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 	ret = fixup_user_fault(mm, address, flags, &unlocked);
 	mmap_read_unlock(mm);
 	return ret;
+}
+
+static int deko_unshare_populatable_user_range(struct mm_struct *mm,
+					       unsigned long start_addr,
+					       unsigned long length,
+					       unsigned long prot,
+					       const char *reason)
+{
+	struct vm_area_struct *vma;
+	unsigned long end_addr;
+	unsigned long cur;
+	bool populated = false;
+	int ret;
+
+	if (READ_ONCE(deko_no_eager_fault))
+		return 0;
+
+	if (!mm || !length)
+		return 0;
+
+	if (check_add_overflow(start_addr, length, &end_addr))
+		return -EINVAL;
+
+	end_addr = PAGE_ALIGN(end_addr);
+	start_addr = PAGE_ALIGN_DOWN(start_addr);
+	if (start_addr >= end_addr)
+		return 0;
+
+	cur = start_addr;
+	while (cur < end_addr) {
+		unsigned long sub_start;
+		unsigned long sub_end;
+		unsigned long page;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, cur);
+		if (!vma) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		if (cur < vma->vm_start)
+			cur = vma->vm_start;
+		if (cur >= end_addr) {
+			mmap_read_unlock(mm);
+			break;
+		}
+
+		sub_start = max(cur, vma->vm_start);
+		sub_end = min(end_addr, vma->vm_end);
+		if (!deko_vma_is_populatable(vma, prot)) {
+			mmap_read_unlock(mm);
+			cur = sub_end;
+			continue;
+		}
+		mmap_read_unlock(mm);
+
+		for (page = PAGE_ALIGN_DOWN(sub_start); page < sub_end;
+		     page += PAGE_SIZE) {
+			u64 page_gpa = 0;
+			bool anon_exclusive = false;
+
+			ret = deko_fixup_user_fault(mm, page,
+						    FAULT_FLAG_USER |
+							    FAULT_FLAG_WRITE);
+			if (ret < 0) {
+				pr_warn("Deko %s write prefault failed pid=%d addr=0x%lx ret=%d\n",
+					reason, current->pid, page, ret);
+				return ret;
+			}
+
+			ret = deko_fixup_user_fault(mm, page,
+						    FAULT_FLAG_USER |
+							    FAULT_FLAG_UNSHARE);
+			if (ret < 0) {
+				pr_warn("Deko %s unshare prefault failed pid=%d addr=0x%lx ret=%d\n",
+					reason, current->pid, page, ret);
+				return ret;
+			}
+
+			if (!deko_lookup_user_page_state(mm, page, &page_gpa,
+							 &anon_exclusive) ||
+			    !anon_exclusive) {
+				pr_warn("Deko %s prefault did not produce anonymous-exclusive page pid=%d addr=0x%lx gpa=0x%llx anon_exclusive=%d\n",
+					reason, current->pid, page,
+					(unsigned long long)page_gpa,
+					anon_exclusive ? 1 : 0);
+				return -EFAULT;
+			}
+
+			populated = true;
+		}
+
+		cur = sub_end;
+	}
+
+	return populated ? 0 : -EFAULT;
 }
 
 static int deko_prefault_private_exec_range(struct mm_struct *mm,
