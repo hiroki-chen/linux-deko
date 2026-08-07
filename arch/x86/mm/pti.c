@@ -130,6 +130,8 @@ early_param("nopti", pti_parse_cmdline_nopti);
 
 pgd_t __pti_set_user_pgtbl(pgd_t *pgdp, pgd_t pgd)
 {
+	pgd_t *user_pgdp;
+	pgd_t user_pgd = pgd;
 	/*
 	 * Changes to the high (kernel) portion of the kernelmode page
 	 * tables are not automatically propagated to the usermode tables.
@@ -143,10 +145,40 @@ pgd_t __pti_set_user_pgtbl(pgd_t *pgdp, pgd_t pgd)
 		return pgd;
 
 	/*
-	 * The user page tables get the full PGD, accessible from
-	 * userspace:
+	 * Deko reserves one complete PML4 slot for executable mappings.  Once
+	 * that contract is active, make every other newly-created PTI user-root
+	 * entry NX.  This also covers late data mappings such as the transport
+	 * alias, without allocating otherwise-unused page-table roots.
 	 */
-	kernel_to_user_pgdp(pgdp)->pgd = pgd.pgd;
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if ((user_pgd.pgd & (_PAGE_USER | _PAGE_PRESENT)) ==
+	    (_PAGE_USER | _PAGE_PRESENT)) {
+		struct mm_struct *mm = pgd_page_get_mm(virt_to_page(pgdp));
+
+		if (mm && READ_ONCE(mm->deko_exec_span)) {
+			unsigned long index = ((unsigned long)pgdp & ~PAGE_MASK) /
+					      sizeof(*pgdp);
+			unsigned long exec_index =
+				pgd_index(READ_ONCE(mm->deko_exec_span_base));
+
+			user_pgd.pgd |= _PAGE_ACCESSED;
+			if (index == exec_index)
+				user_pgd.pgd &= ~_PAGE_NX;
+			else
+				user_pgd.pgd |= _PAGE_NX;
+		}
+	}
+#endif
+
+	/*
+	 * Avoid a redundant store into the paired user root.  Deko may keep
+	 * that root read-only while VMPL1 runs; lower-level data faults do not
+	 * change this entry and must not require opening the root merely for an
+	 * identical PTI mirror write.
+	 */
+	user_pgdp = kernel_to_user_pgdp(pgdp);
+	if (READ_ONCE(user_pgdp->pgd) != user_pgd.pgd)
+		WRITE_ONCE(user_pgdp->pgd, user_pgd.pgd);
 
 	/*
 	 * If this is normal user memory, make it NX in the kernel

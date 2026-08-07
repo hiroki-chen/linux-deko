@@ -29,6 +29,10 @@
 
 #include <linux/uaccess.h>
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#endif
+
 #include <kunit/visibility.h>
 
 #include "internal.h"
@@ -572,10 +576,26 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	unsigned long populate;
 	LIST_HEAD(uf);
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/* This bit is kernel-internal and must never be accepted from VMPL2. */
+	flag &= ~DEKO_MAP_ELF_IMAGE;
+#endif
 	ret = security_mmap_file(file, prot, flag);
 	if (!ret)
 		ret = fsnotify_mmap_perm(file, prot, off, len);
 	if (!ret) {
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+		/*
+		 * glibc reserves a complete shared-object image with this exact
+		 * no-hint/MAP_DENYWRITE shape before replacing its PT_LOAD ranges.
+		 * Do not classify ordinary file mappings as loader reservations.
+		 */
+		if (READ_ONCE(mm->deko_exec_span) && !addr && file &&
+		    (flag & MAP_DENYWRITE) &&
+		    !(prot & PROT_EXEC) &&
+		    deko_exec_span_elf_image(file, pgoff, len))
+			flag |= DEKO_MAP_ELF_IMAGE;
+#endif
 		if (mmap_write_lock_killable(mm))
 			return -EINTR;
 		ret = do_mmap(file, addr, len, prot, flag, 0, pgoff, &populate,

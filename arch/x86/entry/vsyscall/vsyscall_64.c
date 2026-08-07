@@ -38,6 +38,9 @@
 #include <asm/fixmap.h>
 #include <asm/traps.h>
 #include <asm/paravirt.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include "vsyscall_trace.h"
@@ -119,6 +122,12 @@ bool emulate_vsyscall(unsigned long error_code,
 	int vsyscall_nr, syscall_nr, tmp;
 	long ret;
 	unsigned long orig_dx;
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/* A protected image cannot execute through a gate outside its span. */
+	if (current->mm && READ_ONCE(current->mm->deko_exec_span))
+		return false;
+#endif
 
 	/* Write faults or kernel-privilege faults never get fixed up. */
 	if ((error_code & (X86_PF_WRITE | X86_PF_USER)) != X86_PF_USER)
@@ -303,6 +312,10 @@ static struct vm_area_struct gate_vma __ro_after_init = {
 
 struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
 {
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (mm && READ_ONCE(mm->deko_exec_span))
+		return NULL;
+#endif
 #ifdef CONFIG_COMPAT
 	if (!mm || !test_bit(MM_CONTEXT_HAS_VSYSCALL, &mm->context.flags))
 		return NULL;

@@ -1099,6 +1099,11 @@ struct mm_struct {
 		unsigned long mmap_compat_legacy_base;
 #endif
 		unsigned long task_size;	/* size of task vm space */
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+		/* This image reserves one selected user PML4 slot for exec. */
+		unsigned long deko_exec_span_base;
+		bool deko_exec_span;
+#endif
 		pgd_t * pgd;
 
 #ifdef CONFIG_MEMBARRIER

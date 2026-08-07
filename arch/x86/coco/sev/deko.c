@@ -16,6 +16,7 @@
 #undef CREATE_TRACE_POINTS
 
 #include <linux/completion.h>
+#include <linux/atomic.h>
 #include <linux/hashtable.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -42,6 +43,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
+#include <linux/vmalloc.h>
 #include <asm-generic/mman-common.h>
 #include <asm/mem_encrypt.h>
 #include <asm/processor.h>
@@ -213,12 +215,70 @@ struct deko_exec_pin_entry {
 static LIST_HEAD(deko_exec_pin_list);
 static DEFINE_MUTEX(deko_exec_pin_lock);
 
+/*
+ * A data pin is a VMPL2 liveness commitment paired with VMPL0's authoritative
+ * frame ledger.  The token is deliberately opaque: VMPL0 never treats it as
+ * proof of ownership and still rewalks the shared page tables and rejects GPA
+ * aliases before changing RMP permissions.
+ */
+struct deko_data_pin_entry {
+	struct list_head node;
+	struct hlist_node addr_hash_node;
+	struct hlist_node page_hash_node;
+	struct mm_struct *mm;
+	unsigned long addr;
+	struct page *page;
+	u64 token;
+};
+
+#define DEKO_DATA_PIN_HASH_BITS 12
+static LIST_HEAD(deko_data_pin_list);
+static DEFINE_HASHTABLE(deko_data_pin_addr_table, DEKO_DATA_PIN_HASH_BITS);
+static DEFINE_HASHTABLE(deko_data_pin_page_table, DEKO_DATA_PIN_HASH_BITS);
+static DEFINE_MUTEX(deko_data_pin_lock);
+static atomic64_t deko_data_pin_next_token = ATOMIC64_INIT(0);
+
+static unsigned long deko_data_pin_addr_key(struct mm_struct *mm,
+					    unsigned long addr)
+{
+	return (unsigned long)mm ^ (addr >> PAGE_SHIFT);
+}
+
+enum deko_data_pin_transition_kind {
+	DEKO_DATA_PIN_TRANSITION_NONE = 0,
+	DEKO_DATA_PIN_TRANSITION_UNPIN_RANGE,
+	DEKO_DATA_PIN_TRANSITION_MREMAP,
+};
+
+/*
+ * Kernel-local pin bookkeeping that may be applied only after the following
+ * launch call succeeds.  A successful launch is the acknowledgement that
+ * VMPL0 consumed the immutable syscall completion and finished either the
+ * release or rollback transition before VMPL1 ran again.
+ */
+struct deko_data_pin_transition {
+	bool awaiting_monitor;
+	enum deko_data_pin_transition_kind kind;
+	unsigned long old_start;
+	unsigned long old_end;
+	unsigned long new_start;
+	unsigned long new_end;
+	bool replace_destination;
+};
+
 static int deko_prepare_monitor_migration_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
 static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
 					     struct svsm_ca *caa, void *arg);
 static int deko_prepare_exec_range_unlift_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
+struct deko_syscall_body;
+static int deko_prepare_data_pin_transition(
+	const struct deko_syscall_body *syscall_body, unsigned long syscall_nr,
+	unsigned long returned_value, unsigned long old_brk,
+	struct deko_data_pin_transition *transition);
+static int deko_apply_data_pin_transition(
+	struct mm_struct *mm, struct deko_data_pin_transition *transition);
 static bool deko_lookup_user_page_state(struct mm_struct *mm,
 					unsigned long address,
 					u64 *page_gpa,
@@ -707,21 +767,33 @@ int deko_unlift_all_exec_user_ranges(struct mm_struct *mm, const char *reason)
 }
 EXPORT_SYMBOL_GPL(deko_unlift_all_exec_user_ranges);
 
+struct deko_exit_call_args {
+	u16 version;
+	bool exec_span;
+	unsigned long exec_span_base;
+};
+
 static int deko_prepare_exit_call(struct svsm_call *call, struct svsm_ca *caa,
 				  void *arg)
 {
+	struct deko_exit_call_args *args = arg;
 	struct deko_new_app_req *req;
-
-	(void)arg;
 
 	req = (struct deko_new_app_req *)caa->svsm_buffer;
 	memset(req, 0, sizeof(*req));
-	req->version = DEKO_NEW_APP_REQ_VERSION_V3;
-	req->req_size = sizeof(*req);
+	req->version = args->version;
+	req->req_size = args->version == DEKO_NEW_APP_REQ_VERSION_V4 ?
+				sizeof(*req) : DEKO_NEW_APP_REQ_SIZE_V3;
 	req->tgid = current->tgid;
 	req->pid = current->pid;
 	req->ppid = current->real_parent->pid;
 	req->app_type = DEKO_DOCKER_APPS;
+	if (args->exec_span) {
+		req->exec_span_base = args->exec_span_base;
+		req->exec_span_size = DEKO_EXEC_SPAN_SIZE;
+		req->exec_span_pml4_index =
+			args->exec_span_base >> DEKO_EXEC_SPAN_SHIFT;
+	}
 
 	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 	call->r8 = 0; /* Not a creation event */
@@ -954,6 +1026,129 @@ static void deko_free_hidden_user_alias(unsigned long alias_addr,
 static inline bool is_exit_syscall(u64 syscall_num)
 {
 	return syscall_num == __NR_exit || syscall_num == __NR_exit_group;
+}
+
+static inline bool deko_memory_lifecycle_syscall(u64 syscall_num)
+{
+	switch (syscall_num) {
+	case __NR_mmap:
+	case __NR_brk:
+	case __NR_mprotect:
+	case __NR_pkey_mprotect:
+	case __NR_munmap:
+	case __NR_mremap:
+	case __NR_madvise:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int deko_checked_page_range(unsigned long start, unsigned long length,
+				   unsigned long *end_out)
+{
+	unsigned long rounded_length;
+	unsigned long end;
+
+	if (!length || !end_out || !PAGE_ALIGNED(start) ||
+	    check_add_overflow(length, PAGE_SIZE - 1, &rounded_length))
+		return -EINVAL;
+	rounded_length &= PAGE_MASK;
+	if (!rounded_length || check_add_overflow(start, rounded_length, &end) ||
+	    end > TASK_SIZE_MAX)
+		return -EINVAL;
+
+	*end_out = end;
+	return 0;
+}
+
+static int deko_prepare_data_pin_transition(
+	const struct deko_syscall_body *syscall_body, unsigned long syscall_nr,
+	unsigned long returned_value, unsigned long old_brk,
+	struct deko_data_pin_transition *transition)
+{
+	struct deko_data_pin_transition next = {
+		.awaiting_monitor = true,
+		.kind = DEKO_DATA_PIN_TRANSITION_NONE,
+	};
+	unsigned long end;
+	int ret;
+
+	if (!syscall_body || !transition ||
+	    !deko_memory_lifecycle_syscall(syscall_nr))
+		return -EINVAL;
+	if (transition->awaiting_monitor)
+		return -EBUSY;
+
+	switch (syscall_nr) {
+	case __NR_mmap:
+		if (IS_ERR_VALUE(returned_value) ||
+		    !(syscall_body->r10 & MAP_FIXED))
+			break;
+		if (returned_value != syscall_body->di)
+			return -EPROTO;
+		ret = deko_checked_page_range(returned_value, syscall_body->si,
+					      &end);
+		if (ret < 0)
+			return ret;
+		next.kind = DEKO_DATA_PIN_TRANSITION_UNPIN_RANGE;
+		next.old_start = returned_value;
+		next.old_end = end;
+		break;
+	case __NR_munmap:
+		if (IS_ERR_VALUE(returned_value))
+			break;
+		if (returned_value != 0)
+			return -EPROTO;
+		ret = deko_checked_page_range(syscall_body->di, syscall_body->si,
+					      &end);
+		if (ret < 0)
+			return ret;
+		next.kind = DEKO_DATA_PIN_TRANSITION_UNPIN_RANGE;
+		next.old_start = syscall_body->di;
+		next.old_end = end;
+		break;
+	case __NR_brk:
+		if (!old_brk || returned_value >= old_brk)
+			break;
+		if (returned_value > ULONG_MAX - (PAGE_SIZE - 1) ||
+		    old_brk > ULONG_MAX - (PAGE_SIZE - 1))
+			return -EINVAL;
+		next.old_start = PAGE_ALIGN(returned_value);
+		next.old_end = PAGE_ALIGN(old_brk);
+		if (next.old_start < next.old_end) {
+			next.kind = DEKO_DATA_PIN_TRANSITION_UNPIN_RANGE;
+			if (next.old_end > TASK_SIZE_MAX)
+				return -EINVAL;
+		}
+		break;
+	case __NR_mremap:
+		if (IS_ERR_VALUE(returned_value))
+			break;
+		ret = deko_checked_page_range(syscall_body->di,
+					      syscall_body->si, &next.old_end);
+		if (ret < 0)
+			return ret;
+		ret = deko_checked_page_range(returned_value, syscall_body->dx,
+					      &next.new_end);
+		if (ret < 0)
+			return ret;
+		next.kind = DEKO_DATA_PIN_TRANSITION_MREMAP;
+		next.old_start = syscall_body->di;
+		next.new_start = returned_value;
+		next.replace_destination =
+			(syscall_body->r10 & MREMAP_FIXED) != 0;
+		if (next.new_start != next.old_start &&
+		    next.old_start < next.new_end &&
+		    next.new_start < next.old_end)
+			return -EINVAL;
+		break;
+	default:
+		break;
+	}
+
+	*transition = next;
+	return 0;
 }
 
 static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
@@ -1801,6 +1996,9 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 {
 	struct svsm_call call = { 0 };
+	struct deko_exit_call_args args = {
+		.version = DEKO_NEW_APP_REQ_VERSION_V4,
+	};
 	int ret;
 
 	(void)ax;
@@ -1808,13 +2006,20 @@ static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 		return 0;
 
 	if (mm && current->is_monitored) {
+		args.exec_span = READ_ONCE(mm->deko_exec_span);
+		args.exec_span_base = READ_ONCE(mm->deko_exec_span_base);
 		ret = deko_unlift_all_exec_user_ranges(mm, "exit");
 		if (ret < 0)
 			pr_warn("Failed to unlift all executable ranges before app-exit report pid=%d comm=%s ret=%d\n",
 				current->pid, current->comm, ret);
 	}
 
-	ret = deko_svsm_call_locked(&call, deko_prepare_exit_call, NULL);
+	ret = deko_svsm_call_locked(&call, deko_prepare_exit_call, &args);
+	if (ret == -EINVAL) {
+		args.version = DEKO_NEW_APP_REQ_VERSION_V3;
+		ret = deko_svsm_call_locked(&call, deko_prepare_exit_call,
+					    &args);
+	}
 	if (ret < 0) {
 		pr_err("Failed to report app exit to SVSM for process %s (pid: %d), err: %d\n",
 		       current->comm, current->pid, ret);
@@ -1856,9 +2061,17 @@ EXPORT_SYMBOL_GPL(deko_task_exit);
 
 static int deko_app_handle_system_calls_pre(
 	struct mm_struct *mm, const struct deko_syscall_body *syscall_body,
-	unsigned long syscall_nr)
+	unsigned long syscall_nr,
+	const struct deko_data_pin_transition *pin_transition)
 {
 	int ret;
+
+	if (deko_memory_lifecycle_syscall(syscall_nr)) {
+		if (!pin_transition)
+			return -EOPNOTSUPP;
+		if (pin_transition->awaiting_monitor)
+			return -EBUSY;
+	}
 
 	switch (syscall_nr) {
 	case __NR_clone:
@@ -1887,9 +2100,20 @@ static int deko_app_handle_system_calls_pre(
 
 static int deko_app_handle_system_calls_post(
 	struct mm_struct *mm, struct deko_syscall_body *syscall_body,
-	unsigned long syscall_nr, unsigned long ax, unsigned long old_brk)
+	unsigned long syscall_nr, unsigned long ax, unsigned long old_brk,
+	struct deko_data_pin_transition *pin_transition)
 {
 	int ret;
+
+	if (deko_memory_lifecycle_syscall(syscall_nr)) {
+		ret = deko_prepare_data_pin_transition(syscall_body, syscall_nr,
+						       ax, old_brk,
+						       pin_transition);
+		if (ret < 0)
+			return ret;
+		/* Publish the exact Linux completion before any post-work can fail. */
+		syscall_body->ax = ax;
+	}
 
 	switch (syscall_nr) {
 	case __NR_mmap:
@@ -1908,6 +2132,8 @@ static int deko_app_handle_system_calls_post(
 					  syscall_body->dx);
 		if (ret < 0)
 			return ret;
+		break;
+	case __NR_munmap:
 		break;
 	case __NR_mprotect:
 	case __NR_pkey_mprotect:
@@ -1940,7 +2166,9 @@ static int deko_app_handle_system_calls_post(
 	return 0;
 }
 
-static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
+static int deko_app_handle_system_calls(
+	struct deko_syscall_body *syscall_body,
+	struct deko_data_pin_transition *pin_transition)
 {
 	struct pt_regs tmp_regs = { 0 };
 	struct pt_regs saved_current_regs;
@@ -1984,7 +2212,7 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 		old_brk = current->mm->brk;
 
 	ret = deko_app_handle_system_calls_pre(current->mm, syscall_body,
-					       syscall_nr);
+					       syscall_nr, pin_transition);
 	if (ret < 0)
 		return ret;
 
@@ -2013,7 +2241,8 @@ static int deko_app_handle_system_calls(struct deko_syscall_body *syscall_body)
 	trace_deko_syscall_exit(tmp_regs.orig_ax, sys_retval);
 
 	return deko_app_handle_system_calls_post(
-		current->mm, syscall_body, syscall_nr, sys_retval, old_brk);
+		current->mm, syscall_body, syscall_nr, sys_retval, old_brk,
+		pin_transition);
 }
 
 static void deko_syscall_ring_init(struct deko_syscall_ring *ring)
@@ -2082,7 +2311,8 @@ static void deko_syscall_ring_entry_to_body(
 
 static int deko_syscall_ring_complete_claimed(
 	struct deko_shared_buf *buf, struct deko_syscall_entry *entry, u32 index,
-	bool *normal_exit, int *exit_code, bool from_poller)
+	bool *normal_exit, int *exit_code, bool from_poller,
+	struct deko_data_pin_transition *pin_transition)
 {
 	struct deko_syscall_body syscall_body = { 0 };
 	u64 syscall_nr;
@@ -2102,7 +2332,7 @@ static int deko_syscall_ring_complete_claimed(
 		return 0;
 	}
 
-	ret = deko_app_handle_system_calls(&syscall_body);
+	ret = deko_app_handle_system_calls(&syscall_body, pin_transition);
 	if (ret != 0) {
 		pr_err("Error handling syscall ring entry pid=%d index=%u syscall=%llu ret=%d\n",
 		       current->pid, index, (unsigned long long)syscall_nr, ret);
@@ -2174,7 +2404,8 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 					  bool *normal_exit, bool *handled,
 					  bool *ring_present,
 					  int *exit_code,
-					  bool from_poller)
+					  bool from_poller,
+					  struct deko_data_pin_transition *pin_transition)
 {
 	struct deko_syscall_ring *ring;
 	u32 head, tail;
@@ -2215,7 +2446,7 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 
 			ret = deko_syscall_ring_complete_claimed(
 				buf, entry, head, normal_exit, exit_code,
-				from_poller);
+				from_poller, pin_transition);
 		} else if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
 			if (from_poller)
 				break;
@@ -2254,10 +2485,12 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 
 static int deko_syscall_ring_drain(struct deko_shared_buf *buf,
 				   bool *normal_exit, bool *handled,
-				   bool *ring_present, int *exit_code)
+				   bool *ring_present, int *exit_code,
+				   struct deko_data_pin_transition *pin_transition)
 {
 	return deko_syscall_ring_drain_common(buf, normal_exit, handled,
-					      ring_present, exit_code, false);
+					      ring_present, exit_code, false,
+					      pin_transition);
 }
 
 static int deko_syscall_ring_poller_main(void *data)
@@ -2305,7 +2538,7 @@ static int deko_syscall_ring_poller_main(void *data)
 
 		ret = deko_syscall_ring_drain_common(poller->buf, &normal_exit,
 						     &handled, &ring_present,
-						     NULL, true);
+						     NULL, true, NULL);
 		if (ret != 0)
 			pr_warn("Deko syscall ring poller drain failed pid=%d ret=%d\n",
 				current->pid, ret);
@@ -3035,6 +3268,481 @@ out_unlock:
 	return ok;
 }
 
+static struct deko_data_pin_entry *
+deko_data_pin_find_locked(struct mm_struct *mm, unsigned long addr)
+{
+	struct deko_data_pin_entry *entry;
+	unsigned long page_addr = addr & PAGE_MASK;
+	unsigned long key = deko_data_pin_addr_key(mm, page_addr);
+
+	hash_for_each_possible(deko_data_pin_addr_table, entry, addr_hash_node,
+				       key) {
+		if (entry->mm == mm && entry->addr == page_addr)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static struct deko_data_pin_entry *
+deko_data_pin_find_page_locked(const struct page *page)
+{
+	struct deko_data_pin_entry *entry;
+
+	hash_for_each_possible(deko_data_pin_page_table, entry, page_hash_node,
+				       (unsigned long)page) {
+		if (entry->page == page)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static bool deko_vma_is_private_data_candidate(const struct vm_area_struct *vma)
+{
+	if (!vma || !vma_is_accessible(vma))
+		return false;
+	if (vma->vm_flags & (VM_EXEC | VM_SHARED | VM_IO | VM_PFNMAP |
+			     VM_MIXEDMAP))
+		return false;
+
+	return is_cow_mapping(vma->vm_flags);
+}
+
+/*
+ * Return 1 only for a present 4 KiB leaf, including a special zero-page PTE.
+ * Initial admission deliberately rejects huge leaves because VMPL0's data
+ * ownership ledger is page-granular and rewalks only 4 KiB translations.
+ */
+static int deko_user_leaf_present_4k(struct mm_struct *mm,
+				     unsigned long address)
+{
+	struct vm_area_struct *vma;
+	spinlock_t *ptl;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t pte;
+	int ret = 0;
+
+	if (!mm)
+		return -EINVAL;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, address);
+	if (!vma || address < vma->vm_start ||
+	    !deko_vma_is_private_data_candidate(vma))
+		goto out_unlock;
+
+	pgd = pgd_offset(mm, address);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto out_unlock;
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto out_unlock;
+	if (p4d_leaf(*p4d)) {
+		ret = -E2BIG;
+		goto out_unlock;
+	}
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || pud_bad(*pud))
+		goto out_unlock;
+	if (pud_leaf(*pud)) {
+		ret = -E2BIG;
+		goto out_unlock;
+	}
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		goto out_unlock;
+	if (pmd_leaf(*pmd)) {
+		ret = -E2BIG;
+		goto out_unlock;
+	}
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep)
+		goto out_unlock;
+	pte = ptep_get(ptep);
+	ret = pte_present(pte) ? 1 : 0;
+	pte_unmap_unlock(ptep, ptl);
+
+out_unlock:
+	mmap_read_unlock(mm);
+	return ret;
+}
+
+/*
+ * Establish or retrieve the durable FOLL_PIN commitment for one data page.
+ * The PTE/PFN/exclusivity checks are repeated after pinning. VMPL0 repeats the
+ * translation and ownership checks independently before RMPADJUST.
+ */
+static int deko_pin_private_data_page(struct mm_struct *mm,
+				      unsigned long addr, u64 *token_out,
+				      u64 *page_gpa_out)
+{
+	struct deko_data_pin_entry *entry;
+	struct deko_data_pin_entry *existing;
+	struct deko_data_pin_entry *alias;
+	struct vm_area_struct *vma;
+	struct page *page = NULL;
+	unsigned long page_addr = addr & PAGE_MASK;
+	u64 page_gpa = 0;
+	u64 token;
+	bool anon_exclusive = false;
+	long pinned;
+	int locked = 1;
+	int ret = 0;
+
+	if (!mm || !token_out || !page_gpa_out || page_addr >= TASK_SIZE_MAX)
+		return -EINVAL;
+
+	*token_out = 0;
+	*page_gpa_out = 0;
+
+	/* Fast path for a page VMPL0 already owns and Linux still pins. */
+	mutex_lock(&deko_data_pin_lock);
+	existing = deko_data_pin_find_locked(mm, page_addr);
+	if (existing) {
+		if (!PageAnon(existing->page) ||
+		    !PageAnonExclusive(existing->page) ||
+		    !deko_lookup_user_page_state(mm, page_addr, &page_gpa,
+						 &anon_exclusive) ||
+		    !anon_exclusive ||
+		    (page_gpa & PAGE_MASK) !=
+			    ((u64)page_to_pfn(existing->page) << PAGE_SHIFT)) {
+			ret = -EFAULT;
+		} else {
+			*token_out = existing->token;
+			*page_gpa_out = page_gpa;
+		}
+		mutex_unlock(&deko_data_pin_lock);
+		return ret;
+	}
+	mutex_unlock(&deko_data_pin_lock);
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, page_addr);
+	if (!vma || page_addr < vma->vm_start ||
+	    !deko_vma_is_private_data_candidate(vma)) {
+		mmap_read_unlock(mm);
+		return -EACCES;
+	}
+	mmap_read_unlock(mm);
+
+	/*
+	 * FOLL_WRITE materializes private COW and special zero pages even for a
+	 * read-first VMPL1 fault. pin_user_pages_remote supplies FOLL_PIN itself.
+	 */
+	mmap_read_lock(mm);
+	pinned = pin_user_pages_remote(mm, page_addr, 1,
+				       FOLL_FORCE | FOLL_WRITE, &page, &locked);
+	if (locked)
+		mmap_read_unlock(mm);
+	if (pinned != 1)
+		return pinned < 0 ? (int)pinned : -EFAULT;
+
+	if (!PageAnon(page) || !PageAnonExclusive(page)) {
+		ret = -EFAULT;
+		goto out_unpin;
+	}
+
+	if (!deko_lookup_user_page_state(mm, page_addr, &page_gpa,
+					 &anon_exclusive) ||
+	    !anon_exclusive ||
+	    (page_gpa & PAGE_MASK) != ((u64)page_to_pfn(page) << PAGE_SHIFT)) {
+		ret = -EFAULT;
+		goto out_unpin;
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		ret = -ENOMEM;
+		goto out_unpin;
+	}
+
+	mutex_lock(&deko_data_pin_lock);
+	existing = deko_data_pin_find_locked(mm, page_addr);
+	if (existing) {
+		ret = existing->page == page ? 0 : -EEXIST;
+		token = existing->token;
+		mutex_unlock(&deko_data_pin_lock);
+		kfree(entry);
+		if (!ret) {
+			*token_out = token;
+			*page_gpa_out = page_gpa;
+		}
+		goto out_unpin;
+	}
+
+	alias = deko_data_pin_find_page_locked(page);
+	if (alias) {
+		mutex_unlock(&deko_data_pin_lock);
+		kfree(entry);
+		ret = -EEXIST;
+		goto out_unpin;
+	}
+
+	do {
+		token = (u64)atomic64_inc_return(&deko_data_pin_next_token);
+	} while (!token);
+	/* Keep the mm identity stable even on a fail-closed exit that leaks pins. */
+	mmgrab(mm);
+	entry->mm = mm;
+	entry->addr = page_addr;
+	entry->page = page;
+	entry->token = token;
+	list_add(&entry->node, &deko_data_pin_list);
+	hash_add(deko_data_pin_addr_table, &entry->addr_hash_node,
+		 deko_data_pin_addr_key(mm, page_addr));
+	hash_add(deko_data_pin_page_table, &entry->page_hash_node,
+		 (unsigned long)page);
+	mutex_unlock(&deko_data_pin_lock);
+
+	*token_out = token;
+	*page_gpa_out = page_gpa;
+	return 0;
+
+out_unpin:
+	unpin_user_page(page);
+	return ret;
+}
+
+int deko_pin_present_private_data_vmas(struct mm_struct *mm,
+					const char *reason)
+{
+	unsigned long cur = 0;
+
+	if (!mm)
+		return 0;
+
+	for (;;) {
+		struct vm_area_struct *vma;
+		unsigned long start;
+		unsigned long end;
+		bool eligible;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, cur);
+		if (!vma) {
+			mmap_read_unlock(mm);
+			return 0;
+		}
+		start = max(cur, vma->vm_start);
+		end = vma->vm_end;
+		eligible = deko_vma_is_private_data_candidate(vma);
+		mmap_read_unlock(mm);
+
+		if (eligible) {
+			unsigned long page;
+
+			for (page = PAGE_ALIGN_DOWN(start); page < end;
+			     page += PAGE_SIZE) {
+				u64 token;
+				u64 page_gpa;
+				int present;
+				int ret;
+
+				present = deko_user_leaf_present_4k(mm, page);
+				if (present < 0) {
+					pr_err("Deko %s data pin scan rejected non-4K leaf addr=0x%lx ret=%d\n",
+					       reason, page, present);
+					return present;
+				}
+				if (!present)
+					continue;
+
+				ret = deko_pin_private_data_page(mm, page, &token,
+							 &page_gpa);
+				if (ret < 0) {
+					pr_err("Deko %s data pin scan failed addr=0x%lx ret=%d\n",
+					       reason, page, ret);
+					return ret;
+				}
+				cond_resched();
+			}
+		}
+
+		if (end <= cur)
+			return -EFAULT;
+		cur = end;
+	}
+}
+EXPORT_SYMBOL_GPL(deko_pin_present_private_data_vmas);
+
+static unsigned long deko_detach_data_user_range_locked(
+	struct mm_struct *mm, unsigned long start, unsigned long end,
+	struct list_head *detached)
+{
+	struct deko_data_pin_entry *entry;
+	struct deko_data_pin_entry *tmp;
+	unsigned long detached_count = 0;
+
+	list_for_each_entry_safe(entry, tmp, &deko_data_pin_list, node) {
+		if (entry->mm != mm || entry->addr < start || entry->addr >= end)
+			continue;
+		hash_del(&entry->addr_hash_node);
+		hash_del(&entry->page_hash_node);
+		list_move_tail(&entry->node, detached);
+		detached_count++;
+	}
+
+	return detached_count;
+}
+
+static void deko_release_detached_data_pins(struct list_head *detached)
+{
+	struct deko_data_pin_entry *entry;
+	struct deko_data_pin_entry *tmp;
+
+	list_for_each_entry_safe(entry, tmp, detached, node) {
+		list_del(&entry->node);
+		unpin_user_page(entry->page);
+		mmdrop(entry->mm);
+		kfree(entry);
+	}
+}
+
+unsigned long deko_unpin_all_data_user_ranges(struct mm_struct *mm,
+					       const char *reason)
+{
+	LIST_HEAD(detached);
+	unsigned long released;
+
+	if (!mm)
+		return 0;
+
+	mutex_lock(&deko_data_pin_lock);
+	released = deko_detach_data_user_range_locked(mm, 0, TASK_SIZE_MAX,
+						      &detached);
+	mutex_unlock(&deko_data_pin_lock);
+	deko_release_detached_data_pins(&detached);
+
+	pr_debug("Deko %s released all data pins mm=%px pages=%lu\n",
+		 reason, mm, released);
+	return released;
+}
+EXPORT_SYMBOL_GPL(deko_unpin_all_data_user_ranges);
+
+static bool deko_addr_in_range(unsigned long addr, unsigned long start,
+			       unsigned long end)
+{
+	return start <= addr && addr < end;
+}
+
+/*
+ * Apply pin-key changes only after VMPL0 acknowledged the preceding Linux
+ * memory syscall.  The validation pass is mutation-free; an unexpected
+ * destination collision therefore retains every pin fail-closed.
+ */
+static int deko_apply_data_pin_transition(
+	struct mm_struct *mm, struct deko_data_pin_transition *transition)
+{
+	LIST_HEAD(detached);
+	struct deko_data_pin_entry *entry;
+	unsigned long released = 0;
+	unsigned long preserved;
+	bool moved;
+
+	if (!transition || !transition->awaiting_monitor)
+		return 0;
+	if (!mm)
+		return -EINVAL;
+
+	if (transition->kind == DEKO_DATA_PIN_TRANSITION_NONE) {
+		memset(transition, 0, sizeof(*transition));
+		return 0;
+	}
+
+	mutex_lock(&deko_data_pin_lock);
+	if (transition->kind == DEKO_DATA_PIN_TRANSITION_UNPIN_RANGE) {
+		released = deko_detach_data_user_range_locked(
+			mm, transition->old_start, transition->old_end, &detached);
+		goto out_commit;
+	}
+
+	if (transition->kind != DEKO_DATA_PIN_TRANSITION_MREMAP ||
+	    transition->old_start >= transition->old_end ||
+	    transition->new_start >= transition->new_end) {
+		mutex_unlock(&deko_data_pin_lock);
+		return -EINVAL;
+	}
+
+	preserved = min(transition->old_end - transition->old_start,
+			transition->new_end - transition->new_start);
+	moved = transition->old_start != transition->new_start;
+
+	if (moved) {
+		list_for_each_entry(entry, &deko_data_pin_list, node) {
+			struct deko_data_pin_entry *collision;
+			unsigned long target;
+
+			if (entry->mm != mm)
+				continue;
+			if (deko_addr_in_range(entry->addr,
+					       transition->new_start,
+					       transition->new_end) &&
+			    !transition->replace_destination) {
+				mutex_unlock(&deko_data_pin_lock);
+				return -EEXIST;
+			}
+			if (!deko_addr_in_range(entry->addr,
+						transition->old_start,
+						transition->old_start + preserved))
+				continue;
+
+			target = transition->new_start +
+				 (entry->addr - transition->old_start);
+			collision = deko_data_pin_find_locked(mm, target);
+			if (collision && collision != entry &&
+			    !(transition->replace_destination &&
+			      deko_addr_in_range(collision->addr,
+						 transition->new_start,
+						 transition->new_end))) {
+				mutex_unlock(&deko_data_pin_lock);
+				return -EEXIST;
+			}
+		}
+
+		if (transition->replace_destination)
+			released += deko_detach_data_user_range_locked(
+				mm, transition->new_start, transition->new_end,
+				&detached);
+	}
+
+	released += deko_detach_data_user_range_locked(
+		mm, transition->old_start + preserved, transition->old_end,
+		&detached);
+
+	if (moved) {
+		list_for_each_entry(entry, &deko_data_pin_list, node) {
+			if (entry->mm == mm &&
+			    deko_addr_in_range(entry->addr,
+					       transition->old_start,
+					       transition->old_start + preserved))
+			{
+				hash_del(&entry->addr_hash_node);
+				entry->addr = transition->new_start +
+					      (entry->addr - transition->old_start);
+				hash_add(deko_data_pin_addr_table,
+					 &entry->addr_hash_node,
+					 deko_data_pin_addr_key(mm, entry->addr));
+			}
+		}
+	}
+
+out_commit:
+	mutex_unlock(&deko_data_pin_lock);
+	deko_release_detached_data_pins(&detached);
+	pr_debug("Deko applied data pin transition mm=%px kind=%u released=%lu old=[0x%lx-0x%lx) new=[0x%lx-0x%lx)\n",
+		 mm, transition->kind, released, transition->old_start,
+		 transition->old_end, transition->new_start,
+		 transition->new_end);
+	memset(transition, 0, sizeof(*transition));
+	return 0;
+}
+
 static int deko_fixup_user_fault(struct mm_struct *mm, unsigned long address,
 				 unsigned int flags)
 {
@@ -3374,6 +4082,7 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	unsigned int flags;
 	unsigned int resolve_flags = 0;
 	u64 page_gpa = 0;
+	u64 data_pin_token = 0;
 	bool anon_exclusive = false;
 	bool unshare_exec = false;
 	int ret;
@@ -3424,32 +4133,39 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 		unshare_exec = deko_page_fault_exec_needs_unshare(mm,
 								  req->fault_va);
 	}
-	pr_info("Deko page fault service begin pid=%d seq=%llu fault=0x%llx rip=0x%llx access=0x%x reason=%u flags=0x%x unshare_exec=%d\n",
-		current->pid, (unsigned long long)req->seq,
-		(unsigned long long)req->fault_va,
-		(unsigned long long)req->rip, req->access, req->reason,
-		flags, unshare_exec ? 1 : 0);
 
 	ret = deko_fixup_user_fault(mm, req->fault_va, flags);
-	pr_info("Deko page fault service after fixup pid=%d seq=%llu ret=%d unshare_exec=%d\n",
-		current->pid, (unsigned long long)req->seq, ret,
-		unshare_exec ? 1 : 0);
 	if (!ret && unshare_exec) {
 		ret = deko_fixup_user_fault(mm, req->fault_va,
-					    (flags & ~FAULT_FLAG_WRITE) |
-						    FAULT_FLAG_UNSHARE);
-		pr_info("Deko page fault service after unshare pid=%d seq=%llu ret=%d\n",
-			current->pid, (unsigned long long)req->seq, ret);
-		if (!ret &&
-		    deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
-						&anon_exclusive) &&
-		    anon_exclusive) {
-			pr_info("Deko page fault service private page pid=%d seq=%llu gpa=0x%llx\n",
-				current->pid, (unsigned long long)req->seq,
-				(unsigned long long)page_gpa);
-			resolve_flags |= DEKO_PF_RESOLVE_F_FRESH_PAGE |
-					 DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE;
+						    (flags & ~FAULT_FLAG_WRITE) |
+							    FAULT_FLAG_UNSHARE);
+	}
+
+	/*
+	 * Data admission requires a durable FOLL_PIN reference. The helper also
+	 * forces a private COW for read-first anonymous/RODATA faults, so the
+	 * kernel-global zero page can never be advertised for RMP transfer.
+	 * Executable pages retain their separate exec-pin lifecycle.
+	 */
+	if (!ret && !(req->access & DEKO_PF_ACCESS_INSTR)) {
+		ret = deko_pin_private_data_page(mm, req->fault_va,
+						 &data_pin_token, &page_gpa);
+		if (!ret) {
+			anon_exclusive = true;
+			resolve_flags |= DEKO_PF_RESOLVE_F_DATA_PINNED;
 		}
+	} else if (!ret &&
+		   !deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
+						&anon_exclusive)) {
+		pr_warn("Deko page fault service could not resolve executable leaf frame pid=%d seq=%llu fault=0x%llx\n",
+			current->pid, (unsigned long long)req->seq,
+			(unsigned long long)req->fault_va);
+		ret = -EFAULT;
+	}
+	if (!ret && anon_exclusive) {
+		resolve_flags |= DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE;
+		if (req->reason == DEKO_PF_REASON_DEMAND)
+			resolve_flags |= DEKO_PF_RESOLVE_F_FRESH_PAGE;
 	}
 
 out_response:
@@ -3461,6 +4177,8 @@ out_response:
 	resp->page_flags = ret ? 0 : resolve_flags;
 	resp->page_gpa = ret ? 0 : page_gpa;
 	resp->page_len = ret ? 0 : PAGE_SIZE;
+	resp->backing_id = ret ? 0 : data_pin_token;
+	resp->backing_offset = ret || !data_pin_token ? 0 : req->page_va;
 
 	if (unlikely(ret))
 		pr_warn("page fault resolve failed pid=%d fault=0x%llx access=0x%x reason=%u ret=%d\n",
@@ -3557,7 +4275,8 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					 struct deko_shared_buf *buf,
 					 bool *normal_exit,
 					 int *exit_code,
-					 struct deko_ring_poller *poller)
+					 struct deko_ring_poller *poller,
+					 struct deko_data_pin_transition *pin_transition)
 {
 	u64 handled_syscall_nr;
 	unsigned long flags;
@@ -3574,7 +4293,8 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 			ret = deko_syscall_ring_drain(buf, normal_exit,
 						      &ring_handled,
 						      &ring_present,
-						      exit_code);
+						      exit_code,
+						      pin_transition);
 			if (ret != 0)
 				return ret;
 			if (ring_present && poller && poller->task)
@@ -3594,7 +4314,8 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 		handled_syscall_nr = buf->syscall_body.ax;
 		if (is_exit_syscall(handled_syscall_nr) && exit_code)
 			*exit_code = (int)(buf->syscall_body.di & 0xff);
-		ret = deko_app_handle_system_calls(&buf->syscall_body);
+		ret = deko_app_handle_system_calls(&buf->syscall_body,
+						   pin_transition);
 		if (ret != 0) {
 			pr_err("Error handling system calls: %d\n", ret);
 			return ret;
@@ -3672,6 +4393,7 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_migration_state migration = { 0 };
 	struct deko_handoff_checkpoint checkpoint = { 0 };
 	struct deko_page_fault_progress page_fault_progress = { 0 };
+	struct deko_data_pin_transition pin_transition = { 0 };
 	struct deko_ring_poller *poller = NULL;
 
 	struct deko_task_work *dw =
@@ -3719,7 +4441,14 @@ void deko_proxy_loop(struct callback_head *work)
 	 * Linux on demand before VMPL1 retries the faulting instruction.
 	 */
 
-	buf = kzalloc(sizeof(struct deko_shared_buf), GFP_KERNEL);
+	/*
+	 * VMPL0 rewalks this untrusted control-buffer VA before consuming a
+	 * memory-syscall completion and requires a stable 4 KiB leaf mapping.
+	 * A kmalloc allocation can live in a huge direct-map leaf, so keep the
+	 * complete control structure in one dedicated vmalloc page instead.
+	 */
+	BUILD_BUG_ON(sizeof(*buf) > PAGE_SIZE);
+	buf = vzalloc(PAGE_SIZE);
 	if (!buf) {
 		pr_err("Failed to allocate shared buffer for task %d\n",
 		       current->pid);
@@ -3828,8 +4557,22 @@ void deko_proxy_loop(struct callback_head *work)
 		if (unlikely(errno < 0))
 			goto err_loop;
 
+		/*
+		 * The successful launch reconciled the preceding memory completion
+		 * before VMPL1 ran.  Only now may Linux drop or re-key its FOLL_PIN
+		 * references for frames VMPL0 released or moved.
+		 */
+		errno = deko_apply_data_pin_transition(current->mm,
+						       &pin_transition);
+		if (unlikely(errno < 0)) {
+			pr_err("Deko data pin transition failed after monitor acknowledgement pid=%d iter=%llu err=%d\n",
+			       current->pid, iteration, errno);
+			goto err_loop;
+		}
+
 		errno = deko_handle_vmpl1_exit_reason(
-			&call, buf, &normal_exit, &exit_code, poller);
+			&call, buf, &normal_exit, &exit_code, poller,
+			&pin_transition);
 
 		if (unlikely(errno < 0) || normal_exit)
 			goto err_loop;
@@ -3864,7 +4607,7 @@ err_loop:
 
 err_inner_buf:
 err_alias:
-	kfree(buf);
+	vfree(buf);
 
 	deko_free_hidden_user_alias(alias_addr, DEKO_DEFAULT_SHARED_BUF_SIZE);
 

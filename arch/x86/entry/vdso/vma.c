@@ -144,8 +144,10 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 
-	addr = get_unmapped_area(NULL, addr,
-				 image->size + __VDSO_PAGES * PAGE_SIZE, 0, 0);
+	/* The allocation contains executable vDSO text after the vvar pages. */
+	addr = __get_unmapped_area(NULL, addr,
+				   image->size + __VDSO_PAGES * PAGE_SIZE, 0, 0,
+				   VM_EXEC);
 	if (IS_ERR_VALUE(addr)) {
 		ret = addr;
 		goto up_fail;
@@ -233,8 +235,27 @@ static int load_vdso32(void)
 	return map_vdso(&vdso_image_32, 0);
 }
 
+static bool deko_exec_omits_vdso(void)
+{
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/*
+	 * vvar contains lazy PFNMAP leaves immediately adjacent to vDSO text.
+	 * Placing that mixed special mapping in Deko's immutable executable
+	 * subtree would let a first clock read require a post-freeze PTE install.
+	 * Keep the reserved slot exclusive; libc will use the mediated syscall
+	 * fallback for protected images.
+	 */
+	return current->mm && READ_ONCE(current->mm->deko_exec_span);
+#else
+	return false;
+#endif
+}
+
 int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 {
+	if (deko_exec_omits_vdso())
+		return 0;
+
 	if (IS_ENABLED(CONFIG_X86_64)) {
 		if (!vdso64_enabled)
 			return 0;
@@ -249,6 +270,9 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 int compat_arch_setup_additional_pages(struct linux_binprm *bprm,
 				       int uses_interp, bool x32)
 {
+	if (deko_exec_omits_vdso())
+		return 0;
+
 	if (IS_ENABLED(CONFIG_X86_X32_ABI) && x32) {
 		if (!vdso64_enabled)
 			return 0;

@@ -1178,17 +1178,63 @@ static int force_map_va_range(unsigned long va_start, unsigned long va_end,
 					 pa_start, flags, true);
 }
 
-static int map_vmpl1_percpu_current_mm(struct mm_struct *mm)
+static pgd_t *svsm_vmpl1_pgd(struct mm_struct *mm)
+{
+#ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
+	if (boot_cpu_has(X86_FEATURE_PTI))
+		return kernel_to_user_pgdp(mm->pgd);
+#endif
+	return mm->pgd;
+}
+
+static void mirror_kernel_half_to_vmpl1_pgd(struct mm_struct *mm,
+					     pgd_t *vmpl1_pgd)
+{
+	unsigned int index;
+
+	if (vmpl1_pgd == mm->pgd)
+		return;
+
+	/*
+	 * The PTI root is used as Linux's VMPL1 execution root.  Keep its lower
+	 * half on Linux's ordinary shared user page-table descendants, and share
+	 * the existing Linux high-half descendants needed by the syscall
+	 * trampoline, per-CPU state, and vmalloc-backed control buffer.  Avoid
+	 * rewriting unchanged root entries after VMPL0 has committed the root.
+	 */
+	for (index = PTRS_PER_PGD / 2; index < PTRS_PER_PGD; index++) {
+		pgd_t entry = READ_ONCE(mm->pgd[index]);
+
+		if (pgd_val(READ_ONCE(vmpl1_pgd[index])) != pgd_val(entry))
+			set_pgd(&vmpl1_pgd[index], entry);
+	}
+}
+
+static int map_vmpl1_percpu_in_pgd(pgd_t *pgd_base)
 {
 	int cpu = smp_processor_id();
 	phys_addr_t pa = this_cpu_read(svsm_vmpl1_percpu_pa);
 	unsigned long va = SVSM_PERCPU_BASE + (cpu * PMD_SIZE);
 	int ret;
 
-	if (!mm || !pa)
-		return -EINVAL;
+	/*
+	 * Bootstrap maps the interface on every online CPU, but a CPU that was
+	 * not online at that instant has no per-CPU page recorded.  Refresh the
+	 * monitor-supplied interface on the execution CPU before preparing an mm.
+	 */
+	if (!pa) {
+		if (svsm_map_vmpl1() != ES_OK)
+			return -EIO;
+		pa = this_cpu_read(svsm_vmpl1_percpu_pa);
+	}
 
-	ret = force_map_va_range_in_pgd(mm->pgd, va, va + PAGE_SIZE, pa,
+	if (!pgd_base || !pa) {
+		pr_err("SVSM: CPU%d missing VMPL1 per-cpu mapping state pgd=%px pa=%llx\n",
+		       cpu, pgd_base, (unsigned long long)pa);
+		return -EINVAL;
+	}
+
+	ret = force_map_va_range_in_pgd(pgd_base, va, va + PAGE_SIZE, pa,
 					0x163, true);
 	if (ret)
 		pr_err("SVSM: CPU%d failed to map VMPL1 per-cpu VA %lx into current mm, PA %llx ret=%d\n",
@@ -1301,11 +1347,14 @@ int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 {
 	unsigned long ghcb_va = this_cpu_read(svsm_vmpl1_ghcb_va);
 	unsigned long db_va = this_cpu_read(svsm_vmpl1_db_va);
+	pgd_t *vmpl1_pgd;
 	u16 i, map_count = READ_ONCE(svsm_vmpl1_global_map_count);
 	int ret;
 
 	if (!mm)
 		return -EINVAL;
+	vmpl1_pgd = svsm_vmpl1_pgd(mm);
+	mirror_kernel_half_to_vmpl1_pgd(mm, vmpl1_pgd);
 
 	for (i = 0; i < map_count; i++) {
 		struct svsm_map_ifc_single_req *map = &svsm_vmpl1_global_maps[i];
@@ -1318,16 +1367,38 @@ int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 			       map->va_start, map->va_end, map->pa_start, ret);
 			return ret;
 		}
+		if (vmpl1_pgd != mm->pgd) {
+			ret = force_map_va_range_in_pgd(vmpl1_pgd, map->va_start,
+						map->va_end, map->pa_start,
+						0x163, false);
+			if (ret) {
+				pr_err("SVSM: failed to map VMPL1 global VA %llx..%llx into PTI user root, PA %llx ret=%d\n",
+				       map->va_start, map->va_end,
+				       map->pa_start, ret);
+				return ret;
+			}
+		}
 	}
 
-	ret = map_vmpl1_percpu_current_mm(mm);
+	ret = map_vmpl1_percpu_in_pgd(mm->pgd);
 	if (ret)
 		return ret;
+	if (vmpl1_pgd != mm->pgd) {
+		ret = map_vmpl1_percpu_in_pgd(vmpl1_pgd);
+		if (ret)
+			return ret;
+	}
 
 	if (ghcb_va)
 		make_va_decrypted_in_pgd(mm->pgd, ghcb_va);
 	if (db_va)
 		make_va_decrypted_in_pgd(mm->pgd, db_va);
+	if (vmpl1_pgd != mm->pgd) {
+		if (ghcb_va)
+			make_va_decrypted_in_pgd(vmpl1_pgd, ghcb_va);
+		if (db_va)
+			make_va_decrypted_in_pgd(vmpl1_pgd, db_va);
+	}
 
 	__flush_tlb_all();
 	return 0;
@@ -1556,7 +1627,8 @@ static void deko_log_report_vmas_locked(const struct deko_new_app_req *req,
 }
 
 static void deko_fill_req_regions(struct deko_new_app_req *req,
-				  struct task_struct *task)
+				  struct task_struct *task,
+				  bool data_pins_ready)
 {
 	struct mm_struct *mm = task->mm;
 	struct vm_area_struct *vma;
@@ -1564,6 +1636,13 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 
 	if (!mm)
 		return;
+	if (READ_ONCE(mm->deko_exec_span)) {
+		req->exec_span_base =
+			READ_ONCE(mm->deko_exec_span_base);
+		req->exec_span_size = DEKO_EXEC_SPAN_SIZE;
+		req->exec_span_pml4_index =
+			req->exec_span_base >> DEKO_EXEC_SPAN_SHIFT;
+	}
 
 	vma_iter_init(&vmi, mm, 0);
 
@@ -1591,6 +1670,8 @@ static void deko_fill_req_regions(struct deko_new_app_req *req,
 		if ((perm & DEKO_REGION_X) && is_cow_mapping(vma->vm_flags))
 			flags |= DEKO_REGION_F_COW_ELIGIBLE |
 				 DEKO_REGION_F_MEASURE_ON_FAULT;
+		if (!(perm & DEKO_REGION_X) && data_pins_ready)
+			flags |= DEKO_REGION_F_DATA_PINNED;
 
 		if (!deko_append_region(req, kind, perm, flags, start, end,
 					start, end))
@@ -1610,6 +1691,7 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	struct deko_new_app_req *tmp;
 	struct svsm_call call = { 0 };
 	bool creation = report_kind != DEKO_REPORT_APP_LIFECYCLE;
+	bool data_pins_ready = false;
 	unsigned long flags;
 	int call_ret;
 
@@ -1617,7 +1699,10 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	if (!tmp)
 		return ES_UNSUPPORTED;
 
-	tmp->version = DEKO_NEW_APP_REQ_VERSION_V3;
+	BUILD_BUG_ON(DEKO_NEW_APP_REQ_SIZE_V3 != 0xfa8);
+	BUILD_BUG_ON(sizeof(*tmp) > sizeof(svsm_get_caa()->svsm_buffer));
+
+	tmp->version = DEKO_NEW_APP_REQ_VERSION_V4;
 	tmp->req_size = sizeof(*tmp);
 	tmp->pid = task->pid;
 	tmp->ppid = (task == current) ? task->real_parent->pid : current->pid;
@@ -1657,6 +1742,8 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	}
 
 	if (task->mm) {
+		int data_pin_ret;
+
 		if (task == current) {
 			int prepare_ret;
 
@@ -1664,13 +1751,47 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 			prepare_ret = svsm_prepare_vmpl1_current_mm(task->mm);
 			migrate_enable();
 			if (prepare_ret) {
+				pr_err("report_app VMPL1 root preparation failed: pid=%d comm=%s ret=%d\n",
+				       task->pid, task->comm, prepare_ret);
+				ret = ES_UNSUPPORTED;
+				goto out_free;
+			}
+		}
+
+		/*
+		 * Pin every currently-present private data leaf before publishing
+		 * the launch layout. VMPL0 treats the marker only as a liveness
+		 * handshake and independently rewalks each leaf before admission.
+		 */
+		data_pin_ret = deko_pin_present_private_data_vmas(task->mm,
+							   "app-report");
+		if (data_pin_ret < 0) {
+			pr_err("report_app data pin scan failed: pid=%d comm=%s ret=%d\n",
+			       task->pid, task->comm, data_pin_ret);
+			ret = ES_UNSUPPORTED;
+			goto out_free;
+		}
+		data_pins_ready = true;
+
+		/*
+		 * Pinning can fault the stack or another data VMA into a previously
+		 * absent PML4 slot.  Normalize the final Linux PTI user root only
+		 * after those mappings exist, immediately before publishing it to
+		 * VMPL0 for validation and locking.
+		 */
+		if (ty == DEKO_DOCKER_APPS && creation) {
+			int root_ret = deko_prepare_exec_root(task->mm);
+
+			if (root_ret) {
+				pr_err("report_app root normalization failed: pid=%d comm=%s ret=%d\n",
+				       task->pid, task->comm, root_ret);
 				ret = ES_UNSUPPORTED;
 				goto out_free;
 			}
 		}
 
 		mmap_read_lock(task->mm);
-		deko_fill_req_regions(tmp, task);
+		deko_fill_req_regions(tmp, task, data_pins_ready);
 		if (deko_should_log_report_vmas(tmp->launch_identity))
 			deko_log_report_vmas_locked(tmp, task);
 		mmap_read_unlock(task->mm);
@@ -1706,6 +1827,18 @@ enum es_result svsm_deko_new_app_req(struct task_struct *task, u64 ns_id,
 	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_REPORT_APP);
 
 	call_ret = svsm_perform_call_protocol(&call);
+	if (call_ret == -EINVAL) {
+		/*
+		 * The pre-A3 monitor accepts only the unchanged V3 prefix.  Retry
+		 * format rejection with that prefix; an A3 monitor rejects this
+		 * retry as well when V4 is mandatory, preserving fail-closed
+		 * behavior for missing span metadata.
+		 */
+		memcpy(req, tmp, sizeof(*tmp));
+		req->version = DEKO_NEW_APP_REQ_VERSION_V3;
+		req->req_size = DEKO_NEW_APP_REQ_SIZE_V3;
+		call_ret = svsm_perform_call_protocol(&call);
+	}
 	memcpy(tmp, req, sizeof(*tmp));
 
 	local_irq_restore(flags);

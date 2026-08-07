@@ -1267,6 +1267,16 @@ void exit_mmap(struct mm_struct *mm)
 			pr_err("Deko: failed to unlift exec ranges during %s pid=%d ret=%d\n",
 			       __func__, current->pid, deko_ret);
 	}
+	/*
+	 * A cleared binding means the VMPL0 exit report completed, including
+	 * protected-data quarantine, scrub, ledger removal, and VMPL2 restore.
+	 * Retain pins fail-closed when that acknowledgement is missing.
+	 */
+	if (!current->is_monitored)
+		deko_unpin_all_data_user_ranges(mm, "exit_mmap");
+	else
+		pr_warn("Deko: retaining data pins after unacknowledged monitor exit pid=%d\n",
+			current->pid);
 
 	mmap_read_lock(mm);
 	arch_exit_mmap(mm);

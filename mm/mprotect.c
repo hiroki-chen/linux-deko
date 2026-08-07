@@ -35,6 +35,9 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+#endif
 
 #include "internal.h"
 
@@ -809,6 +812,9 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 				(prot & PROT_READ);
 	struct mmu_gather tlb;
 	struct vma_iterator vmi;
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	unsigned long deko_span_base;
+#endif
 
 	start = untagged_addr(start);
 
@@ -863,6 +869,19 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 				goto out;
 		}
 	}
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/* READ_IMPLIES_EXEC can add execute permission without PROT_EXEC. */
+	deko_span_base = READ_ONCE(current->mm->deko_exec_span_base);
+	if (READ_ONCE(current->mm->deko_exec_span) &&
+	    ((prot & PROT_EXEC) || rier) &&
+	    !deko_range_within_exec_span(deko_span_base, start, end - start)) {
+		pr_warn_ratelimited("Deko rejected executable mprotect outside immutable exec span pid=%d range=[0x%lx-0x%lx)\n",
+				    current->pid, start, end);
+		error = -EACCES;
+		goto out;
+	}
+#endif
 
 	prev = vma_prev(&vmi);
 	if (start > vma->vm_start)

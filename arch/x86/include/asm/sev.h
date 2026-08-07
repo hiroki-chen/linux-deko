@@ -43,6 +43,7 @@ enum deko_new_app_type {
 };
 
 #define DEKO_NEW_APP_REQ_VERSION_V3 3
+#define DEKO_NEW_APP_REQ_VERSION_V4 4
 #define DEKO_PROTOCOL_NEGOTIATE_REQ_VERSION_V1 1
 #define DEKO_PAGE_FAULT_REQ_VERSION_V1 1
 #define DEKO_PAGE_FAULT_RESP_VERSION_V1 1
@@ -53,6 +54,11 @@ enum deko_new_app_type {
 #define DEKO_REPORT_APP_LIFECYCLE 0
 #define DEKO_REPORT_APP_EXEC_CREATE 1
 #define DEKO_REPORT_APP_FORK_CREATE 2
+
+#define DEKO_EXEC_SPAN_SHIFT 39
+#define DEKO_EXEC_SPAN_SIZE BIT(39)
+#define DEKO_EXEC_SPAN_ASLR_SIZE BIT(30)
+#define DEKO_MAP_ELF_IMAGE BIT(63)
 
 enum deko_launch_type {
 	DEKO_LAUNCH_TYPE_LEGACY = 0,
@@ -83,6 +89,7 @@ enum deko_region_flags {
 	DEKO_REGION_F_LAZY = 1u << 3,
 	DEKO_REGION_F_COW_ELIGIBLE = 1u << 4,
 	DEKO_REGION_F_MEASURE_ON_FAULT = 1u << 5,
+	DEKO_REGION_F_DATA_PINNED = 1u << 6,
 };
 
 enum deko_feature_flags {
@@ -130,6 +137,7 @@ enum deko_page_fault_resolve_flags {
 	DEKO_PF_RESOLVE_F_ZEROED = 1u << 1,
 	DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE = 1u << 2,
 	DEKO_PF_RESOLVE_F_FILE_BACKED = 1u << 3,
+	DEKO_PF_RESOLVE_F_DATA_PINNED = 1u << 4,
 };
 
 enum deko_aspace_op {
@@ -172,7 +180,35 @@ struct deko_new_app_req {
 	enum deko_new_app_type app_type;
 	u32 domain_id;
 	struct deko_base_region_desc regions[DEKO_MAX_BASE_REGIONS];
+	__u64 exec_span_base;
+	__u64 exec_span_size;
+	__u32 exec_span_pml4_index;
+	__u32 reserved;
 } __attribute__((aligned(8)));
+
+#define DEKO_NEW_APP_REQ_SIZE_V3 \
+	((u32)offsetof(struct deko_new_app_req, exec_span_base))
+
+static inline bool deko_range_within_exec_span(unsigned long span_base,
+					       unsigned long addr,
+					       unsigned long len)
+{
+	return len && len <= DEKO_EXEC_SPAN_SIZE &&
+	       addr >= span_base &&
+	       addr - span_base <= DEKO_EXEC_SPAN_SIZE - len;
+}
+
+static inline bool deko_range_overlaps_exec_span(unsigned long span_base,
+						 unsigned long addr,
+						 unsigned long len)
+{
+	if (!len || addr >= span_base + DEKO_EXEC_SPAN_SIZE)
+		return false;
+	if (addr >= span_base)
+		return true;
+
+	return len > span_base - addr;
+}
 
 struct deko_launch_app_req {
 	struct pt_regs regs;
@@ -326,6 +362,7 @@ static inline u64 lower_bits(u64 val, unsigned int bits)
 
 struct real_mode_header;
 enum stack_type;
+struct file;
 
 extern enum es_result svsm_deko_new_app_req(struct task_struct *tas, u64 ns_id,
 					    const char *launch_identity,
@@ -341,6 +378,20 @@ extern int deko_unlift_exec_user_range(struct mm_struct *mm,
 				       const char *reason);
 extern int deko_unlift_all_exec_user_ranges(struct mm_struct *mm,
 					    const char *reason);
+bool deko_exec_span_area(unsigned long addr, unsigned long len,
+			 unsigned long flags, unsigned long vm_flags,
+			 unsigned long align_mask,
+			 unsigned long align_offset,
+			 unsigned long start_gap,
+			 unsigned long *result);
+int deko_select_exec_span(struct mm_struct *mm);
+int deko_prepare_exec_root(struct mm_struct *mm);
+bool deko_exec_span_elf_image(struct file *file, unsigned long pgoff,
+			      unsigned long len);
+extern int deko_pin_present_private_data_vmas(struct mm_struct *mm,
+					       const char *reason);
+extern unsigned long deko_unpin_all_data_user_ranges(struct mm_struct *mm,
+						      const char *reason);
 extern int deko_prepare_clone_child_before_wake(struct task_struct *child);
 extern void deko_task_exit(void);
 extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);

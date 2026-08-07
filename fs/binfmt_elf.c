@@ -113,6 +113,33 @@ static struct linux_binfmt elf_format = {
 
 #define BAD_ADDR(x) (unlikely((unsigned long)(x) >= TASK_SIZE))
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+static unsigned long deko_elf_exec_span_addr(unsigned long len,
+					     unsigned long alignment)
+{
+	unsigned long span_base =
+		READ_ONCE(current->mm->deko_exec_span_base);
+	struct vm_unmapped_area_info info = {
+		.length = ELF_PAGEALIGN(len),
+		.low_limit = span_base,
+		.high_limit = span_base + DEKO_EXEC_SPAN_SIZE,
+	};
+	unsigned long addr;
+
+	if (!info.length || info.length > DEKO_EXEC_SPAN_SIZE ||
+	    alignment > DEKO_EXEC_SPAN_SIZE)
+		return -ENOMEM;
+	if (alignment)
+		info.align_mask = alignment - 1;
+
+	mmap_read_lock(current->mm);
+	addr = vm_unmapped_area(&info);
+	mmap_read_unlock(current->mm);
+
+	return addr;
+}
+#endif
+
 static inline void elf_coredump_set_mm_eflags(struct mm_struct *mm, u32 flags)
 {
 #ifdef CONFIG_ARCH_HAS_ELF_CORE_EFLAGS
@@ -655,13 +682,14 @@ static inline int make_prot(u32 p_flags, struct arch_elf_state *arch_state,
 static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 		struct file *interpreter,
 		unsigned long no_base, struct elf_phdr *interp_elf_phdata,
-		struct arch_elf_state *arch_state)
+		struct arch_elf_state *arch_state, bool use_exec_span)
 {
 	struct elf_phdr *eppnt;
 	unsigned long load_addr = 0;
 	int load_addr_set = 0;
 	unsigned long error = ~0UL;
 	unsigned long total_size;
+	unsigned long alignment = 0;
 	int i;
 
 	/* First of all, some simple consistency checks */
@@ -680,6 +708,11 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 		error = -EINVAL;
 		goto out;
 	}
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (use_exec_span)
+		alignment = maximum_alignment(interp_elf_phdata,
+					      interp_elf_ex->e_phnum);
+#endif
 
 	eppnt = interp_elf_phdata;
 	for (i = 0; i < interp_elf_ex->e_phnum; i++, eppnt++) {
@@ -691,10 +724,26 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 			unsigned long k, map_addr;
 
 			vaddr = eppnt->p_vaddr;
-			if (interp_elf_ex->e_type == ET_EXEC || load_addr_set)
+			if (use_exec_span && !load_addr_set) {
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+				unsigned long span_addr;
+
+				span_addr = deko_elf_exec_span_addr(total_size, alignment);
+				if (IS_ERR_VALUE(span_addr)) {
+					error = span_addr;
+					goto out;
+				}
+				load_addr = span_addr - ELF_PAGESTART(vaddr);
+				elf_type |= MAP_FIXED_NOREPLACE;
+#else
+				error = -ENOMEM;
+				goto out;
+#endif
+			} else if (interp_elf_ex->e_type == ET_EXEC || load_addr_set) {
 				elf_type |= MAP_FIXED;
-			else if (no_base && interp_elf_ex->e_type == ET_DYN)
+			} else if (no_base && interp_elf_ex->e_type == ET_DYN) {
 				load_addr = -vaddr;
+			}
 
 			map_addr = elf_load(interpreter, load_addr + vaddr,
 					eppnt, elf_prot, elf_type, total_size);
@@ -703,8 +752,10 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 			if (BAD_ADDR(map_addr))
 				goto out;
 
-			if (!load_addr_set &&
-			    interp_elf_ex->e_type == ET_DYN) {
+			if (!load_addr_set && use_exec_span) {
+				load_addr_set = 1;
+			} else if (!load_addr_set &&
+				   interp_elf_ex->e_type == ET_DYN) {
 				load_addr = map_addr - ELF_PAGESTART(vaddr);
 				load_addr_set = 1;
 			}
@@ -855,6 +906,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	unsigned long interp_load_addr = 0;
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long reloc_func_desc __maybe_unused = 0;
+	bool is_app = false;
 	int executable_stack = EXSTACK_DEFAULT;
 	struct elfhdr *elf_ex = (struct elfhdr *)bprm->buf;
 	struct elfhdr *interp_elf_ex = NULL;
@@ -862,7 +914,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct mm_struct *mm;
 	struct pt_regs *regs;
 #ifdef CONFIG_AMD_MEM_ENCRYPT
-	bool is_app = false;
+	u32 deko_domain_id = 0;
 	enum es_result res = ES_OK;
 	struct deko_task_work *dw;
 #endif
@@ -1038,6 +1090,24 @@ out_free_interp:
 
 	setup_new_exec(bprm);
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (!(current->flags & PF_KTHREAD) && sysctl_enable_vmpl_tramp &&
+	    current->nsproxy && current->nsproxy->mnt_ns &&
+	    !deko_domain_lookup(current->nsproxy->mnt_ns->ns.inum,
+				&deko_domain_id))
+		is_app = true;
+
+	if (is_app) {
+		if (executable_stack == EXSTACK_ENABLE_X) {
+			retval = -EACCES;
+			goto out_free_dentry;
+		}
+		retval = deko_select_exec_span(current->mm);
+		if (retval)
+			goto out_free_dentry;
+	}
+#endif
+
 	/* Do this so that we can load the interpreter, if need be.  We will
 	   change some of these later */
 	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
@@ -1078,7 +1148,37 @@ out_free_interp:
 		 */
 		if (!first_pt_load) {
 			elf_flags |= MAP_FIXED;
-		} else if (elf_ex->e_type == ET_EXEC) {
+		}
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+		else if (is_app) {
+			unsigned long span_base;
+
+			total_size = total_mapping_size(elf_phdata,
+							elf_ex->e_phnum);
+			if (!total_size) {
+				retval = -EINVAL;
+				goto out_free_dentry;
+			}
+
+			alignment = maximum_alignment(elf_phdata,
+						      elf_ex->e_phnum);
+			span_base = READ_ONCE(current->mm->deko_exec_span_base);
+			load_bias = span_base;
+			if (current->flags & PF_RANDOMIZE)
+				load_bias += arch_mmap_rnd() &
+					     (DEKO_EXEC_SPAN_ASLR_SIZE - 1);
+			if (alignment)
+				load_bias &= ~(alignment - 1);
+			total_size = ELF_PAGEALIGN(total_size);
+			if (!deko_range_within_exec_span(span_base, load_bias,
+							 total_size)) {
+				retval = -ENOMEM;
+				goto out_free_dentry;
+			}
+			elf_flags |= MAP_FIXED_NOREPLACE;
+		}
+#endif
+		else if (elf_ex->e_type == ET_EXEC) {
 			/*
 			 * This logic is run once for the first LOAD Program
 			 * Header for ET_EXEC binaries. No special handling
@@ -1199,6 +1299,8 @@ out_free_interp:
 			 */
 			load_bias = ELF_PAGESTART(load_bias - vaddr);
 		}
+		if (first_pt_load && is_app)
+			load_bias = ELF_PAGESTART(load_bias - vaddr);
 
 		error = elf_load(bprm->file, load_bias + vaddr, elf_ppnt,
 				elf_prot, elf_flags, total_size);
@@ -1269,7 +1371,7 @@ out_free_interp:
 		elf_entry = load_elf_interp(interp_elf_ex,
 					    interpreter,
 					    load_bias, interp_elf_phdata,
-					    &arch_state);
+					    &arch_state, is_app);
 		if (!IS_ERR_VALUE(elf_entry)) {
 			/*
 			 * load_elf_interp() returns relocation
@@ -1335,9 +1437,10 @@ out_free_interp:
 	 * In the CONFIG_COMPAT_BRK case, though, everything is turned
 	 * off because we're not allowed to move the brk at all.
 	 */
-	if (!IS_ENABLED(CONFIG_COMPAT_BRK) &&
-	    IS_ENABLED(CONFIG_ARCH_HAS_ELF_RANDOMIZE) &&
-	    elf_ex->e_type == ET_DYN && !interpreter) {
+	if (is_app ||
+	    (!IS_ENABLED(CONFIG_COMPAT_BRK) &&
+	     IS_ENABLED(CONFIG_ARCH_HAS_ELF_RANDOMIZE) &&
+	     elf_ex->e_type == ET_DYN && !interpreter)) {
 		elf_brk = ELF_ET_DYN_BASE;
 		/* This counts as moving the brk, so let brk(2) know. */
 		brk_moved = true;
@@ -1395,19 +1498,8 @@ out_free_interp:
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 	regs = current_pt_regs();
-	is_app = false;
 	{
-		u32 deko_domain_id = 0;
 		const char *deko_launch_identity = kbasename(bprm->filename);
-
-		if (current->flags & PF_KTHREAD)
-			goto out_deko;
-
-		if (sysctl_enable_vmpl_tramp && current->nsproxy &&
-		    current->nsproxy->mnt_ns &&
-		    !deko_domain_lookup(current->nsproxy->mnt_ns->ns.inum,
-					&deko_domain_id))
-			is_app = true;
 
 		if (!is_app)
 			goto out_deko;

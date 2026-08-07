@@ -22,6 +22,47 @@
 
 #include <asm/elf.h>
 #include <asm/ia32.h>
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <asm/sev.h>
+
+static unsigned long
+deko_unmapped_area_outside_exec_span(struct vm_unmapped_area_info *info)
+{
+	struct vm_unmapped_area_info outside = *info;
+	struct mm_struct *mm = current->mm;
+	unsigned long span_base = READ_ONCE(mm->deko_exec_span_base);
+	unsigned long span_end = span_base + DEKO_EXEC_SPAN_SIZE;
+	unsigned long addr;
+
+	if (info->flags & VM_UNMAPPED_AREA_TOPDOWN) {
+		if (info->high_limit > span_end) {
+			outside.low_limit = max(info->low_limit, span_end);
+			addr = vm_unmapped_area(&outside);
+			if (!IS_ERR_VALUE(addr))
+				return addr;
+		}
+		if (info->low_limit < span_base) {
+			outside = *info;
+			outside.high_limit = min(info->high_limit, span_base);
+			return vm_unmapped_area(&outside);
+		}
+	} else {
+		if (info->low_limit < span_base) {
+			outside.high_limit = min(info->high_limit, span_base);
+			addr = vm_unmapped_area(&outside);
+			if (!IS_ERR_VALUE(addr))
+				return addr;
+		}
+		if (info->high_limit > span_end) {
+			outside = *info;
+			outside.low_limit = max(info->low_limit, span_end);
+			return vm_unmapped_area(&outside);
+		}
+	}
+
+	return -ENOMEM;
+}
+#endif
 
 /*
  * Align a virtual address to avoid aliasing in the I$ on AMD F15h.
@@ -132,6 +173,27 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
 	struct vm_unmapped_area_info info = {};
 	unsigned long begin, end;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	{
+		unsigned long align_mask = 0;
+		unsigned long align_offset = 0;
+		unsigned long deko_addr;
+		unsigned long start_gap = 0;
+
+		if (!(filp && is_file_hugepages(filp))) {
+			align_offset = pgoff << PAGE_SHIFT;
+			start_gap = stack_guard_placement(vm_flags);
+		}
+		if (filp) {
+			align_mask = get_align_mask(filp);
+			align_offset += get_align_bits();
+		}
+		if (deko_exec_span_area(addr, len, flags, vm_flags, align_mask,
+					align_offset, start_gap, &deko_addr))
+			return deko_addr;
+	}
+#endif
+
 	if (flags & MAP_FIXED)
 		return addr;
 
@@ -160,6 +222,10 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
 		info.align_offset += get_align_bits();
 	}
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (READ_ONCE(mm->deko_exec_span) && !(vm_flags & VM_EXEC))
+		return deko_unmapped_area_outside_exec_span(&info);
+#endif
 	return vm_unmapped_area(&info);
 }
 
@@ -172,6 +238,27 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
 	struct mm_struct *mm = current->mm;
 	unsigned long addr = addr0;
 	struct vm_unmapped_area_info info = {};
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	{
+		unsigned long align_mask = 0;
+		unsigned long align_offset = 0;
+		unsigned long deko_addr;
+		unsigned long start_gap = 0;
+
+		if (!(filp && is_file_hugepages(filp))) {
+			align_offset = pgoff << PAGE_SHIFT;
+			start_gap = stack_guard_placement(vm_flags);
+		}
+		if (filp) {
+			align_mask = get_align_mask(filp);
+			align_offset += get_align_bits();
+		}
+		if (deko_exec_span_area(addr, len, flags, vm_flags, align_mask,
+					align_offset, start_gap, &deko_addr))
+			return deko_addr;
+	}
+#endif
 
 	/* requested length too big for entire address space */
 	if (len > TASK_SIZE)
@@ -224,7 +311,12 @@ get_unmapped_area:
 		info.align_mask = get_align_mask(filp);
 		info.align_offset += get_align_bits();
 	}
-	addr = vm_unmapped_area(&info);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	if (READ_ONCE(mm->deko_exec_span) && !(vm_flags & VM_EXEC))
+		addr = deko_unmapped_area_outside_exec_span(&info);
+	else
+#endif
+		addr = vm_unmapped_area(&info);
 	if (!(addr & ~PAGE_MASK))
 		return addr;
 	VM_BUG_ON(addr != -ENOMEM);
