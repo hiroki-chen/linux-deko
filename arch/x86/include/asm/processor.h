@@ -519,6 +519,16 @@ struct thread_struct {
 	 * in-progress publication.
 	 */
 	u64			deko_checkpoint_generation;
+	/* Monitor-owned warm-reset generation and queued boundary operation. */
+	u64			deko_invocation_generation;
+	u64			deko_last_reset_scrubbed_bytes;
+	u64			deko_checkpoint_boundary_ns;
+	u64			deko_last_derive_ns;
+	u64			deko_last_reset_boundary_ns;
+	u64			deko_lifecycle_started_ns;
+	u64			deko_reset_started_ns;
+	u64			deko_warm_reset_count;
+	u16			deko_aspace_pending_op;
 #endif
 
 #ifdef CONFIG_X86_USER_SHADOW_STACK

@@ -195,10 +195,33 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 		p->thread.kernel_vmpl1_rsp = current->thread.kernel_vmpl1_rsp;
 		p->thread.deko_checkpoint_generation =
 			current->thread.deko_checkpoint_generation;
+		p->thread.deko_invocation_generation =
+			current->thread.deko_invocation_generation;
+		p->thread.deko_last_reset_scrubbed_bytes =
+			current->thread.deko_last_reset_scrubbed_bytes;
+		p->thread.deko_checkpoint_boundary_ns =
+			current->thread.deko_checkpoint_boundary_ns;
+		p->thread.deko_last_derive_ns = current->thread.deko_last_derive_ns;
+		p->thread.deko_last_reset_boundary_ns =
+			current->thread.deko_last_reset_boundary_ns;
+		p->thread.deko_lifecycle_started_ns =
+			current->thread.deko_lifecycle_started_ns;
+		p->thread.deko_reset_started_ns = 0;
+		p->thread.deko_warm_reset_count = current->thread.deko_warm_reset_count;
+		p->thread.deko_aspace_pending_op = 0;
 	} else {
 		p->thread.user_rsp = 0;
 		p->thread.kernel_vmpl1_rsp = 0;
 		p->thread.deko_checkpoint_generation = 0;
+		p->thread.deko_invocation_generation = 0;
+		p->thread.deko_last_reset_scrubbed_bytes = 0;
+		p->thread.deko_checkpoint_boundary_ns = 0;
+		p->thread.deko_last_derive_ns = 0;
+		p->thread.deko_last_reset_boundary_ns = 0;
+		p->thread.deko_lifecycle_started_ns = 0;
+		p->thread.deko_reset_started_ns = 0;
+		p->thread.deko_warm_reset_count = 0;
+		p->thread.deko_aspace_pending_op = 0;
 	}
 #endif
 	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));

@@ -2,6 +2,8 @@
 #ifndef _ASM_X86_PRCTL_H
 #define _ASM_X86_PRCTL_H
 
+#include <linux/types.h>
+
 #define ARCH_SET_GS			0x1001
 #define ARCH_SET_FS			0x1002
 #define ARCH_GET_FS			0x1003
@@ -35,6 +37,26 @@
 #define ARCH_SHSTK_LOCK			0x5003
 #define ARCH_SHSTK_UNLOCK		0x5004
 #define ARCH_SHSTK_STATUS		0x5005
+
+/* Queue a Deko committed-template operation for a quiescent VMPL1 boundary. */
+#define ARCH_DEKO_ASPACE_OP		0x6001
+
+#define ARCH_DEKO_ASPACE_STATUS		0
+#define ARCH_DEKO_ASPACE_CHECKPOINT	1
+#define ARCH_DEKO_ASPACE_RESET		2
+
+struct arch_deko_aspace_op {
+	__u16 op;
+	__u16 flags;
+	__u32 pending_op;
+	__u64 generation;
+	__u64 scrubbed_bytes;
+	__u64 checkpoint_boundary_ns;
+	__u64 derive_ns;
+	__u64 reset_boundary_ns;
+	__u64 lifecycle_elapsed_ns;
+	__u64 reset_count;
+};
 
 /* ARCH_SHSTK_ features bits */
 #define ARCH_SHSTK_SHSTK		(1ULL <<  0)

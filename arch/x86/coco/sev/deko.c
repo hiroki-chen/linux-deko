@@ -28,6 +28,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kstrtox.h>
+#include <linux/ktime.h>
 #include <linux/local_lock.h>
 #include <linux/mutex.h>
 #include <linux/irqflags.h>
@@ -47,12 +48,14 @@
 #include <asm-generic/mman-common.h>
 #include <asm/mem_encrypt.h>
 #include <asm/processor.h>
+#include <uapi/asm/prctl.h>
 #include <asm/segment.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
 #include <asm/trap_pf.h>
 #include <asm/tsc.h>
 #include <asm/current.h>
+#include <asm/fsgsbase.h>
 #include <uapi/linux/sched.h>
 
 extern char __per_cpu_start[];
@@ -205,6 +208,11 @@ struct deko_exec_range_unlift_call_args {
 	u64 page_gpas[DEKO_EXEC_RANGE_UNLIFT_MAX_PAGES];
 };
 
+struct deko_aspace_call_args {
+	u16 op;
+	u64 base_generation;
+};
+
 struct deko_exec_pin_entry {
 	struct list_head node;
 	struct mm_struct *mm;
@@ -272,6 +280,8 @@ static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
 					     struct svsm_ca *caa, void *arg);
 static int deko_prepare_exec_range_unlift_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
+static int deko_prepare_aspace_call(struct svsm_call *call,
+				    struct svsm_ca *caa, void *arg);
 struct deko_syscall_body;
 static int deko_prepare_data_pin_transition(
 	const struct deko_syscall_body *syscall_body, unsigned long syscall_nr,
@@ -358,6 +368,201 @@ static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
 
 	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_EXEC_RANGE_READY);
 
+	return 0;
+}
+
+static int deko_prepare_aspace_call(struct svsm_call *call,
+				    struct svsm_ca *caa, void *arg)
+{
+	struct deko_aspace_call_args *args = arg;
+	struct deko_address_space_op_req *req;
+
+	BUILD_BUG_ON(sizeof(*req) > sizeof(caa->svsm_buffer));
+	req = (struct deko_address_space_op_req *)caa->svsm_buffer;
+	memset(req, 0, sizeof(*req));
+	req->version = DEKO_ASPACE_OP_REQ_VERSION_V1;
+	req->op = args->op;
+	req->req_size = sizeof(*req);
+	req->pid = current->pid;
+	req->tgid = current->tgid;
+	req->base_version_id = args->base_generation;
+
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_ASPACE_OP);
+	return 0;
+}
+
+static int deko_run_aspace_op(u16 op, u64 base_generation,
+                              u64 *generation, u64 *scrubbed_bytes,
+                              u64 *restored_fs_base, u64 *restored_gs_base)
+{
+	struct deko_aspace_call_args args = {
+		.op = op,
+		.base_generation = base_generation,
+	};
+	struct svsm_call call = { 0 };
+	int ret;
+
+	ret = deko_svsm_call_locked(&call, deko_prepare_aspace_call, &args);
+	if (ret < 0)
+		return ret;
+	if (!call.rdx_out)
+		return -EIO;
+
+    *generation = call.rdx_out;
+    *scrubbed_bytes = call.r8_out;
+    if (restored_fs_base)
+        *restored_fs_base = call.rcx_out;
+    if (restored_gs_base)
+        *restored_gs_base = call.r9_out;
+    return 0;
+}
+
+static int deko_process_pending_aspace_op(void)
+{
+	u16 pending = READ_ONCE(current->thread.deko_aspace_pending_op);
+    u64 generation = READ_ONCE(current->thread.deko_invocation_generation);
+    u64 scrubbed_bytes = 0;
+    u64 restored_fs_base = 0;
+    u64 restored_gs_base = 0;
+	u64 started_ns;
+	int ret;
+
+	if (!pending)
+		return 0;
+
+	switch (pending) {
+	case DEKO_ASPACE_OP_CREATE_CHECKPOINT:
+        ret = deko_run_aspace_op(pending, 0, &generation,
+                                 &scrubbed_bytes, NULL, NULL);
+		if (ret < 0)
+			return ret;
+		started_ns = READ_ONCE(current->thread.deko_lifecycle_started_ns);
+		WRITE_ONCE(current->thread.deko_checkpoint_boundary_ns,
+			   ktime_get_ns() - started_ns);
+		WRITE_ONCE(current->thread.deko_invocation_generation,
+			   generation);
+		WRITE_ONCE(current->thread.deko_aspace_pending_op,
+			   DEKO_ASPACE_OP_FORK_VERSION);
+		fallthrough;
+	case DEKO_ASPACE_OP_FORK_VERSION:
+		generation = READ_ONCE(current->thread.deko_invocation_generation);
+		started_ns = ktime_get_ns();
+        ret = deko_run_aspace_op(DEKO_ASPACE_OP_FORK_VERSION, generation,
+                                 &generation, &scrubbed_bytes, NULL, NULL);
+		if (ret < 0)
+			return ret;
+		WRITE_ONCE(current->thread.deko_last_derive_ns,
+			   ktime_get_ns() - started_ns);
+		WRITE_ONCE(current->thread.deko_invocation_generation,
+			   generation);
+		WRITE_ONCE(current->thread.deko_aspace_pending_op, 0);
+		break;
+	case DEKO_ASPACE_OP_REWIND:
+        ret = deko_run_aspace_op(pending, generation, &generation,
+                                 &scrubbed_bytes, NULL, NULL);
+		if (ret < 0)
+			return ret;
+		WRITE_ONCE(current->thread.deko_aspace_pending_op,
+			   DEKO_ASPACE_OP_ROLLBACK);
+		fallthrough;
+	case DEKO_ASPACE_OP_ROLLBACK:
+		generation = READ_ONCE(current->thread.deko_invocation_generation);
+        ret = deko_run_aspace_op(DEKO_ASPACE_OP_ROLLBACK, generation,
+                                 &generation, &scrubbed_bytes,
+                                 &restored_fs_base, &restored_gs_base);
+        if (ret < 0)
+            return ret;
+        /*
+         * VMPL0 has already restored the authoritative VMSA image.  Keep the
+         * cooperative Linux task mirror in step so a later launch or
+         * arch_prctl query cannot feed child-local bases back into VMPL0.
+         * These values are monitor outputs; Linux remains outside the TCB.
+         */
+        x86_fsbase_write_cpu(restored_fs_base);
+        x86_gsbase_write_cpu_inactive(restored_gs_base);
+        current->thread.fsbase = restored_fs_base;
+        current->thread.gsbase = restored_gs_base;
+		WRITE_ONCE(current->thread.deko_invocation_generation,
+			   generation);
+		WRITE_ONCE(current->thread.deko_last_reset_scrubbed_bytes,
+			   scrubbed_bytes);
+		started_ns = READ_ONCE(current->thread.deko_reset_started_ns);
+		WRITE_ONCE(current->thread.deko_last_reset_boundary_ns,
+			   ktime_get_ns() - started_ns);
+		WRITE_ONCE(current->thread.deko_warm_reset_count,
+			   READ_ONCE(current->thread.deko_warm_reset_count) + 1);
+		WRITE_ONCE(current->thread.deko_aspace_pending_op, 0);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	pr_debug("completed address-space operation pid=%d generation=%llu scrubbed_bytes=%llu\n",
+		 current->pid, (unsigned long long)generation,
+		 (unsigned long long)scrubbed_bytes);
+	return 0;
+}
+
+int deko_arch_prctl_aspace_op(struct task_struct *task, unsigned long user_arg)
+{
+	struct arch_deko_aspace_op request;
+	u16 pending;
+
+	if (task != current || !current->is_monitored || !current->mm)
+		return -EPERM;
+	if (copy_from_user(&request, (void __user *)user_arg, sizeof(request)))
+		return -EFAULT;
+	if (request.flags)
+		return -EINVAL;
+
+	pending = READ_ONCE(current->thread.deko_aspace_pending_op);
+	switch (request.op) {
+	case ARCH_DEKO_ASPACE_STATUS:
+		break;
+	case ARCH_DEKO_ASPACE_CHECKPOINT:
+		if (pending)
+			return -EBUSY;
+		if (READ_ONCE(current->thread.deko_invocation_generation))
+			return -EALREADY;
+		WRITE_ONCE(current->thread.deko_aspace_pending_op,
+			   DEKO_ASPACE_OP_CREATE_CHECKPOINT);
+		WRITE_ONCE(current->thread.deko_lifecycle_started_ns, ktime_get_ns());
+		WRITE_ONCE(current->thread.deko_checkpoint_boundary_ns, 0);
+		WRITE_ONCE(current->thread.deko_last_derive_ns, 0);
+		WRITE_ONCE(current->thread.deko_last_reset_boundary_ns, 0);
+		WRITE_ONCE(current->thread.deko_warm_reset_count, 0);
+		break;
+	case ARCH_DEKO_ASPACE_RESET:
+		if (pending)
+			return -EBUSY;
+		if (!READ_ONCE(current->thread.deko_invocation_generation))
+			return -ENOENT;
+		WRITE_ONCE(current->thread.deko_aspace_pending_op,
+			   DEKO_ASPACE_OP_REWIND);
+		WRITE_ONCE(current->thread.deko_reset_started_ns, ktime_get_ns());
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	request.pending_op = READ_ONCE(current->thread.deko_aspace_pending_op);
+	request.generation =
+		READ_ONCE(current->thread.deko_invocation_generation);
+	request.scrubbed_bytes =
+		READ_ONCE(current->thread.deko_last_reset_scrubbed_bytes);
+	request.checkpoint_boundary_ns =
+		READ_ONCE(current->thread.deko_checkpoint_boundary_ns);
+	request.derive_ns = READ_ONCE(current->thread.deko_last_derive_ns);
+	request.reset_boundary_ns =
+		READ_ONCE(current->thread.deko_last_reset_boundary_ns);
+	if (READ_ONCE(current->thread.deko_lifecycle_started_ns))
+		request.lifecycle_elapsed_ns = ktime_get_ns() -
+			READ_ONCE(current->thread.deko_lifecycle_started_ns);
+	else
+		request.lifecycle_elapsed_ns = 0;
+	request.reset_count = READ_ONCE(current->thread.deko_warm_reset_count);
+	if (copy_to_user((void __user *)user_arg, &request, sizeof(request)))
+		return -EFAULT;
 	return 0;
 }
 
@@ -1902,6 +2107,15 @@ static int deko_register_current_clone_child(void)
 	current->thread.user_rsp = 0;
 	current->thread.kernel_vmpl1_rsp = token_low;
 	current->thread.deko_checkpoint_generation = 0;
+	current->thread.deko_invocation_generation = 0;
+	current->thread.deko_last_reset_scrubbed_bytes = 0;
+	current->thread.deko_checkpoint_boundary_ns = 0;
+	current->thread.deko_last_derive_ns = 0;
+	current->thread.deko_last_reset_boundary_ns = 0;
+	current->thread.deko_lifecycle_started_ns = 0;
+	current->thread.deko_reset_started_ns = 0;
+	current->thread.deko_warm_reset_count = 0;
+	current->thread.deko_aspace_pending_op = 0;
 	this_cpu_write(deko_user_rsp, current->thread.user_rsp);
 	this_cpu_write(deko_kernel_vmpl1_rsp,
 		       current->thread.kernel_vmpl1_rsp);
@@ -1929,6 +2143,15 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 		child->thread.user_rsp = 0;
 		child->thread.kernel_vmpl1_rsp = 0;
 		child->thread.deko_checkpoint_generation = 0;
+		child->thread.deko_invocation_generation = 0;
+		child->thread.deko_last_reset_scrubbed_bytes = 0;
+		child->thread.deko_checkpoint_boundary_ns = 0;
+		child->thread.deko_last_derive_ns = 0;
+		child->thread.deko_last_reset_boundary_ns = 0;
+		child->thread.deko_lifecycle_started_ns = 0;
+		child->thread.deko_reset_started_ns = 0;
+		child->thread.deko_warm_reset_count = 0;
+		child->thread.deko_aspace_pending_op = 0;
 		pr_debug("skip deko proxy loop for internal worker child_pid=%d child_tgid=%d parent_pid=%d flags=0x%x\n",
 			 child->pid, child->tgid, current->pid, child->flags);
 		return 0;
@@ -1950,6 +2173,15 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 		child->thread.user_rsp = 0;
 		child->thread.kernel_vmpl1_rsp = 0;
 		child->thread.deko_checkpoint_generation = 0;
+		child->thread.deko_invocation_generation = 0;
+		child->thread.deko_last_reset_scrubbed_bytes = 0;
+		child->thread.deko_checkpoint_boundary_ns = 0;
+		child->thread.deko_last_derive_ns = 0;
+		child->thread.deko_last_reset_boundary_ns = 0;
+		child->thread.deko_lifecycle_started_ns = 0;
+		child->thread.deko_reset_started_ns = 0;
+		child->thread.deko_warm_reset_count = 0;
+		child->thread.deko_aspace_pending_op = 0;
 
 		ret = deko_queue_proxy_loop_for_task(
 			child, "fork", DEKO_LAUNCH_TYPE_PROCESS_FORK);
@@ -1981,6 +2213,15 @@ int deko_prepare_clone_child_before_wake(struct task_struct *child)
 	child->thread.user_rsp = 0;
 	child->thread.kernel_vmpl1_rsp = token_low;
 	child->thread.deko_checkpoint_generation = 0;
+	child->thread.deko_invocation_generation = 0;
+	child->thread.deko_last_reset_scrubbed_bytes = 0;
+	child->thread.deko_checkpoint_boundary_ns = 0;
+	child->thread.deko_last_derive_ns = 0;
+	child->thread.deko_last_reset_boundary_ns = 0;
+	child->thread.deko_lifecycle_started_ns = 0;
+	child->thread.deko_reset_started_ns = 0;
+	child->thread.deko_warm_reset_count = 0;
+	child->thread.deko_aspace_pending_op = 0;
 
 	ret = deko_queue_proxy_loop_for_task(
 		child, "clone", DEKO_LAUNCH_TYPE_THREAD);
@@ -4573,6 +4814,9 @@ void deko_proxy_loop(struct callback_head *work)
 		errno = deko_handle_vmpl1_exit_reason(
 			&call, buf, &normal_exit, &exit_code, poller,
 			&pin_transition);
+		if (!errno && !normal_exit && call.rax_out == DEKO_TIMER_SERVICE &&
+		    READ_ONCE(current->thread.deko_aspace_pending_op))
+			errno = deko_process_pending_aspace_op();
 
 		if (unlikely(errno < 0) || normal_exit)
 			goto err_loop;

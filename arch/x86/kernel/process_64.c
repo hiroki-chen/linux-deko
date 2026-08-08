@@ -982,6 +982,12 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
 	case ARCH_SHSTK_UNLOCK:
 	case ARCH_SHSTK_STATUS:
 		return shstk_prctl(task, option, arg2);
+	case ARCH_DEKO_ASPACE_OP:
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+		return deko_arch_prctl_aspace_op(task, arg2);
+#else
+		return -EOPNOTSUPP;
+#endif
 	default:
 		ret = -EINVAL;
 		break;
