@@ -1260,7 +1260,7 @@ void exit_mmap(struct mm_struct *mm)
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
 
-	if (current->is_monitored) {
+	{
 		int deko_ret = deko_unlift_all_exec_user_ranges(mm, "exit_mmap");
 
 		if (deko_ret < 0)

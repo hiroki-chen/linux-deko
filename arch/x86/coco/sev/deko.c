@@ -2283,11 +2283,17 @@ static int exit_lifecycle_handler(struct mm_struct *mm, unsigned long ax)
 	if (mm && current->is_monitored) {
 		args.exec_span = READ_ONCE(mm->deko_exec_span);
 		args.exec_span_base = READ_ONCE(mm->deko_exec_span_base);
-		ret = deko_unlift_all_exec_user_ranges(mm, "exit");
-		if (ret < 0)
-			pr_warn("Failed to unlift all executable ranges before app-exit report pid=%d comm=%s ret=%d\n",
-				current->pid, current->comm, ret);
 	}
+
+	/*
+	 * Do not unlift the mm here.  Every monitored thread reports its own
+	 * exit, but threads sharing an mm also share the executable-page ledger.
+	 * Unlifting on the first thread exit would restore the whole address
+	 * space to VMPL2 while sibling VMPL1 threads can still execute.  VMPL0's
+	 * monitor-owned address-space task count performs the authoritative final
+	 * restoration when the last registered task is removed.  Linux retains
+	 * only its local page pins until exit_mmap() tears down the mm.
+	 */
 
 	ret = deko_svsm_call_locked(&call, deko_prepare_exit_call, &args);
 	if (ret == -EINVAL) {
