@@ -71,13 +71,16 @@ extern char __per_cpu_start[];
 #define DEKO_SYSCALL_RING_ENTRY_FLAG_EPOLL_PEEK 1U
 #define DEKO_POLLER_ASLEEP 0
 #define DEKO_POLLER_AWAKE 1
-#define DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT 30000000ULL
+#define DEKO_RING_PRODUCER_IDLE 0
+#define DEKO_RING_PRODUCER_ACTIVE 1
+#define DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT 1ULL
 #define DEKO_RING_POLLER_SLEEP_MS_DEFAULT 1
 #define DEKO_RING_POLLER_AFFINITY_NONE 0
 #define DEKO_RING_POLLER_AFFINITY_SAME 1
 #define DEKO_RING_POLLER_AFFINITY_NEXT 2
 #define DEKO_RING_POLLER_CREATE_RETRIES 4
 #define DEKO_RING_WAIT_RESCHED_INTERVAL 1024
+#define DEKO_RING_POLLER_RESCHED_INTERVAL 1024
 #define DEKO_DOMAIN_BITS 8
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
 #define DEKO_EXEC_RANGE_MAX_PAGES 16384UL
@@ -111,6 +114,8 @@ static unsigned int deko_ring_poller_sleep_ms =
 static int deko_ring_poller_nice;
 static unsigned int deko_ring_poller_affinity =
 	DEKO_RING_POLLER_AFFINITY_NONE;
+/* -1 keeps the affinity policy; a non-negative value pins exactly. */
+static int deko_ring_poller_cpu = -1;
 
 static int __init deko_pin_proxy_task_setup(char *str)
 {
@@ -183,6 +188,17 @@ static int __init deko_ring_poller_affinity_setup(char *str)
 	return 0;
 }
 __setup("deko_ring_poller_affinity=", deko_ring_poller_affinity_setup);
+
+static int __init deko_ring_poller_cpu_setup(char *str)
+{
+	int cpu;
+
+	if (kstrtoint(str, 0, &cpu) || cpu < -1)
+		return 0;
+	deko_ring_poller_cpu = cpu;
+	return 1;
+}
+__setup("deko_ring_poller_cpu=", deko_ring_poller_cpu_setup);
 
 struct deko_launch_app_call_args {
 	const struct pt_regs *regs;
@@ -1116,7 +1132,8 @@ struct deko_syscall_ring {
 	u32 head;
 	u32 tail;
 	u32 poller_state;
-	u32 _pad;
+	/* Untrusted performance hint; never authorizes or completes a request. */
+	u32 producer_state;
 	u64 poller_heartbeat;
 	struct deko_syscall_entry entries[DEKO_RING_CAPACITY];
 };
@@ -1368,6 +1385,23 @@ static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
 	case __NR_recvfrom:
 	case __NR_sendto:
 	case __NR_sendfile:
+	/*
+	 * These primitives do not require the owner's per-thread register or
+	 * signal state. create_io_thread() shares VM, FS, files, credentials,
+	 * namespaces, and the thread group, so executing them here preserves
+	 * their process-visible semantics while avoiding a VMPL round trip.
+	 * Keep this an explicit allowlist: lifecycle and unknown syscalls must
+	 * continue through the owner, where monitor quarantine and completion
+	 * processing are serialized with protected execution.
+	 */
+	case __NR_getppid:
+	case __NR_stat:
+	case __NR_fstat:
+	case __NR_newfstatat:
+	case __NR_open:
+	case __NR_openat:
+	case __NR_close:
+	case __NR_lseek:
 		return true;
 	default:
 		return false;
@@ -2739,6 +2773,7 @@ static int deko_syscall_ring_poller_main(void *data)
 	struct deko_ring_poller *poller = data;
 	struct deko_syscall_ring *ring = poller->ring;
 	u64 idle_since = rdtsc_ordered();
+	unsigned int resched_ticks = 0;
 	char comm[TASK_COMM_LEN] = {};
 
 	snprintf(comm, sizeof(comm), "deko-ring-%d", current->pid);
@@ -2789,7 +2824,28 @@ static int deko_syscall_ring_poller_main(void *data)
 
 		if (handled) {
 			idle_since = now;
-			cond_resched();
+			resched_ticks++;
+			if ((resched_ticks &
+			     (DEKO_RING_POLLER_RESCHED_INTERVAL - 1)) == 0)
+				cond_resched();
+			continue;
+		}
+
+		/*
+		 * VMPL1 may be copying a protected egress payload into the shared
+		 * alias before it can release-publish the corresponding READY entry.
+		 * Do not voluntarily yield in that bounded preparation window. This
+		 * shared value is only a scheduling hint: even if forged, the poller
+		 * still executes nothing until the normal ring state machine accepts
+		 * a fully published, explicitly eligible entry.
+		 */
+		if (READ_ONCE(ring->producer_state) ==
+		    DEKO_RING_PRODUCER_ACTIVE) {
+			cpu_relax();
+			resched_ticks++;
+			if ((resched_ticks &
+			     (DEKO_RING_POLLER_RESCHED_INTERVAL - 1)) == 0)
+				cond_resched();
 			continue;
 		}
 
@@ -2818,7 +2874,10 @@ static int deko_syscall_ring_poller_main(void *data)
 		}
 
 		cpu_relax();
-		cond_resched();
+		resched_ticks++;
+		if ((resched_ticks &
+		     (DEKO_RING_POLLER_RESCHED_INTERVAL - 1)) == 0)
+			cond_resched();
 	}
 
 	WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
@@ -2846,28 +2905,49 @@ static void deko_ring_poller_configure_task(struct task_struct *task,
 {
 	unsigned int affinity = READ_ONCE(deko_ring_poller_affinity);
 	unsigned int target_cpu = owner_cpu;
+	int fixed_cpu = READ_ONCE(deko_ring_poller_cpu);
 	int nice = READ_ONCE(deko_ring_poller_nice);
 	int ret;
 
 	if (nice)
 		set_user_nice(task, nice);
 
-	if (affinity == DEKO_RING_POLLER_AFFINITY_NONE)
+	/*
+	 * create_io_thread() inherits the owner's affinity.  The owner is already
+	 * pinned to keep its VMPL1 doorbell and VMSA state CPU-local, so leaving
+	 * the inherited mask intact places producer and consumer on the same CPU
+	 * and makes the purportedly asynchronous path unable to run concurrently.
+	 * "none" means no explicit poller pinning: restore the normal online CPU
+	 * mask and let the scheduler place the infrastructure thread.
+	 */
+	if (fixed_cpu >= 0) {
+		if (fixed_cpu >= nr_cpu_ids || !cpu_online(fixed_cpu)) {
+			pr_warn("invalid fixed Deko syscall ring poller cpu=%d nr_cpu_ids=%u\n",
+				fixed_cpu, nr_cpu_ids);
+			return;
+		}
+		target_cpu = fixed_cpu;
+	} else if (affinity == DEKO_RING_POLLER_AFFINITY_NONE) {
+		ret = set_cpus_allowed_ptr(task, cpu_online_mask);
+		if (ret)
+			pr_warn("failed to restore Deko syscall ring poller scheduler mask pid=%d owner_cpu=%u ret=%d\n",
+				task->pid, owner_cpu, ret);
 		return;
-	if (affinity == DEKO_RING_POLLER_AFFINITY_NEXT)
+	} else if (affinity == DEKO_RING_POLLER_AFFINITY_NEXT) {
 		target_cpu = deko_ring_poller_next_cpu(owner_cpu);
-	else if (affinity != DEKO_RING_POLLER_AFFINITY_SAME)
+	} else if (affinity != DEKO_RING_POLLER_AFFINITY_SAME) {
 		return;
+	}
 
 	ret = set_cpus_allowed_ptr(task, cpumask_of(target_cpu));
 	if (ret)
 		pr_warn("failed to pin Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u ret=%d\n",
 			task->pid, owner_cpu, target_cpu, ret);
 	else
-		pr_debug("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u\n",
+		pr_debug("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u fixed_cpu=%d\n",
 			task->pid, owner_cpu, target_cpu, nice,
 			(unsigned long long)READ_ONCE(deko_ring_poller_idle_cycles),
-			READ_ONCE(deko_ring_poller_sleep_ms), affinity);
+			READ_ONCE(deko_ring_poller_sleep_ms), affinity, fixed_cpu);
 }
 
 static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
@@ -4545,8 +4625,21 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 				 * A present syscall ring owns ENTER_OK delivery.
 				 * Falling through here can re-execute a stale
 				 * legacy syscall body after the poller already
-				 * completed the ring entry.
+				 * completed the ring entry.  This owner entry is
+				 * also the monitor-owned end of a bounded async
+				 * epoch.  Force a real scheduler safepoint before
+				 * relaunching VMPL1 so a continuously protected
+				 * task cannot starve watchdog/RCU service while a
+				 * different CPU completes its ring requests.
 				 */
+				if (!*normal_exit) {
+					migrate_disable();
+					local_irq_save(flags);
+					set_need_resched_current();
+					local_irq_restore(flags);
+					cond_resched();
+					migrate_enable();
+				}
 				break;
 			}
 		}
@@ -4593,8 +4686,24 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 		return -EINVAL;
 	}
 
-	if (!*normal_exit)
+	if (!*normal_exit) {
+		/*
+		 * The monitor clears producer_state before every real VMPL2
+		 * scheduling boundary. Re-arm the performance hint only after that
+		 * service has completed and this owner is about to resume VMPL1, then
+		 * wake a poller that went idle while Linux was handling the boundary.
+		 * This state remains untrusted: the poller still validates and claims
+		 * a release-published READY entry before executing any syscall.
+		 */
+		if (poller && poller->task &&
+		    deko_syscall_ring_available(poller->ring)) {
+			WRITE_ONCE(poller->ring->producer_state,
+				   DEKO_RING_PRODUCER_ACTIVE);
+			smp_wmb();
+			wake_up_process(poller->task);
+		}
 		call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
+	}
 
 	return 0;
 }
