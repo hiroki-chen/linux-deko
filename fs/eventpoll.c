@@ -1933,10 +1933,18 @@ static int ep_schedule_timeout(ktime_t *to)
  * Return: the number of ready events which have been fetched, or an
  *          error code, in case of error.
  */
+static bool ep_cancel_pending(const atomic_t *cancel_seq,
+			      int expected_cancel_seq)
+{
+	return cancel_seq && atomic_read(cancel_seq) != expected_cancel_seq;
+}
+
 static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
-		   int maxevents, struct timespec64 *timeout)
+		   int maxevents, struct timespec64 *timeout,
+		   const atomic_t *cancel_seq, int expected_cancel_seq)
 {
 	int res, eavail, timed_out = 0;
+	bool cancelled;
 	u64 slack = 0;
 	wait_queue_entry_t wait;
 	ktime_t expires, *to = NULL;
@@ -1979,7 +1987,8 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 		if (eavail)
 			continue;
 
-		if (signal_pending(current))
+		if (signal_pending(current) ||
+		    ep_cancel_pending(cancel_seq, expected_cancel_seq))
 			return -EINTR;
 
 		/*
@@ -2018,10 +2027,15 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 		 * important.
 		 */
 		eavail = ep_events_available(ep);
-		if (!eavail)
+		cancelled = ep_cancel_pending(cancel_seq, expected_cancel_seq);
+		if (!eavail && !cancelled)
 			__add_wait_queue_exclusive(&ep->wq, &wait);
 
 		spin_unlock_irq(&ep->lock);
+		if (!eavail && cancelled) {
+			__set_current_state(TASK_RUNNING);
+			return -EINTR;
+		}
 
 		if (!eavail)
 			timed_out = !ep_schedule_timeout(to) ||
@@ -2436,8 +2450,11 @@ int epoll_sendevents(struct file *file, struct epoll_event __user *events,
  * Implement the event wait interface for the eventpoll file. It is the kernel
  * part of the user space epoll_wait(2).
  */
-static int do_epoll_wait(int epfd, struct epoll_event __user *events,
-			 int maxevents, struct timespec64 *to)
+static int do_epoll_wait_cancelable(int epfd,
+				    struct epoll_event __user *events,
+				    int maxevents, struct timespec64 *to,
+				    const atomic_t *cancel_seq,
+				    int expected_cancel_seq)
 {
 	struct eventpoll *ep;
 	int ret;
@@ -2458,7 +2475,26 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
 	ep = fd_file(f)->private_data;
 
 	/* Time to fish for events ... */
-	return ep_poll(ep, events, maxevents, to);
+	return ep_poll(ep, events, maxevents, to, cancel_seq,
+		       expected_cancel_seq);
+}
+
+static int do_epoll_wait(int epfd, struct epoll_event __user *events,
+			 int maxevents, struct timespec64 *to)
+{
+	return do_epoll_wait_cancelable(epfd, events, maxevents, to, NULL, 0);
+}
+
+int epoll_wait_cancelable(int epfd, struct epoll_event __user *events,
+			  int maxevents, int timeout,
+			  const atomic_t *cancel_seq,
+			  int expected_cancel_seq)
+{
+	struct timespec64 to;
+
+	return do_epoll_wait_cancelable(
+		epfd, events, maxevents, ep_timeout_to_timespec(&to, timeout),
+		cancel_seq, expected_cancel_seq);
 }
 
 SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,

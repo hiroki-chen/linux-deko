@@ -18,6 +18,9 @@
 #include <linux/io.h>
 #include <linux/psp-sev.h>
 #include <linux/efi.h>
+#include <linux/export.h>
+#include <linux/init.h>
+#include <linux/kstrtox.h>
 #include <uapi/linux/sev-guest.h>
 
 #include <asm/init.h>
@@ -34,6 +37,55 @@
 #include <asm/cpu.h>
 #include <asm/apic.h>
 #include <asm/cpuid/api.h>
+
+static bool deko_bench_hv_ipi_enabled;
+
+static int __init deko_bench_hv_ipi_setup(char *value)
+{
+	return value ? kstrtobool(value, &deko_bench_hv_ipi_enabled) : -EINVAL;
+}
+early_param("deko_bench_hv_ipi", deko_bench_hv_ipi_setup);
+
+/*
+ * Disposable VMPL2 notification probe. No protected service runs here. The
+ * caller holds cpus_read_lock(); only a remote CPU's reschedule vector is
+ * permitted. The current KVM implementation needs an x2APIC source to consume
+ * the full destination ID in this GHCB request.
+ */
+int svsm_deko_bench_hv_ipi(unsigned int cpu)
+{
+	struct es_em_ctxt ctxt = {};
+	struct ghcb_state state;
+	struct ghcb *ghcb;
+	unsigned long flags;
+	u64 saved_msr, icr;
+	enum es_result result;
+	int ret;
+
+	if (!deko_bench_hv_ipi_enabled ||
+	    !cc_platform_has(CC_ATTR_GUEST_SEV_SNP) || !x2apic_mode)
+		return -EOPNOTSUPP;
+	if (cpu >= nr_cpu_ids || !cpu_online(cpu) || in_nmi())
+		return -EINVAL;
+	local_irq_save(flags);
+	if (cpu == raw_smp_processor_id()) {
+		local_irq_restore(flags);
+		return -EINVAL;
+	}
+	icr = ((u64)per_cpu(x86_cpu_to_apicid, cpu) << 32) | RESCHEDULE_VECTOR;
+	saved_msr = native_rdmsrq(MSR_AMD64_SEV_ES_GHCB);
+	ghcb = __sev_get_ghcb(&state);
+	vc_ghcb_invalidate(ghcb);
+	result = sev_es_ghcb_hv_call(ghcb, &ctxt, 0x80000015ULL, icr, 0);
+	ret = result == ES_OK && ghcb_sw_exit_info_1_is_valid(ghcb) &&
+		ghcb_sw_exit_info_2_is_valid(ghcb) &&
+		!ghcb->save.sw_exit_info_1 && !ghcb->save.sw_exit_info_2 ? 0 : -EIO;
+	__sev_put_ghcb(&state);
+	native_wrmsrq(MSR_AMD64_SEV_ES_GHCB, saved_msr);
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(svsm_deko_bench_hv_ipi);
 
 static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt *ctxt,
 					   unsigned long vaddr, phys_addr_t *paddr)
@@ -1077,4 +1129,3 @@ fail:
 
 	sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
 }
-

@@ -11,6 +11,10 @@
 struct inode;
 struct task_struct;
 
+typedef int (*futex_monitor_prepare_fn)(void *ctx);
+typedef int (*futex_monitor_check_fn)(void *ctx);
+typedef void (*futex_monitor_unlock_fn)(void *ctx);
+
 /*
  * Futexes are matched on equal values of this key.
  * The key type depends on whether it's a shared or private mapping.
@@ -80,6 +84,11 @@ void futex_exec_release(struct task_struct *tsk);
 
 long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	      u32 __user *uaddr2, u32 val2, u32 val3);
+long futex_wait_with_monitor_check(u32 __user *uaddr, int op, u32 bitset,
+				   futex_monitor_prepare_fn prepare,
+				   futex_monitor_check_fn check,
+				   futex_monitor_unlock_fn unlock,
+				   void *ctx);
 int futex_hash_prctl(unsigned long arg2, unsigned long arg3, unsigned long arg4);
 
 #ifdef CONFIG_FUTEX_PRIVATE_HASH
@@ -101,6 +110,14 @@ static inline void futex_exec_release(struct task_struct *tsk) { }
 static inline long do_futex(u32 __user *uaddr, int op, u32 val,
 			    ktime_t *timeout, u32 __user *uaddr2,
 			    u32 val2, u32 val3)
+{
+	return -EINVAL;
+}
+
+static inline long futex_wait_with_monitor_check(
+	u32 __user *uaddr, int op, u32 bitset,
+	futex_monitor_prepare_fn prepare, futex_monitor_check_fn check,
+	futex_monitor_unlock_fn unlock, void *ctx)
 {
 	return -EINVAL;
 }

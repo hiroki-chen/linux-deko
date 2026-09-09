@@ -14,6 +14,7 @@
 #include <linux/cc_platform.h>
 #include <linux/printk.h>
 #include <linux/mm_types.h>
+#include <linux/moduleparam.h>
 #include <linux/set_memory.h>
 #include <linux/memblock.h>
 #include <linux/kernel.h>
@@ -212,7 +213,12 @@ struct svsm_map_ifc_req {
 } __attribute__((packed, aligned(8)));
 
 static struct svsm_map_ifc_single_req svsm_vmpl1_global_maps[16];
+static bool svsm_vmpl1_global_map_ready[16];
 static u16 svsm_vmpl1_global_map_count;
+
+/* Opt-in Linux-side preparation optimization; not a monitor relaunch ticket. */
+static bool deko_vmpl1_shared_roots;
+core_param(deko_vmpl1_shared_roots, deko_vmpl1_shared_roots, bool, 0644);
 
 /*
  * SVSM related information:
@@ -509,6 +515,105 @@ static u64 __init get_jump_table_addr(void)
 	return ret;
 }
 
+static bool deko_direct_probe;
+core_param(deko_direct_probe, deko_direct_probe, bool, 0644);
+static atomic64_t deko_direct_probe_bounces = ATOMIC64_INIT(0);
+
+static int deko_direct_probe_count_get(char *buffer, const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%lld\n", atomic64_read(&deko_direct_probe_bounces));
+}
+
+static const struct kernel_param_ops deko_direct_probe_count_ops = {
+	.get = deko_direct_probe_count_get,
+};
+module_param_cb(deko_direct_probe_bounces, &deko_direct_probe_count_ops, NULL, 0444);
+
+/*
+ * Disposable null-continuation probe. The original VMPL0 LAUNCH_APP remains
+ * outstanding until the monitor supplies its ordinary return registers.
+ * CAA.call_pending is cleared on acceptance, before the launch executes, so
+ * it cannot distinguish an intermediate return from final completion. A
+ * direct VMPL1 return leaves Linux's original LAUNCH_APP input RAX unchanged;
+ * that value is not a valid SVSM result. VMPL0's normal return replaces it.
+ * An intermediate return requests VMPL1 again immediately. No service, payload, scheduling operation
+ * or CAA update is performed on that intermediate path. IRQs stay disabled,
+ * as required by the enclosing GHCB and CAA guards.
+ *
+ * This is not a general service dispatcher: blocking work cannot execute in
+ * this call frame. The boolean and counter are untrusted diagnostics, never
+ * completion authority. The loop is bounded and disabled by default.
+ */
+static __always_inline void svsm_direct_probe_vmgexit(struct svsm_call *call)
+{
+	register unsigned long rax asm("rax") = call->rax;
+	register unsigned long rcx asm("rcx") = call->rcx;
+	register unsigned long rdx asm("rdx") = call->rdx;
+	register unsigned long r8 asm("r8") = call->r8;
+	register unsigned long r9 asm("r9") = call->r9;
+
+	asm volatile("rep; vmmcall"
+		     : "+r" (rax), "+r" (rcx), "+r" (rdx), "+r" (r8), "+r" (r9)
+		     : : "memory");
+	/* Save returned registers before reading the GHCB MSR or doing bookkeeping. */
+	call->rax_out = rax;
+	call->rcx_out = rcx;
+	call->rdx_out = rdx;
+	call->r8_out = r8;
+	call->r9_out = r9;
+}
+
+static void svsm_issue_direct_probe_call(struct ghcb *ghcb,
+					 struct svsm_call *call, u8 *pending)
+{
+	u64 saved_msr = sev_es_rd_ghcb_msr();
+	unsigned int bounces = 0;
+	bool direct = false;
+
+	WARN_ON_ONCE(!irqs_disabled());
+	call->caa->call_pending = 1;
+	for (;;) {
+		if (direct) {
+			/* Page-protocol return leg, with explicit MSR selection so
+			 * nested exception handling cannot leave a stale GHCB mode.
+			 * Rebuild valid bits because the host replaces them on exit. */
+			vc_ghcb_invalidate(ghcb);
+			ghcb->protocol_version = ghcb_version;
+			ghcb->ghcb_usage = GHCB_DEFAULT_USAGE;
+			ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_SNP_RUN_VMPL);
+			ghcb_set_sw_exit_info_1(ghcb, 1);
+			ghcb_set_sw_exit_info_2(ghcb, 0);
+			sev_es_wr_ghcb_msr(__pa(ghcb));
+		}
+		svsm_direct_probe_vmgexit(call);
+		if (direct &&
+		    (!ghcb_sw_exit_info_1_is_valid(ghcb) ||
+		     !ghcb_sw_exit_info_2_is_valid(ghcb) ||
+		     READ_ONCE(ghcb->save.sw_exit_info_1) != 0 ||
+		     READ_ONCE(ghcb->save.sw_exit_info_2) != 0)) {
+			pr_err("direct null probe received invalid Run VMPL response\n");
+			/* Make this failure visible to the enclosing SVSM protocol
+			 * even if acceptance already cleared the CAA byte. */
+			WRITE_ONCE(call->caa->call_pending, 1);
+			break;
+		}
+		/* A pending call was not accepted; retain ordinary protocol failure.
+		 * Zero acknowledges acceptance only. Final completion must replace
+		 * the original input register with a monitor result as well. */
+		if (READ_ONCE(call->caa->call_pending) ||
+		    call->rax_out != SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP))
+			break;
+		if (++bounces > 4096) {
+			pr_err("direct null probe exceeded its bounded continuation window\n");
+			break;
+		}
+		atomic64_inc(&deko_direct_probe_bounces);
+		direct = true;
+	}
+	sev_es_wr_ghcb_msr(saved_msr);
+	*pending = xchg(&call->caa->call_pending, *pending);
+}
+
 static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 {
 	struct es_em_ctxt ctxt;
@@ -529,7 +634,11 @@ static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 
 	sev_es_wr_ghcb_msr(__pa(ghcb));
 
-	svsm_issue_call(call, &pending);
+	if (READ_ONCE(deko_direct_probe) &&
+	    call->rax == SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP))
+		svsm_issue_direct_probe_call(ghcb, call, &pending);
+	else
+		svsm_issue_call(call, &pending);
 
 	if (pending)
 		return -EINVAL;
@@ -547,7 +656,7 @@ static int svsm_perform_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 	return svsm_process_result_codes(call);
 }
 
-int svsm_perform_call_protocol(struct svsm_call *call)
+static int __svsm_perform_call_protocol(struct svsm_call *call, bool retry)
 {
 	struct ghcb_state state;
 	unsigned long flags;
@@ -566,7 +675,7 @@ int svsm_perform_call_protocol(struct svsm_call *call)
 	do {
 		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call) :
 			     __pi_svsm_perform_msr_protocol(call);
-	} while (ret == -EAGAIN);
+	} while (retry && ret == -EAGAIN);
 
 	if (sev_cfg.ghcbs_initialized)
 		__sev_put_ghcb(&state);
@@ -574,6 +683,16 @@ int svsm_perform_call_protocol(struct svsm_call *call)
 	native_local_irq_restore(flags);
 
 	return ret;
+}
+
+int svsm_perform_call_protocol_once(struct svsm_call *call)
+{
+	return __svsm_perform_call_protocol(call, false);
+}
+
+int svsm_perform_call_protocol(struct svsm_call *call)
+{
+	return __svsm_perform_call_protocol(call, true);
 }
 
 static inline void __pval_terminate(u64 pfn, bool action,
@@ -1289,6 +1408,37 @@ int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len)
 }
 EXPORT_SYMBOL_GPL(svsm_deko_load_policy);
 
+int svsm_deko_bench_probes(void *buf, u64 len)
+{
+	struct svsm_deko_bench_probe_control *req;
+	struct svsm_call call = { 0 };
+	phys_addr_t req_pa;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!buf || len != sizeof(*req))
+		return -EINVAL;
+	BUILD_BUG_ON(sizeof(*req) > sizeof(((struct svsm_ca *)0)->svsm_buffer));
+
+	local_irq_save(flags);
+	req = (struct svsm_deko_bench_probe_control *)
+		svsm_get_caa()->svsm_buffer;
+	req_pa = svsm_get_caa_pa() + offsetof(struct svsm_ca, svsm_buffer);
+	memcpy(req, buf, sizeof(*req));
+
+	call.caa = svsm_get_caa();
+	call.r9 = req_pa;
+	call.rax = SVSM_EXTEND_CALL(SVSM_EXTEND_BENCH_PROBES);
+
+	if (svsm_perform_call_protocol(&call))
+		ret = -EOPNOTSUPP;
+	else
+		memcpy(buf, req, sizeof(*req));
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(svsm_deko_bench_probes);
+
 static void make_va_decrypted_in_pgd(pgd_t *pgd_base, unsigned long va)
 {
 	pgd_t *pgd;
@@ -1343,6 +1493,51 @@ static void make_va_decrypted(unsigned long va)
 	make_va_decrypted_in_pgd(init_mm.pgd, va);
 }
 
+/*
+ * A copied kernel-half PGD entry names the very same lower-level tables as
+ * init_mm. For a global range already installed there by process_map_vmpl1(),
+ * walking every leaf again cannot install anything new. Compare live entries
+ * on every call; there is no mm-pointer/lifetime cache and no user-half shortcut.
+ * Per-CPU mapping, GHCB/doorbell decryption and TLB handling still run normally.
+ * Linux is untrusted: this is never evidence of ownership or launch authority.
+ */
+static bool svsm_global_range_shared_with_init(pgd_t *root,
+					     unsigned long start,
+					     unsigned long end)
+{
+	unsigned long address = start;
+
+	if (!READ_ONCE(deko_vmpl1_shared_roots) || start >= end ||
+	    pgd_index(start) < PTRS_PER_PGD / 2 ||
+	    pgd_index(end - 1) < PTRS_PER_PGD / 2)
+		return false;
+
+	do {
+		unsigned int index = pgd_index(address);
+		pgd_t reference = READ_ONCE(init_mm.pgd[index]);
+		pgd_t observed = READ_ONCE(root[index]);
+
+		if (!pgd_present(reference) ||
+		    pgd_val(observed) != pgd_val(reference))
+			return false;
+		address = pgd_addr_end(address, end);
+	} while (address < end);
+	return true;
+}
+
+static int svsm_prepare_global_range(pgd_t *root, u16 index)
+{
+	struct svsm_map_ifc_single_req *map = &svsm_vmpl1_global_maps[index];
+
+	if (smp_load_acquire(&svsm_vmpl1_global_map_ready[index]) &&
+	    svsm_global_range_shared_with_init(root, map->va_start, map->va_end)) {
+		pr_info_once("reused global VMPL1 mappings shared with init_mm\n");
+		return 0;
+	}
+	return force_map_va_range_in_pgd(root, map->va_start, map->va_end,
+					map->pa_start, 0x163, false);
+}
+
 int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 {
 	unsigned long ghcb_va = this_cpu_read(svsm_vmpl1_ghcb_va);
@@ -1359,18 +1554,14 @@ int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm)
 	for (i = 0; i < map_count; i++) {
 		struct svsm_map_ifc_single_req *map = &svsm_vmpl1_global_maps[i];
 
-		ret = force_map_va_range_in_pgd(mm->pgd, map->va_start,
-						map->va_end, map->pa_start,
-						0x163, false);
+		ret = svsm_prepare_global_range(mm->pgd, i);
 		if (ret) {
 			pr_err("SVSM: failed to map VMPL1 global VA %llx..%llx into current mm, PA %llx ret=%d\n",
 			       map->va_start, map->va_end, map->pa_start, ret);
 			return ret;
 		}
 		if (vmpl1_pgd != mm->pgd) {
-			ret = force_map_va_range_in_pgd(vmpl1_pgd, map->va_start,
-						map->va_end, map->pa_start,
-						0x163, false);
+			ret = svsm_prepare_global_range(vmpl1_pgd, i);
 			if (ret) {
 				pr_err("SVSM: failed to map VMPL1 global VA %llx..%llx into PTI user root, PA %llx ret=%d\n",
 				       map->va_start, map->va_end,
@@ -1419,12 +1610,17 @@ static void process_map_vmpl1(struct svsm_map_ifc_req *req)
 
 		if (!cur->is_per_cpu) {
 			if (smp_processor_id() == 0) {
-				if (global_map_count <
-				    ARRAY_SIZE(svsm_vmpl1_global_maps))
-					svsm_vmpl1_global_maps[global_map_count++] =
-						*cur;
-				force_map_va_range(cur->va_start, cur->va_end,
-						   cur->pa_start, 0x163);
+				int ret;
+
+				if (global_map_count < ARRAY_SIZE(svsm_vmpl1_global_maps))
+					WRITE_ONCE(svsm_vmpl1_global_map_ready[global_map_count], false);
+				ret = force_map_va_range(cur->va_start, cur->va_end,
+							cur->pa_start, 0x163);
+				if (global_map_count < ARRAY_SIZE(svsm_vmpl1_global_maps)) {
+					svsm_vmpl1_global_maps[global_map_count] = *cur;
+					smp_store_release(&svsm_vmpl1_global_map_ready[global_map_count], !ret);
+					global_map_count++;
+				}
 			}
 		} else {
 			cpu = smp_processor_id();

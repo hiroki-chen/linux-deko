@@ -16,9 +16,15 @@
 #undef CREATE_TRACE_POINTS
 
 #include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/file.h>
+#include <linux/futex.h>
 #include <linux/hashtable.h>
 #include <linux/fs.h>
+#include <linux/eventpoll.h>
+#include <linux/magic.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/mm_types.h>
@@ -32,10 +38,20 @@
 #include <linux/local_lock.h>
 #include <linux/mutex.h>
 #include <linux/irqflags.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/pci.h>
+#include <linux/refcount.h>
 #include <linux/sizes.h>
 #include <linux/smp.h>
+#include <linux/socket.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
+#ifdef DEKO_POLLER_METRICS
+#include <linux/jiffies.h>
+#include <linux/sched/cputime.h>
+#endif
 #include <linux/sched/prio.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
@@ -52,6 +68,7 @@
 #include <asm/segment.h>
 #include <asm/sev.h>
 #include <asm/syscall.h>
+#include <asm/tlbflush.h>
 #include <asm/trap_pf.h>
 #include <asm/tsc.h>
 #include <asm/current.h>
@@ -68,18 +85,23 @@ extern char __per_cpu_start[];
 #define DEKO_SYSCALL_RING_ENTRY_READY 1
 #define DEKO_SYSCALL_RING_ENTRY_DONE 2
 #define DEKO_SYSCALL_RING_ENTRY_CLAIMED 3
-#define DEKO_SYSCALL_RING_ENTRY_FLAG_EPOLL_PEEK 1U
+#define DEKO_SYSCALL_RING_ENTRY_FLAG_RETAINED_TRANSLATION 1U
+#define DEKO_SYSCALL_RING_ENTRY_FLAG_FUTEX_WAIT_MONITOR_CHECK 2U
 #define DEKO_POLLER_ASLEEP 0
 #define DEKO_POLLER_AWAKE 1
 #define DEKO_RING_PRODUCER_IDLE 0
 #define DEKO_RING_PRODUCER_ACTIVE 1
 #define DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT 1ULL
-#define DEKO_RING_POLLER_SLEEP_MS_DEFAULT 1
+#define DEKO_RING_POLLER_SLEEP_MS_DEFAULT 10
+#define DEKO_RING_POLLER_ACTIVE_SLEEP_US_DEFAULT 5U
+#define DEKO_RING_POLLER_ACTIVE_SLEEP_US_MAX 1000000U
+#define DEKO_RING_OWNER_SAFEPOINT_NS_DEFAULT (1ULL * NSEC_PER_SEC)
 #define DEKO_RING_POLLER_AFFINITY_NONE 0
 #define DEKO_RING_POLLER_AFFINITY_SAME 1
 #define DEKO_RING_POLLER_AFFINITY_NEXT 2
 #define DEKO_RING_POLLER_CREATE_RETRIES 4
-#define DEKO_RING_WAIT_RESCHED_INTERVAL 1024
+#define DEKO_RING_CLAIM_SPIN_CHECK_INTERVAL 1024
+#define DEKO_RING_CLAIM_SPIN_BUDGET_NS (10ULL * NSEC_PER_USEC)
 #define DEKO_RING_POLLER_RESCHED_INTERVAL 1024
 #define DEKO_DOMAIN_BITS 8
 #define DEKO_PIN_PREFAULT_MAX_RETRIES 3
@@ -87,6 +109,8 @@ extern char __per_cpu_start[];
 #define DEKO_EXEC_RANGE_MAX_BYTES (DEKO_EXEC_RANGE_MAX_PAGES << PAGE_SHIFT)
 #define DEKO_FORK_CHILD_STACK_PREFAULT_BELOW_PAGES 4UL
 #define DEKO_FORK_CHILD_STACK_PREFAULT_ABOVE_PAGES 2UL
+#define DEKO_DATA_ALIAS_CANARY_REGISTER_MAGIC 0x44454b4f414c5301ULL
+#define DEKO_DATA_ALIAS_CANARY_INJECT_MAGIC 0x44454b4f414c5302ULL
 
 struct deko_domain_entry {
 	u64 mnt_ns_id;
@@ -102,6 +126,25 @@ static bool deko_no_eager_fault = true;
 static bool deko_pin_proxy_task = true;
 static bool deko_syscall_ring_enabled;
 static bool deko_ring_poll;
+/* Opt-in scheduling hints; the original ring owns all service decisions. */
+static bool deko_ring_msi;
+static unsigned int deko_ring_msi_spin_us = 20;
+/* Diagnostic only: evict the local service CPU's translations per request. */
+static bool deko_ring_service_flush_tlb;
+static bool deko_ring_service_mm;
+/*
+ * Test-only VMPL2 adversary hook.  It is disabled by default and never asks
+ * VMPL0 to relax a check: when enabled, a magic getpid request can copy a
+ * foreign protected PFN into the caller's Linux-owned leaf PTE while the
+ * caller is quiesced in its normal syscall translation window.  The expected
+ * outcome is that VMPL0's ordinary full-tree relock rejects the foreign alias
+ * before VMPL1 executes another instruction.
+ */
+extern int sysctl_deko_data_alias_canary;
+static DEFINE_MUTEX(deko_data_alias_canary_lock);
+static u64 deko_data_alias_canary_source_pfn_bits;
+static pid_t deko_data_alias_canary_source_pid;
+static bool deko_data_alias_canary_source_valid;
 /*
  * Test hook for exercising monitor-side stale-CR3 reclamation.  Linux is
  * untrusted and can always omit the exit hypercall, so disabling this liveness
@@ -111,11 +154,101 @@ static bool deko_exit_report = true;
 static u64 deko_ring_poller_idle_cycles = DEKO_RING_POLLER_IDLE_CYCLES_DEFAULT;
 static unsigned int deko_ring_poller_sleep_ms =
 	DEKO_RING_POLLER_SLEEP_MS_DEFAULT;
+static unsigned int deko_ring_poller_active_sleep_us =
+	DEKO_RING_POLLER_ACTIVE_SLEEP_US_DEFAULT;
+static u64 deko_ring_owner_safepoint_ns =
+	DEKO_RING_OWNER_SAFEPOINT_NS_DEFAULT;
 static int deko_ring_poller_nice;
 static unsigned int deko_ring_poller_affinity =
 	DEKO_RING_POLLER_AFFINITY_NONE;
 /* -1 keeps the affinity policy; a non-negative value pins exactly. */
 static int deko_ring_poller_cpu = -1;
+
+static int deko_data_alias_canary_leaf_pfn(struct mm_struct *mm,
+					  unsigned long address,
+					  u64 *pfn_bits, bool replace,
+					  u64 *old_pte_value,
+					  u64 expected_pfn_bits)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t entry;
+	spinlock_t *ptl;
+	int ret = 0;
+
+	if (!mm || !pfn_bits || !PAGE_ALIGNED(address) ||
+	    address >= TASK_SIZE_MAX)
+		return -EINVAL;
+
+	mmap_read_lock(mm);
+	pgd = pgd_offset(mm, address);
+	if (pgd_none(*pgd) || !pgd_present(*pgd) || pgd_bad(*pgd)) {
+		ret = -EFAULT;
+		goto out_mmap;
+	}
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || !p4d_present(*p4d) || p4d_bad(*p4d) ||
+	    p4d_leaf(*p4d)) {
+		ret = -EFAULT;
+		goto out_mmap;
+	}
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || !pud_present(*pud) || pud_bad(*pud) ||
+	    pud_leaf(*pud)) {
+		ret = -EFAULT;
+		goto out_mmap;
+	}
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd) || !pmd_present(*pmd) || pmd_bad(*pmd) ||
+	    pmd_leaf(*pmd)) {
+		ret = -EFAULT;
+		goto out_mmap;
+	}
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep) {
+		ret = -EAGAIN;
+		goto out_mmap;
+	}
+	entry = ptep_get(ptep);
+	if (!pte_present(entry) || !(pte_val(entry) & _PAGE_USER)) {
+		ret = -EFAULT;
+		goto out_pte;
+	}
+	if (replace) {
+		u64 old_value = pte_val(entry);
+		u64 new_value = (old_value & PTE_FLAGS_MASK) |
+				(*pfn_bits & PTE_PFN_MASK);
+
+		if (expected_pfn_bits &&
+		    (old_value & PTE_PFN_MASK) !=
+			    (expected_pfn_bits & PTE_PFN_MASK)) {
+			ret = -ESTALE;
+			goto out_pte;
+		}
+		if (!(*pfn_bits & PTE_PFN_MASK) ||
+		    (old_value & PTE_PFN_MASK) == (new_value & PTE_PFN_MASK)) {
+			ret = -EINVAL;
+			goto out_pte;
+		}
+		if (old_pte_value)
+			*old_pte_value = old_value;
+		set_pte_at(mm, address, ptep, __pte(new_value));
+	} else {
+		*pfn_bits = pte_val(entry) & PTE_PFN_MASK;
+		if (!*pfn_bits)
+			ret = -EFAULT;
+	}
+
+out_pte:
+	pte_unmap_unlock(ptep, ptl);
+out_mmap:
+	mmap_read_unlock(mm);
+	return ret;
+}
 
 static int __init deko_pin_proxy_task_setup(char *str)
 {
@@ -141,6 +274,35 @@ static int __init deko_exit_report_setup(char *str)
 }
 __setup("deko_exit_report=", deko_exit_report_setup);
 
+static int __init deko_ring_msi_setup(char *str)
+{
+	return kstrtobool(str, &deko_ring_msi) == 0;
+}
+__setup("deko_ring_msi=", deko_ring_msi_setup);
+
+static int __init deko_ring_service_flush_tlb_setup(char *str)
+{
+	return kstrtobool(str, &deko_ring_service_flush_tlb) == 0;
+}
+__setup("deko_ring_service_flush_tlb=", deko_ring_service_flush_tlb_setup);
+
+static int __init deko_ring_service_mm_setup(char *str)
+{
+	return kstrtobool(str, &deko_ring_service_mm) == 0;
+}
+__setup("deko_ring_service_mm=", deko_ring_service_mm_setup);
+
+static int __init deko_ring_msi_spin_us_setup(char *str)
+{
+	unsigned int value;
+
+	if (kstrtouint(str, 0, &value) || value > 200)
+		return 0;
+	deko_ring_msi_spin_us = value;
+	return 1;
+}
+__setup("deko_ring_msi_spin_us=", deko_ring_msi_spin_us_setup);
+
 static int __init deko_ring_poller_idle_cycles_setup(char *str)
 {
 	return kstrtoull(str, 0, &deko_ring_poller_idle_cycles) == 0;
@@ -152,6 +314,27 @@ static int __init deko_ring_poller_sleep_ms_setup(char *str)
 	return kstrtouint(str, 0, &deko_ring_poller_sleep_ms) == 0;
 }
 __setup("deko_ring_poller_sleep_ms=", deko_ring_poller_sleep_ms_setup);
+
+static int __init deko_ring_poller_active_sleep_us_setup(char *str)
+{
+	unsigned int value;
+
+	if (kstrtouint(str, 0, &value) != 0 ||
+	    value > DEKO_RING_POLLER_ACTIVE_SLEEP_US_MAX)
+		return 0;
+
+	deko_ring_poller_active_sleep_us = value;
+	return 1;
+}
+__setup("deko_ring_poller_active_sleep_us=",
+	deko_ring_poller_active_sleep_us_setup);
+
+static int __init deko_ring_owner_safepoint_ns_setup(char *str)
+{
+	return kstrtoull(str, 0, &deko_ring_owner_safepoint_ns) == 0;
+}
+__setup("deko_ring_owner_safepoint_ns=",
+	deko_ring_owner_safepoint_ns_setup);
 
 static int __init deko_ring_poller_nice_setup(char *str)
 {
@@ -204,6 +387,7 @@ struct deko_launch_app_call_args {
 	const struct pt_regs *regs;
 	u32 launch_type;
 	u64 migration_version;
+	u32 flags;
 };
 
 struct deko_migration_call_args {
@@ -215,6 +399,13 @@ struct deko_migration_call_args {
 struct deko_exec_range_ready_call_args {
 	unsigned long start;
 	unsigned long end;
+};
+
+struct deko_immutable_range_ready_call_args {
+	unsigned long start;
+	unsigned long end;
+	u64 first_page_gpa;
+	unsigned long page_count;
 };
 
 struct deko_exec_range_unlift_call_args {
@@ -294,6 +485,9 @@ static int deko_prepare_monitor_migration_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
 static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
 					     struct svsm_ca *caa, void *arg);
+static int deko_prepare_immutable_range_ready_call(struct svsm_call *call,
+						  struct svsm_ca *caa,
+						  void *arg);
 static int deko_prepare_exec_range_unlift_call(struct svsm_call *call,
 					       struct svsm_ca *caa, void *arg);
 static int deko_prepare_aspace_call(struct svsm_call *call,
@@ -313,6 +507,15 @@ static int deko_prefault_lift_exec_user_range(struct mm_struct *mm,
 					      unsigned long start_addr,
 					      unsigned long length,
 					      const char *reason);
+static int deko_pin_private_data_page(struct mm_struct *mm,
+				      unsigned long addr, u64 *token_out,
+				      u64 *page_gpa_out);
+static int deko_pin_private_data_fault_around(struct mm_struct *mm,
+					       unsigned long start_addr,
+					       unsigned long max_pages,
+					       u64 *first_token_out,
+					       u64 *first_page_gpa_out,
+					       unsigned long *page_count_out);
 
 static int deko_refresh_launch_app_context(struct svsm_call *call,
 					   struct svsm_ca *caa)
@@ -326,10 +529,11 @@ static int deko_refresh_launch_app_context(struct svsm_call *call,
 	return 0;
 }
 
-static int deko_svsm_call_locked(struct svsm_call *call,
-				 int (*prepare)(struct svsm_call *,
-						struct svsm_ca *, void *),
-				 void *arg)
+static int deko_svsm_call_locked_common(struct svsm_call *call,
+					int (*prepare)(struct svsm_call *,
+						       struct svsm_ca *, void *),
+					void *arg, bool retry,
+					bool prepare_current_mm)
 {
 	struct svsm_ca *caa;
 	unsigned long flags;
@@ -337,7 +541,7 @@ static int deko_svsm_call_locked(struct svsm_call *call,
 
 	migrate_disable();
 
-	if (current->mm) {
+	if (prepare_current_mm && current->mm) {
 		ret = svsm_prepare_vmpl1_current_mm(current->mm);
 		if (ret < 0)
 			goto out_migrate;
@@ -356,7 +560,8 @@ static int deko_svsm_call_locked(struct svsm_call *call,
 			goto out;
 	}
 
-	ret = svsm_perform_call_protocol(call);
+	ret = retry ? svsm_perform_call_protocol(call) :
+		      svsm_perform_call_protocol_once(call);
 
 out:
 	local_unlock_irqrestore(&deko_svsm_caa_lock, flags);
@@ -364,6 +569,36 @@ out_migrate:
 	migrate_enable();
 
 	return ret;
+}
+
+static int deko_svsm_call_locked(struct svsm_call *call,
+				 int (*prepare)(struct svsm_call *,
+						struct svsm_ca *, void *),
+				 void *arg)
+{
+	return deko_svsm_call_locked_common(call, prepare, arg, true, true);
+}
+
+static int deko_svsm_call_locked_once(struct svsm_call *call,
+				      int (*prepare)(struct svsm_call *,
+						     struct svsm_ca *, void *),
+				      void *arg)
+{
+	return deko_svsm_call_locked_common(call, prepare, arg, false, true);
+}
+
+/*
+ * The caller has pinned this task to the current CPU, holds mmap_write_lock,
+ * and has already prepared that CPU's VMPL1 mappings.  This variant keeps all
+ * potentially allocating page-table work outside a later spinlock-protected
+ * critical section while retaining the per-CPU CAA lock and one-shot call.
+ */
+static int deko_svsm_call_locked_once_mm_prepared(
+	struct svsm_call *call,
+	int (*prepare)(struct svsm_call *, struct svsm_ca *, void *),
+	void *arg)
+{
+	return deko_svsm_call_locked_common(call, prepare, arg, false, false);
 }
 
 static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
@@ -384,6 +619,30 @@ static int deko_prepare_exec_range_ready_call(struct svsm_call *call,
 
 	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_EXEC_RANGE_READY);
 
+	return 0;
+}
+
+static int deko_prepare_immutable_range_ready_call(struct svsm_call *call,
+						  struct svsm_ca *caa,
+						  void *arg)
+{
+	struct deko_immutable_range_ready_call_args *range = arg;
+	struct deko_immutable_range_ready_req *req;
+
+	BUILD_BUG_ON(sizeof(*req) > sizeof(caa->svsm_buffer));
+	req = (struct deko_immutable_range_ready_req *)caa->svsm_buffer;
+	memset(req, 0, sizeof(*req));
+	req->version = DEKO_IMMUTABLE_RANGE_READY_REQ_VERSION_V1;
+	req->req_size = sizeof(*req);
+	req->flags = DEKO_EXEC_RANGE_F_PRIVATE_CANDIDATE;
+	req->pid = current->pid;
+	req->tgid = current->tgid;
+	req->start_va = range->start;
+	req->end_va = range->end;
+	req->first_page_gpa = range->first_page_gpa;
+	req->page_count = range->page_count;
+
+	call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_IMMUTABLE_RANGE_READY);
 	return 0;
 }
 
@@ -635,6 +894,43 @@ static int deko_notify_monitor_exec_range_ready(unsigned long start,
 
 	pr_debug("Deko %s exec range lifted pid=%d tgid=%d range=[0x%lx-0x%lx)\n",
 		 reason, current->pid, current->tgid, start, end);
+	return 0;
+}
+
+static int deko_notify_monitor_immutable_range_ready(
+	unsigned long start, unsigned long end, u64 first_page_gpa,
+	unsigned long page_count, const char *reason)
+{
+	struct deko_immutable_range_ready_call_args args = {
+		.start = start,
+		.end = end,
+		.first_page_gpa = first_page_gpa,
+		.page_count = page_count,
+	};
+	struct svsm_call call = { 0 };
+	int ret;
+
+	if (!current->is_monitored)
+		return 0;
+	if (!start || start >= end || !page_count ||
+	    page_count > DEKO_PF_FAULT_AROUND_MAX_PAGES ||
+	    end - start != page_count << PAGE_SHIFT)
+		return -EINVAL;
+
+	ret = deko_svsm_call_locked(&call,
+				    deko_prepare_immutable_range_ready_call,
+				    &args);
+	if (ret < 0) {
+		pr_err("Deko %s immutable range admission failed pid=%d tgid=%d range=[0x%lx-0x%lx) pages=%lu ret=%d\n",
+		       reason, current->pid, current->tgid, start, end,
+		       page_count, ret);
+		return ret;
+	}
+	/*
+	 * The monitor service is all-or-error.  Do not inspect the per-CPU CAA
+	 * buffer after deko_svsm_call_locked() drops the migration lock: another
+	 * caller on this CPU could already have reused it.
+	 */
 	return 0;
 }
 
@@ -1156,6 +1452,120 @@ struct deko_syscall_body {
 	u64 user_rsp;
 };
 
+static int deko_run_data_alias_canary(struct deko_syscall_body *syscall_body,
+				      unsigned long syscall_nr)
+{
+	u64 original_pte_value = 0;
+	u64 source_pfn_bits = 0;
+	int ret = 0;
+
+	if (!READ_ONCE(sysctl_deko_data_alias_canary) || !current->is_monitored ||
+	    syscall_nr != __NR_getpid)
+		return 0;
+
+	if (syscall_body->dx == DEKO_DATA_ALIAS_CANARY_REGISTER_MAGIC) {
+		mutex_lock(&deko_data_alias_canary_lock);
+		ret = deko_data_alias_canary_leaf_pfn(current->mm,
+						       syscall_body->di,
+						       &source_pfn_bits, false,
+						       NULL, 0);
+		if (!ret) {
+			deko_data_alias_canary_source_pfn_bits = source_pfn_bits;
+			deko_data_alias_canary_source_pid = current->pid;
+			deko_data_alias_canary_source_valid = true;
+		}
+		mutex_unlock(&deko_data_alias_canary_lock);
+		if (!ret)
+			pr_err("data-alias canary registered protected source pid=%d va=0x%llx pfn_bits=0x%llx\n",
+			       current->pid,
+			       (unsigned long long)syscall_body->di,
+			       (unsigned long long)source_pfn_bits);
+		return ret;
+	}
+
+	if (syscall_body->dx != DEKO_DATA_ALIAS_CANARY_INJECT_MAGIC)
+		return 0;
+
+	mutex_lock(&deko_data_alias_canary_lock);
+	if (!deko_data_alias_canary_source_valid ||
+	    deko_data_alias_canary_source_pid == current->pid) {
+		ret = -ENOENT;
+	} else {
+		source_pfn_bits = deko_data_alias_canary_source_pfn_bits;
+		ret = deko_data_alias_canary_leaf_pfn(current->mm,
+						       syscall_body->di,
+						       &source_pfn_bits, true,
+						       &original_pte_value, 0);
+		if (!ret) {
+			current->deko_data_alias_canary_target_va =
+				syscall_body->di;
+			current->deko_data_alias_canary_original_pte =
+				original_pte_value;
+			current->deko_data_alias_canary_foreign_pfn_bits =
+				source_pfn_bits;
+			WRITE_ONCE(current->deko_data_alias_canary_target_valid,
+				   true);
+		}
+	}
+	mutex_unlock(&deko_data_alias_canary_lock);
+	if (!ret)
+		pr_err("data-alias canary injected foreign PTE source_pid=%d target_pid=%d target_va=0x%llx pfn_bits=0x%llx\n",
+		       deko_data_alias_canary_source_pid, current->pid,
+		       (unsigned long long)syscall_body->di,
+		       (unsigned long long)source_pfn_bits);
+	return ret;
+}
+
+/*
+ * Keep the deliberately corrupt Linux page table long enough for VMPL0 to
+ * inspect and reject it, then restore Linux's original leaf before exit_mmap()
+ * performs its ordinary rmap accounting.  This is test-harness hygiene only:
+ * VMPL0 has already made the fail-closed decision, and Linux remains outside
+ * the TCB.  No explicit TLB operation is needed because the rejected task is
+ * never returned to userspace and the normal mm teardown follows immediately.
+ */
+static void deko_cleanup_data_alias_canary(void)
+{
+	u64 original_pfn_bits;
+	u64 foreign_pfn_bits;
+	unsigned long target_va;
+	bool restored = false;
+	int ret = 0;
+
+	mutex_lock(&deko_data_alias_canary_lock);
+	if (READ_ONCE(current->deko_data_alias_canary_target_valid)) {
+		target_va = current->deko_data_alias_canary_target_va;
+		foreign_pfn_bits =
+			current->deko_data_alias_canary_foreign_pfn_bits;
+		original_pfn_bits =
+			current->deko_data_alias_canary_original_pte &
+			PTE_PFN_MASK;
+		if (!current->mm) {
+			ret = -ESRCH;
+		} else {
+			ret = deko_data_alias_canary_leaf_pfn(
+				current->mm, target_va, &original_pfn_bits, true,
+				NULL, foreign_pfn_bits);
+			restored = ret == 0;
+		}
+		WRITE_ONCE(current->deko_data_alias_canary_target_valid,
+			   false);
+	} else {
+		target_va = 0;
+	}
+	if (deko_data_alias_canary_source_valid &&
+	    deko_data_alias_canary_source_pid == current->pid)
+		deko_data_alias_canary_source_valid = false;
+	mutex_unlock(&deko_data_alias_canary_lock);
+
+	if (restored)
+		pr_err("data-alias canary restored rejected target PTE pid=%d va=0x%lx\n",
+		       current->pid, target_va);
+	else if (ret)
+		pr_warn("data-alias canary target cleanup failed pid=%d va=0x%lx ret=%d\n",
+			current->pid, target_va, ret);
+}
+
 struct deko_migration_req {
 	u32 old_cpu;
 	u32 new_cpu;
@@ -1173,15 +1583,145 @@ struct deko_shared_buf {
 	struct deko_page_fault_frame page_fault;
 };
 
+struct deko_service_alias {
+	struct page **pages;
+	unsigned long nr_pages;
+	pid_t owner_pid;
+	refcount_t refs;
+};
+
 struct deko_ring_poller {
 	struct deko_shared_buf *buf;
 	struct deko_syscall_ring *ring;
 	struct task_struct *owner;
 	struct task_struct *task;
 	struct completion exited;
+	struct completion initialized;
+	struct deko_service_alias *service_alias;
+	int setup_result;
+	wait_queue_head_t completion_wait;
+	wait_queue_head_t work_wait;
+	atomic_t work_seq;
+	atomic_t epoll_cancel_seq;
+	int msi_slot;
+	u64 last_owner_safepoint_ns;
 	bool stop;
 	bool started;
 };
+
+#include "deko-msi.h"
+
+static void deko_service_alias_put(struct deko_service_alias *alias)
+{
+	if (!alias || !refcount_dec_and_test(&alias->refs))
+		return;
+	if (alias->nr_pages)
+		unpin_user_pages_dirty_lock(alias->pages, alias->nr_pages, true);
+	pr_info("Deko service alias released owner=%d pages=%lu\n",
+		alias->owner_pid, alias->nr_pages);
+	kfree(alias->pages);
+	kfree(alias);
+}
+
+static void deko_service_vma_open(struct vm_area_struct *vma)
+{
+	struct deko_service_alias *alias = vma->vm_private_data;
+
+	refcount_inc(&alias->refs);
+}
+
+static void deko_service_vma_close(struct vm_area_struct *vma)
+{
+	deko_service_alias_put(vma->vm_private_data);
+}
+
+static vm_fault_t deko_service_vma_fault(struct vm_fault *vmf)
+{
+	/* Every supported transport page is installed before publishing READY. */
+	return VM_FAULT_SIGBUS;
+}
+
+static const struct vm_operations_struct deko_service_vm_ops = {
+	.open = deko_service_vma_open,
+	.close = deko_service_vma_close,
+	.fault = deko_service_vma_fault,
+};
+
+static int deko_service_alias_pin(struct deko_ring_poller *poller)
+{
+	struct deko_service_alias *alias;
+	unsigned long addr = (unsigned long)poller->buf->alias_buf;
+	unsigned long count = DEKO_DEFAULT_SHARED_BUF_SIZE >> PAGE_SHIFT;
+	long pinned;
+
+	if (!addr || !PAGE_ALIGNED(addr) ||
+	    poller->buf->alias_len != DEKO_DEFAULT_SHARED_BUF_SIZE ||
+	    addr > TASK_SIZE_MAX - DEKO_DEFAULT_SHARED_BUF_SIZE)
+		return -EINVAL;
+	alias = kzalloc(sizeof(*alias), GFP_KERNEL);
+	if (!alias)
+		return -ENOMEM;
+	refcount_set(&alias->refs, 1);
+	alias->owner_pid = poller->owner->pid;
+	alias->pages = kcalloc(count, sizeof(*alias->pages), GFP_KERNEL);
+	if (!alias->pages) {
+		deko_service_alias_put(alias);
+		return -ENOMEM;
+	}
+	pinned = pin_user_pages_unlocked(addr, count, alias->pages, FOLL_WRITE);
+	if (pinned > 0)
+		alias->nr_pages = pinned;
+	if (pinned != count) {
+		deko_service_alias_put(alias);
+		return pinned < 0 ? (int)pinned : -EFAULT;
+	}
+	poller->service_alias = alias;
+	return 0;
+}
+
+static int deko_service_alias_map(struct deko_ring_poller *poller)
+{
+	struct deko_service_alias *alias = poller->service_alias;
+	struct vm_area_struct *vma;
+	unsigned long addr = (unsigned long)poller->buf->alias_buf;
+	unsigned long len = poller->buf->alias_len;
+	unsigned long mapped, i;
+	int ret = -EINVAL;
+
+	if (!current->mm || current->mm == poller->owner->mm)
+		return -EINVAL;
+	mapped = vm_mmap(NULL, addr, len, PROT_READ | PROT_WRITE,
+			 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
+	if (IS_ERR_VALUE(mapped))
+		return (int)mapped;
+	if (mapped != addr) {
+		vm_munmap(mapped, len);
+		return -EFAULT;
+	}
+	mmap_write_lock(current->mm);
+	vma = vma_lookup(current->mm, addr);
+	if (!vma || vma->vm_start != addr || vma->vm_end != addr + len)
+		goto out;
+	/* No shmem pages have been faulted. Replace its fault operations with
+	 * a fixed PFN mapping and an independent lifetime for the owner pins.
+	 * VMA close, including a fatal worker exit, releases its own reference.
+	 */
+	vma->vm_private_data = alias;
+	vma->vm_ops = &deko_service_vm_ops;
+	deko_service_vma_open(vma);
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND);
+	for (i = 0; i < alias->nr_pages; i++) {
+		ret = remap_pfn_range(vma, addr + (i << PAGE_SHIFT),
+				      page_to_pfn(alias->pages[i]), PAGE_SIZE,
+				      vma->vm_page_prot);
+		if (ret)
+			break;
+	}
+out:
+	mmap_write_unlock(current->mm);
+	/* On failure do_exit() tears down the partial VMA and its pin reference. */
+	return ret;
+}
 
 struct deko_page_fault_progress {
 	u64 fault_va;
@@ -1212,6 +1752,27 @@ struct deko_migration_state {
 	u64 staged_generation;
 	bool pending;
 };
+
+/*
+ * Owner-only context for an untimed private futex wait whose word remains
+ * protected from VMPL2.  The shared ring bit merely selects this route; VMPL0
+ * revalidates the protected request identity and supplies only an equality
+ * result after the translation tree has been relocked.
+ */
+struct deko_monitor_futex_wait_ctx {
+	const struct svsm_call *launch_call;
+	const struct pt_regs *regs;
+	struct deko_migration_state *migration;
+	struct mm_struct *mm;
+	bool *translation_window_open;
+	u32 launch_type;
+	bool mmap_locked;
+	bool migration_disabled;
+};
+
+static int deko_monitor_futex_wait_prepare(void *arg);
+static int deko_monitor_futex_wait_check(void *arg);
+static void deko_monitor_futex_wait_unlock(void *arg);
 
 /* Allocate a hidden reserced user VMA not visible to the application
  * provided as a communication channel between VMPL1 and VMPL2.
@@ -1376,20 +1937,15 @@ static int deko_prepare_data_pin_transition(
 static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
 {
 	switch (syscall_num) {
-	case __NR_read:
-	case __NR_write:
-	case __NR_pread64:
-	case __NR_pwrite64:
-	case __NR_readv:
-	case __NR_writev:
-	case __NR_recvfrom:
-	case __NR_sendto:
-	case __NR_sendfile:
 	/*
 	 * These primitives do not require the owner's per-thread register or
-	 * signal state. create_io_thread() shares VM, FS, files, credentials,
-	 * namespaces, and the thread group, so executing them here preserves
-	 * their process-visible semantics while avoiding a VMPL round trip.
+	 * signal state. Both worker modes share FS, files, credentials,
+	 * namespaces, and the thread group. The private service mm maps only
+	 * the already-staged transport buffers; application memory operations
+	 * must stay on the owner. This avoids a VMPL round trip.
+	 * The clock and descriptor-control operations below are bounded local
+	 * work: none waits for external readiness.  accept is handled separately
+	 * because only a nonblocking listening descriptor has that property.
 	 * Keep this an explicit allowlist: lifecycle and unknown syscalls must
 	 * continue through the owner, where monitor quarantine and completion
 	 * processing are serialized with protected execution.
@@ -1402,6 +1958,94 @@ static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
 	case __NR_openat:
 	case __NR_close:
 	case __NR_lseek:
+	case __NR_setsockopt:
+	case __NR_epoll_ctl:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * The poller must not claim descriptor operations that can wait for external
+ * readiness.  O_NONBLOCK and MSG_DONTWAIT make that contract explicit.  A
+ * normal regular file is also bounded by storage service rather than peer
+ * readiness; anonymous-inode "regular" files (eventfd, timerfd, and similar)
+ * are excluded because their reads can block.  VMPL2 owns this file metadata,
+ * so the result is only a scheduling decision and never a security decision.
+ */
+static bool deko_ring_fd_operation_is_poll_safe(u64 fd_num)
+{
+	struct fd fd;
+	struct file *file;
+	struct inode *inode;
+	bool safe;
+
+	if (fd_num > INT_MAX)
+		return true;
+
+	fd = fdget((int)fd_num);
+	if (fd_empty(fd))
+		return true;
+
+	file = fd_file(fd);
+	inode = file_inode(file);
+	safe = (READ_ONCE(file->f_flags) & O_NONBLOCK) != 0 ||
+		(S_ISREG(inode->i_mode) &&
+		 READ_ONCE(inode->i_sb->s_magic) != ANON_INODE_FS_MAGIC) ||
+		S_ISDIR(inode->i_mode);
+	fdput(fd);
+	return safe;
+}
+
+static bool
+deko_ring_entry_blocks_by_contract(const struct deko_syscall_entry *entry)
+{
+	u64 syscall_num = READ_ONCE(entry->ax);
+
+	switch (syscall_num) {
+	case __NR_epoll_wait_old:
+	case __NR_epoll_wait:
+	case __NR_epoll_pwait:
+		return READ_ONCE(entry->r10) != 0;
+#ifdef __NR_epoll_pwait2
+	case __NR_epoll_pwait2:
+		return true;
+#endif
+	case __NR_accept:
+	case __NR_accept4:
+		return !deko_ring_fd_operation_is_poll_safe(
+			READ_ONCE(entry->di));
+	case __NR_read:
+	case __NR_write:
+	case __NR_pread64:
+	case __NR_pwrite64:
+	case __NR_readv:
+	case __NR_writev:
+		return !deko_ring_fd_operation_is_poll_safe(
+			READ_ONCE(entry->di));
+	case __NR_recvfrom:
+	case __NR_sendto:
+		return (READ_ONCE(entry->r10) & MSG_DONTWAIT) == 0 &&
+		       !deko_ring_fd_operation_is_poll_safe(
+			       READ_ONCE(entry->di));
+	case __NR_futex:
+		switch (READ_ONCE(entry->si) & FUTEX_CMD_MASK) {
+		case FUTEX_WAIT:
+		case FUTEX_WAIT_BITSET:
+		case FUTEX_WAIT_REQUEUE_PI:
+		case FUTEX_LOCK_PI:
+		case FUTEX_LOCK_PI2:
+			return true;
+		default:
+			return false;
+		}
+	case __NR_poll:
+	case __NR_ppoll:
+	case __NR_select:
+	case __NR_pselect6:
+	case __NR_nanosleep:
+	case __NR_clock_nanosleep:
 		return true;
 	default:
 		return false;
@@ -1409,10 +2053,48 @@ static inline bool deko_ring_poller_syscall_eligible(u64 syscall_num)
 }
 
 static inline bool
-deko_syscall_ring_entry_has_flag(const struct deko_syscall_entry *entry,
-				 u32 flag)
+deko_syscall_ring_entry_retains_translation(const struct deko_syscall_entry *entry)
 {
-	return (READ_ONCE(entry->_reserved) & flag) != 0;
+	return (READ_ONCE(entry->_reserved) &
+		DEKO_SYSCALL_RING_ENTRY_FLAG_RETAINED_TRANSLATION) != 0;
+}
+
+static inline bool deko_syscall_ring_entry_needs_futex_monitor_check(
+	const struct deko_syscall_entry *entry)
+{
+	return (READ_ONCE(entry->_reserved) &
+		DEKO_SYSCALL_RING_ENTRY_FLAG_FUTEX_WAIT_MONITOR_CHECK) != 0;
+}
+
+static bool deko_private_futex_wait_monitor_shape(
+	const struct deko_syscall_body *body)
+{
+	u64 op;
+	unsigned long uaddr;
+	bool wait_bitset;
+
+	if (!body || body->ax != __NR_futex || body->r10 != 0)
+		return false;
+
+	op = body->si;
+	wait_bitset = op == FUTEX_WAIT_BITSET_PRIVATE ||
+		      op == (FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME);
+	if (op != FUTEX_WAIT_PRIVATE && !wait_bitset)
+		return false;
+	if (wait_bitset && (u32)body->r9 == 0)
+		return false;
+
+	uaddr = (unsigned long)body->di;
+	return uaddr != 0 && IS_ALIGNED(uaddr, sizeof(u32)) &&
+	       access_ok((u32 __user *)uaddr, sizeof(u32));
+}
+
+static inline bool
+deko_syscall_ring_entry_is_staged_epoll(
+	const struct deko_syscall_entry *entry)
+{
+	return READ_ONCE(entry->ax) == __NR_epoll_wait &&
+	       deko_syscall_ring_entry_retains_translation(entry);
 }
 
 static inline bool
@@ -1420,18 +2102,104 @@ deko_ring_poller_entry_eligible(const struct deko_syscall_entry *entry)
 {
 	u64 syscall_num = READ_ONCE(entry->ax);
 
+	if (deko_ring_service_mm) {
+		/*
+		 * A monitor ticket says these calls have scalar arguments or every
+		 * userspace operand is staged in the pinned transport alias. They do
+		 * not use owner-private register or signal state. Eligibility here is
+		 * therefore about execution context, not expected duration: a read,
+		 * write, open, or pread that waits in the kernel parks this worker on
+		 * the native wait queue while its sole owner joins completion.
+		 *
+		 * Other calls, including openat, epoll_ctl, and setsockopt, still
+		 * carry original application pointers. Leave them on the owner until
+		 * their complete argument/output tuples use the transport. The shared
+		 * flag remains only a scheduling hint; VMPL0's protected ledger decides
+		 * whether translations may actually remain retained.
+		 */
+		if (!deko_syscall_ring_entry_retains_translation(entry))
+			return false;
+
+		switch (syscall_num) {
+		case __NR_getppid:
+		case __NR_close:
+		case __NR_lseek:
+		case __NR_open:
+		case __NR_fstat:
+		case __NR_read:
+		case __NR_pread64:
+		case __NR_write:
+			return true;
+		case __NR_clock_gettime:
+			return READ_ONCE(entry->di) == CLOCK_REALTIME ||
+			       READ_ONCE(entry->di) == CLOCK_MONOTONIC;
+		case __NR_epoll_wait:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	if (deko_ring_poller_syscall_eligible(syscall_num))
 		return true;
 
 	switch (syscall_num) {
+	case __NR_clock_gettime:
+		/* The service task inherits the owner's time namespace. CPU clocks
+		 * and dynamic IDs have task/descriptor semantics and remain owner
+		 * operations. Output is still written only to the supplied alias. */
+		return READ_ONCE(entry->di) == CLOCK_REALTIME ||
+		       READ_ONCE(entry->di) == CLOCK_MONOTONIC;
+	case __NR_read:
+	case __NR_write:
+	case __NR_pread64:
+	case __NR_pwrite64:
+	case __NR_readv:
+	case __NR_writev:
+		return deko_ring_fd_operation_is_poll_safe(
+			READ_ONCE(entry->di));
+	case __NR_recvfrom:
+	case __NR_sendto:
+		return (READ_ONCE(entry->r10) & MSG_DONTWAIT) != 0 ||
+		       deko_ring_fd_operation_is_poll_safe(
+			       READ_ONCE(entry->di));
+	case __NR_sendfile:
+		return deko_ring_fd_operation_is_poll_safe(
+			       READ_ONCE(entry->di)) &&
+		       deko_ring_fd_operation_is_poll_safe(
+			       READ_ONCE(entry->si));
+	case __NR_accept:
+	case __NR_accept4:
+		return deko_ring_fd_operation_is_poll_safe(
+			READ_ONCE(entry->di));
 	case __NR_epoll_wait_old:
 	case __NR_epoll_wait:
-	case __NR_epoll_pwait:
-		return deko_syscall_ring_entry_has_flag(
-			entry, DEKO_SYSCALL_RING_ENTRY_FLAG_EPOLL_PEEK);
+		return deko_syscall_ring_entry_retains_translation(entry);
 	default:
 		return false;
 	}
+}
+
+static inline bool deko_ring_poller_may_claim(
+	const struct deko_syscall_ring *ring,
+	const struct deko_syscall_entry *entry)
+{
+	/*
+	 * A retained-translation request must enter the private service mm. Claim it
+	 * only while the monitor's asynchronous scheduling epoch is active; after a
+	 * missed notification, the owner explicitly starts a new epoch and joins
+	 * completion. The flag is not authorization: entry publication and VMPL0
+	 * completion validation remain authoritative even if VMPL2 forges it.
+	 */
+	if (!deko_ring_poller_entry_eligible(entry))
+		return false;
+	if (deko_syscall_ring_entry_retains_translation(entry)) {
+		if (!READ_ONCE(deko_ring_service_mm))
+			return false;
+		return READ_ONCE(ring->producer_state) ==
+		       DEKO_RING_PRODUCER_ACTIVE;
+	}
+	return true;
 }
 
 static inline bool deko_ring_poller_syscall_dangerous(u64 syscall_num)
@@ -1653,16 +2421,91 @@ static int deko_pin_prefault_user_range(struct mm_struct *mm,
 	return 0;
 }
 
+/*
+ * The exec span is reserved for complete ELF images.  Admit only the
+ * non-writable, non-executable, private file pieces of that image as eager
+ * immutable data.  This deliberately excludes generic file mappings and
+ * writable initialized data.
+ */
+static bool deko_range_is_immutable_exec_image(struct mm_struct *mm,
+					       unsigned long start_addr,
+					       unsigned long end_addr)
+{
+	struct vm_area_struct *vma;
+	unsigned long span_base;
+	unsigned long span_end;
+	bool eligible = false;
+
+	if (!mm || start_addr >= end_addr ||
+	    !READ_ONCE(mm->deko_exec_span))
+		return false;
+
+	span_base = READ_ONCE(mm->deko_exec_span_base);
+	if (check_add_overflow(span_base, DEKO_EXEC_SPAN_SIZE, &span_end) ||
+	    start_addr < span_base || end_addr > span_end)
+		return false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, start_addr);
+	if (vma && start_addr >= vma->vm_start && end_addr <= vma->vm_end &&
+	    vma->vm_file && is_cow_mapping(vma->vm_flags) &&
+	    (vma->vm_flags & VM_READ) && (vma->vm_flags & VM_LOCKED) &&
+	    !(vma->vm_flags & (VM_WRITE | VM_EXEC | VM_SHARED | VM_IO |
+			       VM_PFNMAP | VM_MIXEDMAP)))
+		eligible = true;
+	mmap_read_unlock(mm);
+
+	return eligible;
+}
+
+static int deko_admit_immutable_exec_image_range(struct mm_struct *mm,
+						 unsigned long start_addr,
+						 unsigned long end_addr,
+						 const char *reason)
+{
+	unsigned long cur = start_addr;
+
+	while (cur < end_addr) {
+		unsigned long leaf_end = ALIGN(cur + 1, PMD_SIZE);
+		unsigned long remaining = (end_addr - cur) >> PAGE_SHIFT;
+		unsigned long leaf_pages = (leaf_end - cur) >> PAGE_SHIFT;
+		unsigned long requested = min3(remaining, leaf_pages,
+					       (unsigned long)DEKO_PF_FAULT_AROUND_MAX_PAGES);
+		unsigned long admitted_pages = 1;
+		u64 first_token;
+		u64 first_page_gpa;
+		int ret;
+
+		if (!requested)
+			return -EINVAL;
+		if (requested == 1) {
+			ret = deko_pin_private_data_page(mm, cur, &first_token,
+						 &first_page_gpa);
+		} else {
+			ret = deko_pin_private_data_fault_around(
+				mm, cur, requested, &first_token,
+				&first_page_gpa, &admitted_pages);
+		}
+		if (ret < 0 || !admitted_pages || admitted_pages > requested)
+			return ret < 0 ? ret : -EFAULT;
+		ret = deko_notify_monitor_immutable_range_ready(
+			cur, cur + (admitted_pages << PAGE_SHIFT),
+			first_page_gpa, admitted_pages, reason);
+		if (ret < 0)
+			return ret;
+		cur += admitted_pages << PAGE_SHIFT;
+	}
+	return 0;
+}
+
 static int eager_fault_user_range(struct mm_struct *mm,
 				  unsigned long start_addr,
 				  unsigned long length, unsigned long prot,
 				  const char *reason)
 {
 	unsigned long end_addr;
+	bool immutable_exec_image;
 	int ret;
-
-	if (READ_ONCE(deko_no_eager_fault))
-		return 0;
 
 	if (!mm || !length || !prot)
 		return 0;
@@ -1674,6 +2517,11 @@ static int eager_fault_user_range(struct mm_struct *mm,
 	start_addr = PAGE_ALIGN_DOWN(start_addr);
 
 	if (start_addr >= end_addr)
+		return 0;
+
+	immutable_exec_image = prot == PROT_READ &&
+		deko_range_is_immutable_exec_image(mm, start_addr, end_addr);
+	if (READ_ONCE(deko_no_eager_fault) && !immutable_exec_image)
 		return 0;
 
 	deko_clamp_file_tail_populate_range(mm, start_addr, &end_addr, prot,
@@ -1694,7 +2542,19 @@ static int eager_fault_user_range(struct mm_struct *mm,
 		return ret;
 	}
 
-	ret = deko_pin_prefault_user_range(mm, start_addr, end_addr, prot, reason);
+	/*
+	 * FOLL_WRITE creates a context-private COW frame without changing the R--
+	 * VMA permission.  VMPL0 later authenticates and write-protects that exact
+	 * pinned frame before VMPL1 can consume it.
+	 */
+	if (immutable_exec_image && current->is_monitored)
+		ret = deko_admit_immutable_exec_image_range(mm, start_addr,
+						     end_addr, reason);
+	else
+		ret = deko_pin_prefault_user_range(mm, start_addr, end_addr,
+						   immutable_exec_image ?
+							   prot | PROT_WRITE : prot,
+						   reason);
 	if (ret < 0) {
 		pr_err("Prefault range failed for %s: start=0x%lx end=0x%lx length=0x%lx prot=0x%lx ret=%d\n",
 			reason, start_addr, end_addr, length, prot, ret);
@@ -1915,6 +2775,65 @@ static int eager_fault_vma_containing_addr(struct mm_struct *mm,
 	return eager_fault_user_range(mm, start, length, prot, reason);
 }
 
+/* Diagnostic only: snapshot the ordinary Linux PTE before clone3 writes a
+ * parent TID.  This does not touch the user frame itself. */
+static void deko_log_clone_user_pte(struct mm_struct *mm,
+				    unsigned long address, const char *name,
+				    const char *phase)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t entry = __pte(0);
+	spinlock_t *ptl;
+	int level = 0;
+
+	if (!mm || !address || address >= TASK_SIZE_MAX)
+		return;
+
+	mmap_read_lock(mm);
+	pgd = pgd_offset(mm, address);
+	if (pgd_none(*pgd) || !pgd_present(*pgd) || pgd_bad(*pgd))
+		goto out;
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || !p4d_present(*p4d) || p4d_bad(*p4d) ||
+	    p4d_leaf(*p4d))
+		goto out;
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || !pud_present(*pud) || pud_bad(*pud))
+		goto out;
+	if (pud_leaf(*pud)) {
+		level = 3;
+		entry = __pte(pud_val(*pud));
+		goto out;
+	}
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd) || !pmd_present(*pmd) || pmd_bad(*pmd))
+		goto out;
+	if (pmd_leaf(*pmd)) {
+		level = 2;
+		entry = __pte(pmd_val(*pmd));
+		goto out;
+	}
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep)
+		goto out;
+	entry = ptep_get(ptep);
+	level = 1;
+	pte_unmap_unlock(ptep, ptl);
+out:
+	mmap_read_unlock(mm);
+	pr_info("Deko clone3 PTE pid=%d phase=%s field=%s va=0x%lx level=%d raw=0x%llx present=%u user=%u write=%u young=%u dirty=%u\n",
+		current->pid, phase, name, address, level,
+		(unsigned long long)pte_val(entry), pte_present(entry) ? 1 : 0,
+		(pte_val(entry) & _PAGE_USER) ? 1 : 0,
+		pte_write(entry) ? 1 : 0, pte_young(entry) ? 1 : 0,
+		pte_dirty(entry) ? 1 : 0);
+}
+
 static int clone_stack_pre_handler(struct mm_struct *mm,
 				   const struct deko_syscall_body *syscall_body,
 				   unsigned long syscall_nr)
@@ -1925,6 +2844,7 @@ static int clone_stack_pre_handler(struct mm_struct *mm,
 	if (syscall_nr == __NR_clone3) {
 		struct clone_args args = {};
 		size_t size = min_t(size_t, syscall_body->si, sizeof(args));
+		int ret;
 
 		if (!syscall_body->di ||
 		    size < offsetofend(struct clone_args, stack_size))
@@ -1936,16 +2856,37 @@ static int clone_stack_pre_handler(struct mm_struct *mm,
 				current->pid);
 			return 0;
 		}
+		pr_info("Deko clone3 args pid=%d flags=0x%llx pidfd=0x%llx child_tid=0x%llx parent_tid=0x%llx stack=0x%llx stack_size=0x%llx tls=0x%llx\n",
+			current->pid, (unsigned long long)args.flags,
+			(unsigned long long)args.pidfd,
+			(unsigned long long)args.child_tid,
+			(unsigned long long)args.parent_tid,
+			(unsigned long long)args.stack,
+			(unsigned long long)args.stack_size,
+			(unsigned long long)args.tls);
+		if (args.parent_tid)
+			deko_log_clone_user_pte(mm, (unsigned long)args.parent_tid,
+						"parent_tid", "before_prefault");
+		if (args.child_tid && args.child_tid != args.parent_tid)
+			deko_log_clone_user_pte(mm, (unsigned long)args.child_tid,
+						"child_tid", "before_prefault");
 
 		if (!(args.flags & CLONE_THREAD) || !args.stack ||
 		    !args.stack_size)
 			return 0;
 
-		return eager_fault_populatable_user_range(mm,
-							  (unsigned long)args.stack,
-							  (unsigned long)args.stack_size,
-							  PROT_READ | PROT_WRITE,
-							  "clone_stack_pre");
+		ret = eager_fault_populatable_user_range(mm,
+							 (unsigned long)args.stack,
+							 (unsigned long)args.stack_size,
+							 PROT_READ | PROT_WRITE,
+							 "clone_stack_pre");
+		if (args.parent_tid)
+			deko_log_clone_user_pte(mm, (unsigned long)args.parent_tid,
+						"parent_tid", "after_prefault");
+		if (args.child_tid && args.child_tid != args.parent_tid)
+			deko_log_clone_user_pte(mm, (unsigned long)args.child_tid,
+						"child_tid", "after_prefault");
+		return ret;
 	}
 
 	if (syscall_nr == __NR_clone) {
@@ -2449,7 +3390,9 @@ static int deko_app_handle_system_calls_post(
 
 static int deko_app_handle_system_calls(
 	struct deko_syscall_body *syscall_body,
-	struct deko_data_pin_transition *pin_transition)
+	struct deko_data_pin_transition *pin_transition,
+	const atomic_t *epoll_cancel_seq, int expected_epoll_cancel_seq,
+	struct deko_monitor_futex_wait_ctx *futex_wait_ctx)
 {
 	struct pt_regs tmp_regs = { 0 };
 	struct pt_regs saved_current_regs;
@@ -2514,7 +3457,33 @@ static int deko_app_handle_system_calls(
 		*current_regs = tmp_regs;
 	}
 
-	sys_retval = syscall_fn(&tmp_regs);
+	if (futex_wait_ctx) {
+		u32 bitset;
+
+		if (unlikely(!deko_private_futex_wait_monitor_shape(syscall_body))) {
+			sys_retval = -EPROTO;
+		} else {
+			bitset = syscall_body->si == FUTEX_WAIT_PRIVATE ?
+				 FUTEX_BITSET_MATCH_ANY : (u32)syscall_body->r9;
+			sys_retval = futex_wait_with_monitor_check(
+				(u32 __user *)(unsigned long)syscall_body->di,
+				(int)syscall_body->si, bitset,
+				deko_monitor_futex_wait_prepare,
+				deko_monitor_futex_wait_check,
+				deko_monitor_futex_wait_unlock, futex_wait_ctx);
+		}
+	} else if (syscall_nr == __NR_epoll_wait && epoll_cancel_seq) {
+		sys_retval = epoll_wait_cancelable(
+			(int)syscall_body->di,
+			(struct epoll_event __user *)syscall_body->si,
+			(int)syscall_body->dx, (int)syscall_body->r10,
+			epoll_cancel_seq, expected_epoll_cancel_seq);
+	} else {
+		sys_retval = syscall_fn(&tmp_regs);
+	}
+	ret = deko_run_data_alias_canary(syscall_body, syscall_nr);
+	if (ret < 0)
+		sys_retval = ret;
 
 	if (override_current_regs)
 		*current_regs = saved_current_regs;
@@ -2590,17 +3559,113 @@ static void deko_syscall_ring_entry_to_body(
 	syscall_body->r9 = READ_ONCE(entry->r9);
 }
 
+static void deko_syscall_ring_signal_owner(struct deko_ring_poller *poller,
+					   bool from_poller)
+{
+	if (!poller || !from_poller)
+		return;
+
+	/* Pairs with wait_event()'s queue publication and predicate recheck. */
+	smp_mb();
+	if (waitqueue_active(&poller->completion_wait))
+		wake_up_all(&poller->completion_wait);
+}
+
+static void deko_syscall_ring_wake_poller(struct deko_ring_poller *poller)
+{
+	if (!poller || !poller->task)
+		return;
+
+	/*
+	 * The sequence closes the race between publishing ASLEEP and entering the
+	 * wait queue.  A wake that arrives in that window changes the predicate,
+	 * so wait_event() cannot turn it into a scheduler-tick-sized delay.
+	 */
+	atomic_inc(&poller->work_seq);
+	smp_mb__after_atomic();
+	wake_up_all(&poller->work_wait);
+}
+
+static void
+deko_syscall_ring_cancel_epoll_wait(struct deko_ring_poller *poller)
+{
+	if (!poller || !poller->task)
+		return;
+
+	/*
+	 * The worker snapshots this sequence before publishing CLAIMED.  Increment
+	 * it before the wake so eventpoll either observes cancellation in its final
+	 * pre-schedule check or is already interruptible when wake_up_process() runs.
+	 */
+	(void)atomic_inc_return(&poller->epoll_cancel_seq);
+	wake_up_process(poller->task);
+}
+
+static bool
+deko_syscall_ring_owner_safepoint_due(struct deko_ring_poller *poller)
+{
+	u64 interval_ns = READ_ONCE(deko_ring_owner_safepoint_ns);
+	u64 now_ns;
+	u64 last_ns;
+
+	/* A zero interval retains the conservative per-boundary behavior. */
+	if (!poller || !interval_ns)
+		return true;
+
+	now_ns = ktime_get_mono_fast_ns();
+	last_ns = READ_ONCE(poller->last_owner_safepoint_ns);
+	if (now_ns >= last_ns && now_ns - last_ns < interval_ns)
+		return false;
+
+	WRITE_ONCE(poller->last_owner_safepoint_ns, now_ns);
+	return true;
+}
+
+/*
+ * The private service-mm worker performs the caller's complete epoll wait on
+ * eventpoll's native wait queue.  Owner signals and teardown change a monotonic
+ * sequence and wake this task, so cancellation needs neither timeout slicing
+ * nor repeated readiness probes.
+ */
+static int deko_syscall_ring_run_epoll_wait(
+	struct deko_syscall_body *syscall_body,
+	struct deko_data_pin_transition *pin_transition,
+	struct deko_ring_poller *poller, int expected_cancel_seq)
+{
+	u64 syscall_nr = syscall_body->ax;
+	u64 started_ns = ktime_get_ns();
+	s32 timeout = (s32)syscall_body->r10;
+	int ret;
+
+	syscall_body->ax = syscall_nr;
+	ret = deko_app_handle_system_calls(
+		syscall_body, pin_transition, &poller->epoll_cancel_seq,
+		expected_cancel_seq, NULL);
+	trace_deko_ring_epoll_wait(timeout, (s64)syscall_body->ax, ret,
+				   ktime_get_ns() - started_ns);
+	return ret;
+}
+
 static int deko_syscall_ring_complete_claimed(
 	struct deko_shared_buf *buf, struct deko_syscall_entry *entry, u32 index,
-	bool *normal_exit, int *exit_code, bool from_poller,
-	struct deko_data_pin_transition *pin_transition)
+	bool *normal_exit, int *exit_code, bool *group_exit, bool from_poller,
+	struct deko_ring_poller *poller,
+	int expected_epoll_cancel_seq,
+	struct deko_data_pin_transition *pin_transition,
+	struct deko_monitor_futex_wait_ctx *futex_wait_ctx)
 {
 	struct deko_syscall_body syscall_body = { 0 };
+	struct deko_monitor_futex_wait_ctx *monitor_wait = NULL;
 	u64 syscall_nr;
+	u64 service_started_ns;
 	int ret;
 
 	deko_syscall_ring_entry_to_body(entry, &syscall_body);
 	syscall_nr = syscall_body.ax;
+	if (!from_poller && futex_wait_ctx &&
+	    deko_syscall_ring_entry_needs_futex_monitor_check(entry) &&
+	    deko_private_futex_wait_monitor_shape(&syscall_body))
+		monitor_wait = futex_wait_ctx;
 
 	if (from_poller && !deko_ring_poller_entry_eligible(entry) &&
 	    deko_ring_poller_syscall_dangerous(syscall_nr)) {
@@ -2610,10 +3675,34 @@ static int deko_syscall_ring_complete_claimed(
 		WRITE_ONCE(entry->ret, syscall_body.ax);
 		WRITE_ONCE(buf->syscall_body.ax, syscall_body.ax);
 		smp_store_release(&entry->state, DEKO_SYSCALL_RING_ENTRY_DONE);
+		deko_syscall_ring_signal_owner(poller, from_poller);
 		return 0;
 	}
 
-	ret = deko_app_handle_system_calls(&syscall_body, pin_transition);
+	if (from_poller && deko_ring_service_flush_tlb) {
+		unsigned long irq_flags;
+
+		/* Local CPU only; leave page tables and RMP permissions intact. */
+		local_irq_save(irq_flags);
+		__flush_tlb_all();
+		local_irq_restore(irq_flags);
+	}
+	service_started_ns = trace_deko_ring_service_enabled() ?
+		ktime_get_ns() : 0;
+	if (from_poller && deko_syscall_ring_entry_is_staged_epoll(entry)) {
+		ret = deko_syscall_ring_run_epoll_wait(
+			&syscall_body, pin_transition, poller,
+			expected_epoll_cancel_seq);
+		if (service_started_ns)
+			trace_deko_ring_service(syscall_nr, from_poller, ret,
+					       ktime_get_ns() - service_started_ns);
+	} else {
+		ret = deko_app_handle_system_calls(
+			&syscall_body, pin_transition, NULL, 0, monitor_wait);
+		if (service_started_ns)
+			trace_deko_ring_service(syscall_nr, from_poller, ret,
+					       ktime_get_ns() - service_started_ns);
+	}
 	if (ret != 0) {
 		pr_err("Error handling syscall ring entry pid=%d index=%u syscall=%llu ret=%d\n",
 		       current->pid, index, (unsigned long long)syscall_nr, ret);
@@ -2623,10 +3712,13 @@ static int deko_syscall_ring_complete_claimed(
 	WRITE_ONCE(entry->ret, syscall_body.ax);
 	WRITE_ONCE(buf->syscall_body.ax, syscall_body.ax);
 	smp_store_release(&entry->state, DEKO_SYSCALL_RING_ENTRY_DONE);
+	deko_syscall_ring_signal_owner(poller, from_poller);
 
 	if (!from_poller && is_exit_syscall(syscall_nr)) {
 		if (exit_code)
 			*exit_code = (int)(syscall_body.di & 0xff);
+		if (group_exit)
+			*group_exit = syscall_nr == __NR_exit_group;
 		*normal_exit = true;
 	}
 
@@ -2634,15 +3726,22 @@ static int deko_syscall_ring_complete_claimed(
 }
 
 static int deko_syscall_ring_wait_done(struct deko_syscall_entry *entry,
-				       u32 index)
+				       u32 index,
+				       struct deko_ring_poller *poller,
+				       bool blocks_by_contract)
 {
+	u64 spin_started_ns = ktime_get_ns();
 	unsigned int spins = 0;
+	int wait_ret = 0;
+	u32 state;
 
-	for (;;) {
-		u32 state = smp_load_acquire(&entry->state);
+	while (!blocks_by_contract) {
+		state = smp_load_acquire(&entry->state);
 
 		if (state == DEKO_SYSCALL_RING_ENTRY_DONE)
 			return 0;
+		if (state == DEKO_SYSCALL_RING_ENTRY_READY)
+			return 1;
 
 		if (state != DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
 			pr_err("Deko syscall ring wait saw invalid state pid=%d index=%u state=%u\n",
@@ -2652,12 +3751,64 @@ static int deko_syscall_ring_wait_done(struct deko_syscall_entry *entry,
 
 		cpu_relax();
 		spins++;
-		if ((spins & (DEKO_RING_WAIT_RESCHED_INTERVAL - 1)) == 0)
-			cond_resched();
+		if ((spins & (DEKO_RING_CLAIM_SPIN_CHECK_INTERVAL - 1)) == 0 &&
+		    ktime_get_ns() - spin_started_ns >=
+			    DEKO_RING_CLAIM_SPIN_BUDGET_NS)
+			break;
 	}
+
+	/*
+	 * A claimed request may be waiting on external readiness in the poller.
+	 * Use a service-time budget rather than an instruction-count budget: the
+	 * former covers normal mediated copies without depending on a particular
+	 * CPU's pause cost.  After the budget, sleeping is required so one blocking
+	 * syscall cannot consume the owner's CPU indefinitely.
+	 */
+	if (!poller) {
+		pr_err("Deko syscall ring wait has no poller pid=%d index=%u\n",
+		       current->pid, index);
+		return -EIO;
+	}
+
+	if (deko_syscall_ring_entry_is_staged_epoll(entry))
+		wait_ret = wait_event_interruptible(
+			poller->completion_wait,
+			smp_load_acquire(&entry->state) !=
+					DEKO_SYSCALL_RING_ENTRY_CLAIMED ||
+				READ_ONCE(poller->stop));
+	else
+		wait_event(poller->completion_wait,
+			   smp_load_acquire(&entry->state) !=
+					   DEKO_SYSCALL_RING_ENTRY_CLAIMED ||
+			   READ_ONCE(poller->stop));
+
+	if (wait_ret) {
+		deko_syscall_ring_cancel_epoll_wait(poller);
+		/*
+		 * The stack-backed eventpoll waiter and ring entry remain live until
+		 * the worker publishes a terminal state.  Join it uninterruptibly
+		 * after forwarding the owner's signal as an epoll cancellation.
+		 */
+		wait_event(poller->completion_wait,
+			   smp_load_acquire(&entry->state) !=
+					   DEKO_SYSCALL_RING_ENTRY_CLAIMED ||
+			   READ_ONCE(poller->stop));
+	}
+
+	state = smp_load_acquire(&entry->state);
+	if (state == DEKO_SYSCALL_RING_ENTRY_DONE)
+		return 0;
+	if (state == DEKO_SYSCALL_RING_ENTRY_READY)
+		return 1;
+	if (READ_ONCE(poller->stop))
+		return -ECANCELED;
+
+	pr_err("Deko syscall ring wait woke in invalid state pid=%d index=%u state=%u\n",
+	       current->pid, index, state);
+	return -EIO;
 }
 
-static bool deko_syscall_ring_has_poller_ready(
+static bool deko_syscall_ring_has_poller_wake_work(
 	const struct deko_syscall_ring *ring)
 {
 	u32 head = READ_ONCE(ring->head);
@@ -2671,7 +3822,7 @@ static bool deko_syscall_ring_has_poller_ready(
 		u32 state = smp_load_acquire(&entry->state);
 
 		if (state == DEKO_SYSCALL_RING_ENTRY_READY)
-			return deko_ring_poller_entry_eligible(entry);
+			return deko_ring_poller_may_claim(ring, entry);
 		if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED)
 			return false;
 
@@ -2681,12 +3832,74 @@ static bool deko_syscall_ring_has_poller_ready(
 	return false;
 }
 
+/*
+ * Pollers are optional service infrastructure, not part of request
+ * authorization or completion. Allocate one only after a release-published
+ * eligible request exists, but start it before servicing that request. This
+ * lets a staged blocking wait enter the private service mm on its first use
+ * while tasks that never issue eligible calls allocate no worker.
+ */
+static bool deko_syscall_ring_needs_poller(struct deko_shared_buf *buf)
+{
+	struct deko_syscall_ring *ring;
+	u32 head;
+	u32 tail;
+
+	if (!buf || !buf->buf)
+		return false;
+
+	ring = (struct deko_syscall_ring *)buf->buf;
+	if (!deko_syscall_ring_available(ring))
+		return false;
+	head = READ_ONCE(ring->head);
+	tail = READ_ONCE(ring->tail);
+	if (head >= DEKO_RING_CAPACITY || tail >= DEKO_RING_CAPACITY ||
+	    head == tail)
+		return false;
+
+	return smp_load_acquire(&ring->entries[head].state) ==
+		       DEKO_SYSCALL_RING_ENTRY_READY &&
+	       deko_ring_poller_entry_eligible(&ring->entries[head]);
+}
+
+static void deko_log_stalled_claim(const struct deko_syscall_ring *ring,
+				   const struct deko_syscall_entry *entry,
+				   u32 index,
+				   const struct deko_ring_poller *poller)
+{
+	u64 heartbeat = READ_ONCE(ring->poller_heartbeat);
+	u64 syscall_nr = READ_ONCE(entry->ax);
+	u32 entry_state = READ_ONCE(entry->state);
+	u32 producer_state = READ_ONCE(ring->producer_state);
+	u32 poller_state = READ_ONCE(ring->poller_state);
+	unsigned int worker_state = READ_ONCE(poller->task->__state);
+	unsigned int worker_cpu = task_cpu(poller->task);
+	bool may_claim = deko_ring_poller_may_claim(ring, entry);
+
+	pr_err_ratelimited("Deko retained claim stalled pid=%d index=%u "
+			   "syscall=%llu state=%u producer=%u poller=%u "
+			   "may_claim=%u worker_state=%u worker_cpu=%u "
+			   "heartbeat=%llu\n",
+			   current->pid, index,
+			   (unsigned long long)syscall_nr, entry_state,
+			   producer_state, poller_state, may_claim, worker_state,
+			   worker_cpu, (unsigned long long)heartbeat);
+}
+
 static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 					  bool *normal_exit, bool *handled,
 					  bool *ring_present,
 					  int *exit_code,
+					  bool *group_exit,
 					  bool from_poller,
-					  struct deko_data_pin_transition *pin_transition)
+					  struct deko_ring_poller *poller,
+					  bool *owner_blocking_service,
+					  bool *made_progress,
+#ifdef DEKO_POLLER_METRICS
+					  u64 *completions_serviced,
+#endif
+					  struct deko_data_pin_transition *pin_transition,
+					  struct deko_monitor_futex_wait_ctx *futex_wait_ctx)
 {
 	struct deko_syscall_ring *ring;
 	u32 head, tail;
@@ -2694,6 +3907,10 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 
 	*handled = false;
 	*ring_present = false;
+	if (made_progress)
+		*made_progress = false;
+	if (owner_blocking_service)
+		*owner_blocking_service = false;
 	if (!buf || !buf->buf)
 		return 0;
 
@@ -2712,28 +3929,85 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 
 	while (head != tail) {
 		struct deko_syscall_entry *entry = &ring->entries[head];
+		int expected_epoll_cancel_seq = 0;
 		u32 state;
 		int ret;
 
 		state = smp_load_acquire(&entry->state);
 		if (state == DEKO_SYSCALL_RING_ENTRY_READY) {
+			long claim_wait;
+
 			if (from_poller &&
-			    !deko_ring_poller_entry_eligible(entry))
+			    !deko_ring_poller_may_claim(ring, entry))
 				break;
+			if (!from_poller &&
+			    deko_syscall_ring_entry_retains_translation(entry)) {
+				if (!READ_ONCE(deko_ring_service_mm) ||
+				    !deko_ring_poller_entry_eligible(entry) || !poller ||
+				    !poller->task || !poller->service_alias) {
+					pr_err("Deko retained-translation request has no eligible private worker pid=%d index=%u syscall=%llu\n",
+					       current->pid, head,
+					       (unsigned long long)READ_ONCE(entry->ax));
+					return -EIO;
+				}
+				if (owner_blocking_service)
+					*owner_blocking_service = true;
+				/*
+				 * VMPL0 ends its bounded spin epoch before entering this
+				 * owner. Re-arm the scheduling hint and leave the request
+				 * exclusively to the service-mm worker: executing it here
+				 * would require the application's retained translation tree.
+				 */
+				smp_store_release(&ring->producer_state,
+						  DEKO_RING_PRODUCER_ACTIVE);
+				deko_syscall_ring_wake_poller(poller);
+				claim_wait = wait_event_timeout(poller->completion_wait,
+					smp_load_acquire(&entry->state) !=
+						DEKO_SYSCALL_RING_ENTRY_READY ||
+						READ_ONCE(poller->stop), HZ);
+				if (!claim_wait)
+					deko_log_stalled_claim(ring, entry, head,
+							       poller);
+				if (READ_ONCE(poller->stop) &&
+				    smp_load_acquire(&entry->state) ==
+					    DEKO_SYSCALL_RING_ENTRY_READY)
+					return -ECANCELED;
+				continue;
+			}
+			if (from_poller && poller &&
+			    deko_syscall_ring_entry_is_staged_epoll(entry))
+				expected_epoll_cancel_seq =
+					atomic_read(&poller->epoll_cancel_seq);
 			if (cmpxchg(&entry->state, DEKO_SYSCALL_RING_ENTRY_READY,
 				    DEKO_SYSCALL_RING_ENTRY_CLAIMED) !=
-			    DEKO_SYSCALL_RING_ENTRY_READY)
+				    DEKO_SYSCALL_RING_ENTRY_READY)
 				continue;
+			if (from_poller &&
+			    deko_syscall_ring_entry_retains_translation(entry))
+				deko_syscall_ring_signal_owner(poller, true);
+			if (!from_poller && owner_blocking_service &&
+			    deko_ring_entry_blocks_by_contract(entry))
+				*owner_blocking_service = true;
 
 			ret = deko_syscall_ring_complete_claimed(
-				buf, entry, head, normal_exit, exit_code,
-				from_poller, pin_transition);
+				buf, entry, head, normal_exit, exit_code, group_exit,
+				from_poller, poller, expected_epoll_cancel_seq,
+				pin_transition, futex_wait_ctx);
 		} else if (state == DEKO_SYSCALL_RING_ENTRY_CLAIMED) {
+			bool blocks_by_contract;
+
 			if (from_poller)
 				break;
-			ret = deko_syscall_ring_wait_done(entry, head);
-			if (ret != 0)
+			blocks_by_contract =
+				deko_ring_entry_blocks_by_contract(entry);
+			if (owner_blocking_service && blocks_by_contract)
+				*owner_blocking_service = true;
+			ret = deko_syscall_ring_wait_done(
+				entry, head, poller, blocks_by_contract);
+			if (ret < 0)
 				return ret;
+			if (ret > 0)
+				continue;
 		} else if (state == DEKO_SYSCALL_RING_ENTRY_DONE) {
 			ret = 0;
 		} else if (state == DEKO_SYSCALL_RING_ENTRY_EMPTY) {
@@ -2746,10 +4020,16 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 		}
 
 		*handled = true;
+		if (made_progress)
+			*made_progress = true;
 		drained++;
 		head = deko_syscall_ring_advance_head(ring, head);
 		if (head >= DEKO_RING_CAPACITY)
 			return -EINVAL;
+#ifdef DEKO_POLLER_METRICS
+		if (completions_serviced)
+			(*completions_serviced)++;
+#endif
 
 		if (ret != 0)
 			return ret;
@@ -2767,20 +4047,39 @@ static int deko_syscall_ring_drain_common(struct deko_shared_buf *buf,
 static int deko_syscall_ring_drain(struct deko_shared_buf *buf,
 				   bool *normal_exit, bool *handled,
 				   bool *ring_present, int *exit_code,
-				   struct deko_data_pin_transition *pin_transition)
+				   bool *group_exit,
+				   struct deko_ring_poller *poller,
+				   bool *owner_blocking_service,
+				   struct deko_data_pin_transition *pin_transition,
+				   struct deko_monitor_futex_wait_ctx *futex_wait_ctx)
 {
 	return deko_syscall_ring_drain_common(buf, normal_exit, handled,
-					      ring_present, exit_code, false,
-					      pin_transition);
+					      ring_present, exit_code, group_exit, false,
+					      poller, owner_blocking_service, NULL,
+#ifdef DEKO_POLLER_METRICS
+					      NULL,
+#endif
+					      pin_transition, futex_wait_ctx);
 }
 
 static int deko_syscall_ring_poller_main(void *data)
 {
 	struct deko_ring_poller *poller = data;
 	struct deko_syscall_ring *ring = poller->ring;
+	struct deko_ring_msi_control *msi;
 	u64 idle_since = rdtsc_ordered();
+	u64 msi_last_work = idle_since;
+	u64 msi_spin_cycles = (u64)tsc_khz * READ_ONCE(deko_ring_msi_spin_us) / 1000;
 	unsigned int resched_ticks = 0;
 	char comm[TASK_COMM_LEN] = {};
+#ifdef DEKO_POLLER_METRICS
+	u64 metrics_iterations = 0;
+	u64 metrics_iterations_with_work = 0;
+	u64 metrics_completions_serviced = 0;
+	u64 metrics_start_cycles;
+	u64 metrics_start_utime_ns;
+	u64 metrics_start_stime_ns;
+#endif
 
 	snprintf(comm, sizeof(comm), "deko-ring-%d", current->pid);
 	set_task_comm(current, comm);
@@ -2791,9 +4090,27 @@ static int deko_syscall_ring_poller_main(void *data)
 	 * poller's pid after the owner has already reclaimed the application.
 	 */
 	current->is_monitored = false;
+	if (poller->service_alias) {
+		int ret = deko_service_alias_map(poller);
+
+		WRITE_ONCE(poller->setup_result, ret);
+		complete(&poller->initialized);
+		if (ret)
+			goto out_service;
+		pr_info("Deko private service mm owner=%d poller=%d pages=%lu\n",
+			poller->owner->pid, current->pid,
+			poller->service_alias->nr_pages);
+	}
+	msi = deko_msi_attach(poller);
+#ifdef DEKO_POLLER_METRICS
+	metrics_start_cycles = rdtsc_ordered();
+	task_cputime_adjusted(current, &metrics_start_utime_ns,
+			       &metrics_start_stime_ns);
+#endif
 
 	for (;;) {
 		bool handled = false;
+		bool made_progress = false;
 		bool normal_exit = false;
 		bool ring_present = false;
 		u64 now;
@@ -2806,21 +4123,35 @@ static int deko_syscall_ring_poller_main(void *data)
 
 		/*
 		 * A fatal signal cannot reach do_exit() until the owner returns from
-		 * VMPL1, while the VMPL1 proxy loop only checks the signal after a
-		 * launch iteration returns.  Actively kick a running owner so the
-		 * reschedule interrupt crosses the VMPL boundary and closes that
-		 * circular wait.  The owner remains responsible for reporting its
-		 * lifecycle exit and stopping this poller.
+		 * VMPL1. Retire asynchronous service so its next request takes the
+		 * ordinary owner path and observes cancellation. Continuing to serve
+		 * that owner could otherwise postpone signal delivery indefinitely.
+		 * The owner still joins this task before releasing the ring.
 		 */
-		if (fatal_signal_pending(poller->owner))
+		if (fatal_signal_pending(poller->owner) ||
+		    fatal_signal_pending(current)) {
 			kick_process(poller->owner);
+			break;
+		}
 
 		WRITE_ONCE(ring->poller_state, DEKO_POLLER_AWAKE);
 		WRITE_ONCE(ring->poller_heartbeat, rdtsc_ordered());
+		/* Attach initializes parked=0, and finish_wait clears it on every
+		 * wake. Keep the producer's notification cache line read-only during
+		 * active polling instead of repeatedly publishing the same zero. */
 
 		ret = deko_syscall_ring_drain_common(poller->buf, &normal_exit,
 						     &handled, &ring_present,
-						     NULL, true, NULL);
+						     NULL, NULL, true, poller, NULL,
+						     &made_progress,
+#ifdef DEKO_POLLER_METRICS
+						     &metrics_completions_serviced,
+#endif
+						     NULL, NULL);
+#ifdef DEKO_POLLER_METRICS
+		barrier();
+		metrics_iterations++;
+#endif
 		if (ret != 0)
 			pr_warn("Deko syscall ring poller drain failed pid=%d ret=%d\n",
 				current->pid, ret);
@@ -2828,7 +4159,14 @@ static int deko_syscall_ring_poller_main(void *data)
 		now = rdtsc_ordered();
 		WRITE_ONCE(ring->poller_heartbeat, now);
 
-		if (handled) {
+		if (made_progress) {
+			if (msi) {
+				msi_last_work = now;
+				WRITE_ONCE(msi->progress_batches, msi->progress_batches + 1);
+			}
+#ifdef DEKO_POLLER_METRICS
+			metrics_iterations_with_work++;
+#endif
 			idle_since = now;
 			resched_ticks++;
 			if ((resched_ticks &
@@ -2836,17 +4174,86 @@ static int deko_syscall_ring_poller_main(void *data)
 				cond_resched();
 			continue;
 		}
+		if (handled) {
+			/* Preserve the generic no-progress backoff for future handlers. */
+			resched_ticks++;
+			if ((resched_ticks &
+			     (DEKO_RING_POLLER_RESCHED_INTERVAL - 1)) == 0)
+				cond_resched();
+		}
+
+		if (msi && smp_load_acquire(&msi->enabled)) {
+			DEFINE_WAIT(wait);
+			int work_seq;
+
+			/* Empty IRQs and timeout checks never renew the spin budget. */
+			if (now >= msi_last_work && now - msi_last_work < msi_spin_cycles) {
+				cpu_relax();
+				cond_resched();
+				continue;
+			}
+			work_seq = atomic_read(&poller->work_seq);
+			/* The owner joins and explicitly wakes this infrastructure task.
+			 * Killable sleep also receives the thread group's fatal-signal
+			 * wake. The loop retires the worker before serving more requests.
+			 * TASK_NOLOAD avoids charging idle infrastructure to load average.
+			 * Device, owner and teardown wakes use TASK_NORMAL. */
+			prepare_to_wait(&poller->work_wait, &wait,
+					TASK_KILLABLE | TASK_NOLOAD);
+			WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
+			smp_store_release(&msi->parked, 1);
+			smp_mb();
+			/* Pair with publication/barrier/parked in the producer. An IRQ
+			 * after this check makes the task runnable before schedule(). */
+			if (!READ_ONCE(poller->stop) &&
+			    !READ_ONCE(poller->owner->exit_state) &&
+			    !(READ_ONCE(poller->owner->flags) & PF_EXITING) &&
+			    !fatal_signal_pending(poller->owner) &&
+			    !fatal_signal_pending(current) &&
+			    smp_load_acquire(&msi->enabled) &&
+			    atomic_read(&poller->work_seq) == work_seq &&
+			    !deko_syscall_ring_has_poller_wake_work(ring)) {
+				WRITE_ONCE(msi->sleeps, msi->sleeps + 1);
+				schedule();
+			}
+			finish_wait(&poller->work_wait, &wait);
+			smp_store_release(&msi->parked, 0);
+			continue;
+		}
 
 		/*
-		 * VMPL1 may be copying a protected egress payload into the shared
-		 * alias before it can release-publish the corresponding READY entry.
-		 * Do not voluntarily yield in that bounded preparation window. This
-		 * shared value is only a scheduling hint: even if forged, the poller
-		 * still executes nothing until the normal ring state machine accepts
-		 * a fully published, explicitly eligible entry.
+		 * Without a device endpoint VMPL1 cannot notify this sleeping VMPL2
+		 * thread without taking the very
+		 * transition this asynchronous path avoids. Keep the dedicated consumer
+		 * runnable for the complete monitor-defined VMPL1 epoch, including the
+		 * user-mode gap between requests. VMPL0 publishes IDLE before every real
+		 * owner fallback, so externally blocking waits consume no poller CPU.
+		 * This shared value remains only a scheduling hint: even if forged, the
+		 * poller executes nothing until the normal ring state machine accepts a
+		 * fully published, explicitly eligible entry.
 		 */
 		if (READ_ONCE(ring->producer_state) ==
 		    DEKO_RING_PRODUCER_ACTIVE) {
+			unsigned int sleep_us =
+				READ_ONCE(deko_ring_poller_active_sleep_us);
+
+			/*
+			 * The protected producer cannot wake this VMPL2 task without
+			 * taking the transition that the asynchronous ring avoids.  A
+			 * continuously runnable empty-ring consumer, however, spends the
+			 * application's cgroup quota in parallel with VMPL1 and can
+			 * throttle both tasks for the rest of every CFS period.  Poll at a
+			 * fixed high-resolution cadence instead.  The interval is a public
+			 * boot-time scheduling parameter and never depends on labels,
+			 * payload bytes, or a protected completion value.  A published
+			 * request is still claimed and completed immediately on the next
+			 * pass through the unchanged validation state machine.
+			 */
+			if (sleep_us) {
+				usleep_range(sleep_us, sleep_us + 1);
+				continue;
+			}
+
 			cpu_relax();
 			resched_ticks++;
 			if ((resched_ticks &
@@ -2860,6 +4267,7 @@ static int deko_syscall_ring_poller_main(void *data)
 		    now - idle_since > READ_ONCE(deko_ring_poller_idle_cycles)) {
 			unsigned int sleep_ms =
 				READ_ONCE(deko_ring_poller_sleep_ms);
+			int work_seq;
 
 			if (!sleep_ms) {
 				cpu_relax();
@@ -2867,14 +4275,20 @@ static int deko_syscall_ring_poller_main(void *data)
 				continue;
 			}
 
+			work_seq = atomic_read(&poller->work_seq);
 			WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
 			smp_mb();
-			if (deko_syscall_ring_has_poller_ready(ring)) {
+			if (atomic_read(&poller->work_seq) != work_seq ||
+			    deko_syscall_ring_has_poller_wake_work(ring)) {
 				WRITE_ONCE(ring->poller_state, DEKO_POLLER_AWAKE);
 				idle_since = rdtsc_ordered();
 				continue;
 			}
-			schedule_timeout_interruptible(msecs_to_jiffies(sleep_ms));
+			wait_event_interruptible_timeout(
+				poller->work_wait,
+				atomic_read(&poller->work_seq) != work_seq ||
+					READ_ONCE(poller->stop),
+				msecs_to_jiffies(sleep_ms));
 			idle_since = rdtsc_ordered();
 			continue;
 		}
@@ -2886,8 +4300,41 @@ static int deko_syscall_ring_poller_main(void *data)
 			cond_resched();
 	}
 
+#ifdef DEKO_POLLER_METRICS
+	{
+		u64 metrics_end_cycles = rdtsc_ordered();
+		u64 metrics_end_utime_ns;
+		u64 metrics_end_stime_ns;
+
+		task_cputime_adjusted(current, &metrics_end_utime_ns,
+				       &metrics_end_stime_ns);
+		pr_info("POLLER_METRICS_V1 poller_tid=%d owner_tid=%d owner_tgid=%d owner_comm=%s iterations=%llu iterations_with_work=%llu completions_serviced=%llu cycles=%llu utime_start_ns=%llu stime_start_ns=%llu utime_end_ns=%llu stime_end_ns=%llu proc_utime_start_ticks=%llu proc_stime_start_ticks=%llu proc_utime_end_ticks=%llu proc_stime_end_ticks=%llu proc_clk_tck=%u\n",
+			current->pid, poller->owner->pid, poller->owner->tgid,
+			poller->owner->comm,
+			(unsigned long long)metrics_iterations,
+			(unsigned long long)metrics_iterations_with_work,
+			(unsigned long long)metrics_completions_serviced,
+			(unsigned long long)(metrics_end_cycles -
+					     metrics_start_cycles),
+			(unsigned long long)metrics_start_utime_ns,
+			(unsigned long long)metrics_start_stime_ns,
+			(unsigned long long)metrics_end_utime_ns,
+			(unsigned long long)metrics_end_stime_ns,
+			(unsigned long long)nsec_to_clock_t(
+				metrics_start_utime_ns),
+			(unsigned long long)nsec_to_clock_t(
+				metrics_start_stime_ns),
+			(unsigned long long)nsec_to_clock_t(
+				metrics_end_utime_ns),
+			(unsigned long long)nsec_to_clock_t(
+				metrics_end_stime_ns), USER_HZ);
+	}
+#endif
+out_service:
+	deko_msi_detach(poller);
 	WRITE_ONCE(ring->poller_state, DEKO_POLLER_ASLEEP);
 	WRITE_ONCE(ring->poller_heartbeat, 0);
+	wake_up_all(&poller->completion_wait);
 	complete(&poller->exited);
 	do_exit(0);
 	return 0;
@@ -2950,11 +4397,15 @@ static void deko_ring_poller_configure_task(struct task_struct *task,
 		pr_warn("failed to pin Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u ret=%d\n",
 			task->pid, owner_cpu, target_cpu, ret);
 	else
-		pr_debug("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u affinity=%u fixed_cpu=%d\n",
+		pr_debug("configured Deko syscall ring poller pid=%d owner_cpu=%u target_cpu=%u nice=%d idle_cycles=%llu sleep_ms=%u active_sleep_us=%u affinity=%u fixed_cpu=%d\n",
 			task->pid, owner_cpu, target_cpu, nice,
 			(unsigned long long)READ_ONCE(deko_ring_poller_idle_cycles),
-			READ_ONCE(deko_ring_poller_sleep_ms), affinity, fixed_cpu);
+			READ_ONCE(deko_ring_poller_sleep_ms),
+			READ_ONCE(deko_ring_poller_active_sleep_us), affinity,
+			fixed_cpu);
 }
+
+static void deko_syscall_ring_poller_stop(struct deko_ring_poller *poller);
 
 static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 					  struct deko_shared_buf *buf)
@@ -2982,14 +4433,33 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	if (!poller)
 		return -ENOMEM;
 	init_completion(&poller->exited);
+	init_completion(&poller->initialized);
+	init_waitqueue_head(&poller->completion_wait);
+	init_waitqueue_head(&poller->work_wait);
+	atomic_set(&poller->work_seq, 0);
+	atomic_set(&poller->epoll_cancel_seq, 0);
+	poller->msi_slot = -1;
+	poller->last_owner_safepoint_ns = ktime_get_mono_fast_ns();
 
 	poller->buf = buf;
 	poller->ring = (struct deko_syscall_ring *)buf->buf;
 	poller->owner = get_task_struct(current);
+	if (deko_ring_service_mm) {
+		ret = deko_service_alias_pin(poller);
+		if (ret) {
+			put_task_struct(poller->owner);
+			kfree(poller);
+			return ret;
+		}
+	}
 	owner_cpu = raw_smp_processor_id();
 	for (attempt = 0; attempt <= DEKO_RING_POLLER_CREATE_RETRIES; attempt++) {
-		task = create_io_thread(deko_syscall_ring_poller_main, poller,
-					NUMA_NO_NODE);
+		if (poller->service_alias)
+			task = create_deko_io_thread(deko_syscall_ring_poller_main,
+						    poller, NUMA_NO_NODE);
+		else
+			task = create_io_thread(deko_syscall_ring_poller_main, poller,
+						NUMA_NO_NODE);
 		if (!IS_ERR(task))
 			break;
 
@@ -3001,12 +4471,10 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	}
 	if (IS_ERR(task)) {
 		ret = PTR_ERR(task);
+		deko_service_alias_put(poller->service_alias);
 		if (ret == -ERESTARTNOINTR) {
-			pr_warn_ratelimited("Deko syscall ring poller creation interrupted by pending signal pid=%d; continuing without background poller\n",
+			pr_warn_ratelimited("Deko syscall ring poller creation interrupted by pending signal pid=%d\n",
 					    current->pid);
-			put_task_struct(poller->owner);
-			kfree(poller);
-			return 0;
 		}
 		put_task_struct(poller->owner);
 		kfree(poller);
@@ -3018,6 +4486,15 @@ static int deko_syscall_ring_poller_start(struct deko_ring_poller **poller_out,
 	*poller_out = poller;
 	deko_ring_poller_configure_task(task, owner_cpu);
 	wake_up_new_task(task);
+	if (poller->service_alias) {
+		wait_for_completion(&poller->initialized);
+		ret = READ_ONCE(poller->setup_result);
+		if (ret) {
+			deko_syscall_ring_poller_stop(poller);
+			*poller_out = NULL;
+			return ret;
+		}
+	}
 	pr_debug("Deko syscall ring poller started proxy_pid=%d poller_pid=%d\n",
 		current->pid, task->pid);
 
@@ -3030,10 +4507,14 @@ static void deko_syscall_ring_poller_stop(struct deko_ring_poller *poller)
 		return;
 
 	WRITE_ONCE(poller->stop, true);
-	wake_up_process(poller->task);
+	deko_syscall_ring_cancel_epoll_wait(poller);
+	wake_up_all(&poller->completion_wait);
+	deko_syscall_ring_wake_poller(poller);
 	wait_for_completion(&poller->exited);
 	put_task_struct(poller->task);
 	put_task_struct(poller->owner);
+	/* A still-exiting worker's VMA retains a separate reference to the pins. */
+	deko_service_alias_put(poller->service_alias);
 	poller->task = NULL;
 	poller->owner = NULL;
 	poller->started = false;
@@ -3259,6 +4740,7 @@ static int deko_prepare_launch_app_call(struct svsm_call *call,
 	memset(req, 0, sizeof(*req));
 	memcpy(&req->regs, launch->regs, sizeof(*launch->regs));
 	req->launch_type = launch->launch_type;
+	req->_reserved = launch->flags;
 	req->fs_base = x86_fsbase_read_task(current);
 	req->user_gs_base = x86_gsbase_read_task(current);
 	req->kernel_gs_base = (u64)(cpu_kernelmode_gs_base(current_cpu) +
@@ -3836,6 +5318,247 @@ out_unpin:
 	return ret;
 }
 
+/*
+ * Materialize a fixed, forward fault-around window while retaining one
+ * durable data-pin entry per page.  Only the first absent run is returned:
+ * stopping at an already-present successor prevents VMPL0 from treating
+ * application data as a newly created page that must be zeroed.  VMPL0 chose
+ * whether this optimization was eligible and independently rewalks,
+ * classifies, and admits every returned 4 KiB leaf.
+ */
+static int deko_pin_private_data_fault_around(struct mm_struct *mm,
+					       unsigned long start_addr,
+					       unsigned long max_pages,
+					       u64 *first_token_out,
+					       u64 *first_page_gpa_out,
+					       unsigned long *page_count_out)
+{
+	struct deko_data_pin_entry **entries;
+	struct page **pages;
+	u64 *page_gpas;
+	bool *reused;
+	struct vm_area_struct *vma;
+	unsigned long end_addr;
+	unsigned long page;
+	unsigned long candidate_pages = 1;
+	unsigned long pinned_pages;
+	unsigned long page_count;
+	unsigned long i;
+	long pinned;
+	int locked = 1;
+	int ret = 0;
+	bool immutable_exec_image;
+
+	if (!mm || max_pages < 2 ||
+	    max_pages > DEKO_PF_FAULT_AROUND_MAX_PAGES ||
+	    !first_token_out || !first_page_gpa_out ||
+	    !page_count_out || start_addr >= TASK_SIZE_MAX ||
+	    start_addr & ~PAGE_MASK)
+		return -EINVAL;
+
+	*first_token_out = 0;
+	*first_page_gpa_out = 0;
+	*page_count_out = 0;
+	entries = kcalloc(max_pages, sizeof(*entries), GFP_KERNEL);
+	pages = kcalloc(max_pages, sizeof(*pages), GFP_KERNEL);
+	page_gpas = kcalloc(max_pages, sizeof(*page_gpas), GFP_KERNEL);
+	reused = kcalloc(max_pages, sizeof(*reused), GFP_KERNEL);
+	if (!entries || !pages || !page_gpas || !reused) {
+		ret = -ENOMEM;
+		goto out_free_arrays;
+	}
+
+	if (check_add_overflow(start_addr,
+			       max_pages << PAGE_SHIFT,
+			       &end_addr)) {
+		ret = -EINVAL;
+		goto out_free_arrays;
+	}
+	immutable_exec_image =
+		deko_range_is_immutable_exec_image(mm, start_addr, end_addr);
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, start_addr);
+	if (!vma || start_addr < vma->vm_start ||
+	    !deko_vma_is_private_data_candidate(vma)) {
+		mmap_read_unlock(mm);
+		ret = -EACCES;
+		goto out_free_arrays;
+	}
+	end_addr = min(end_addr, vma->vm_end);
+	mmap_read_unlock(mm);
+
+	if (immutable_exec_image) {
+		/*
+		 * Immutable image pages were eagerly materialized. They are preserved
+		 * and measured rather than zeroed, so present successors are eligible
+		 * for the same bounded transaction.
+		 */
+		candidate_pages = (end_addr - start_addr) >> PAGE_SHIFT;
+	} else {
+		/*
+		 * Anonymous admission retains the absent-prefix rule: a present
+		 * successor may contain application state and must not be re-zeroed.
+		 */
+		for (page = start_addr + PAGE_SIZE; page < end_addr;
+		     page += PAGE_SIZE) {
+			int present = deko_user_leaf_present_4k(mm, page);
+
+			if (present != 0)
+				break;
+			candidate_pages++;
+		}
+	}
+
+	/*
+	 * Materialize and pin the complete prefix with one GUP walk.  The old
+	 * implementation repeated the complete single-page path -- including
+	 * mmap locking, GUP, allocation, and the global pin mutex -- once per
+	 * page, which defeated most of the transition amortization.
+	 */
+	mmap_read_lock(mm);
+	pinned = pin_user_pages_remote(mm, start_addr, candidate_pages,
+				       FOLL_FORCE | FOLL_WRITE, pages, &locked);
+	if (locked)
+		mmap_read_unlock(mm);
+	if (pinned < 1) {
+		ret = pinned < 0 ? (int)pinned : -EFAULT;
+		goto out_free_arrays;
+	}
+	pinned_pages = pinned;
+	page_count = pinned_pages;
+
+	/*
+	 * Validate and allocate the candidate prefix before mutating the pin
+	 * tables.  A bad suffix shortens the batch; a bad first page fails it.
+	 */
+	for (i = 0; i < pinned_pages; i++) {
+		unsigned long page_addr = start_addr + (i << PAGE_SHIFT);
+		bool anon_exclusive = false;
+
+		if (!PageAnon(pages[i]) || !PageAnonExclusive(pages[i]) ||
+		    !deko_lookup_user_page_state(mm, page_addr, &page_gpas[i],
+						 &anon_exclusive) ||
+		    !anon_exclusive ||
+		    (page_gpas[i] & PAGE_MASK) !=
+			    ((u64)page_to_pfn(pages[i]) << PAGE_SHIFT)) {
+			if (!i) {
+				ret = -EFAULT;
+				goto out_unpin_all;
+			}
+			page_count = i;
+			break;
+		}
+
+		entries[i] = kzalloc(sizeof(*entries[i]), GFP_KERNEL);
+		if (!entries[i]) {
+			if (!i) {
+				ret = -ENOMEM;
+				goto out_unpin_all;
+			}
+			page_count = i;
+			break;
+		}
+	}
+
+	/*
+	 * Preflight the whole accepted prefix under one mutex, then publish all
+	 * new durable pins atomically.  Exact entries installed by a racing
+	 * sibling are reused; address/PFN conflicts still fail closed.
+	 */
+	mutex_lock(&deko_data_pin_lock);
+	for (i = 0; i < page_count; i++) {
+		unsigned long page_addr = start_addr + (i << PAGE_SHIFT);
+		struct deko_data_pin_entry *existing;
+		struct deko_data_pin_entry *alias;
+		unsigned long j;
+
+		existing = deko_data_pin_find_locked(mm, page_addr);
+		alias = deko_data_pin_find_page_locked(pages[i]);
+		for (j = 0; j < i; j++) {
+			if (pages[j] == pages[i]) {
+				ret = -EEXIST;
+				goto out_unlock_failed;
+			}
+		}
+		if (existing) {
+			if (existing->page != pages[i] ||
+			    (alias && alias != existing)) {
+				ret = -EEXIST;
+				goto out_unlock_failed;
+			}
+			reused[i] = true;
+			continue;
+		}
+		if (alias) {
+			ret = -EEXIST;
+			goto out_unlock_failed;
+		}
+	}
+
+	for (i = 0; i < page_count; i++) {
+		struct deko_data_pin_entry *entry;
+		u64 token;
+
+		if (reused[i]) {
+			entry = deko_data_pin_find_locked(
+				mm, start_addr + (i << PAGE_SHIFT));
+			if (!i)
+				*first_token_out = entry->token;
+			continue;
+		}
+
+		entry = entries[i];
+		do {
+			token = (u64)atomic64_inc_return(
+				&deko_data_pin_next_token);
+		} while (!token);
+		mmgrab(mm);
+		entry->mm = mm;
+		entry->addr = start_addr + (i << PAGE_SHIFT);
+		entry->page = pages[i];
+		entry->token = token;
+		list_add(&entry->node, &deko_data_pin_list);
+		hash_add(deko_data_pin_addr_table, &entry->addr_hash_node,
+			 deko_data_pin_addr_key(mm, entry->addr));
+		hash_add(deko_data_pin_page_table, &entry->page_hash_node,
+			 (unsigned long)entry->page);
+		entries[i] = NULL;
+		if (!i)
+			*first_token_out = token;
+	}
+	mutex_unlock(&deko_data_pin_lock);
+
+	*first_page_gpa_out = page_gpas[0];
+	*page_count_out = page_count;
+
+	/* Drop only the extra references taken for exact reused entries. */
+	for (i = 0; i < page_count; i++) {
+		if (reused[i])
+			unpin_user_page(pages[i]);
+		kfree(entries[i]);
+	}
+	if (page_count < pinned_pages)
+		unpin_user_pages(pages + page_count,
+				 pinned_pages - page_count);
+	ret = 0;
+	goto out_free_arrays;
+
+out_unlock_failed:
+	mutex_unlock(&deko_data_pin_lock);
+out_unpin_all:
+	for (i = 0; i < max_pages; i++)
+		kfree(entries[i]);
+	unpin_user_pages(pages, pinned_pages);
+
+out_free_arrays:
+	kfree(reused);
+	kfree(page_gpas);
+	kfree(pages);
+	kfree(entries);
+	return ret;
+}
+
 int deko_pin_present_private_data_vmas(struct mm_struct *mm,
 					const char *reason)
 {
@@ -4410,12 +6133,16 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	unsigned int resolve_flags = 0;
 	u64 page_gpa = 0;
 	u64 data_pin_token = 0;
+	unsigned long resolved_pages = 0;
+	unsigned long fault_around_pages = 0;
 	bool anon_exclusive = false;
 	bool unshare_exec = false;
+	u64 started_ns;
 	int ret;
 
 	if (unlikely(!buf))
 		return -EFAULT;
+	started_ns = ktime_get_ns();
 
 	frame = &buf->page_fault;
 	req = &frame->req;
@@ -4439,6 +6166,21 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	}
 	if (unlikely(req->version != DEKO_PAGE_FAULT_REQ_VERSION_V1 ||
 		     req->req_size != sizeof(*req))) {
+		ret = -EINVAL;
+		goto out_response;
+	}
+	if (unlikely(req->flags & ~(DEKO_PF_REQ_F_FAULT_AROUND |
+				    DEKO_PF_REQ_FAULT_AROUND_PAGES_MASK))) {
+		ret = -EINVAL;
+		goto out_response;
+	}
+	fault_around_pages =
+		(req->flags & DEKO_PF_REQ_FAULT_AROUND_PAGES_MASK) >>
+		DEKO_PF_REQ_FAULT_AROUND_PAGES_SHIFT;
+	if (unlikely((req->flags & DEKO_PF_REQ_F_FAULT_AROUND) ?
+		     (fault_around_pages < 2 ||
+		      fault_around_pages > DEKO_PF_FAULT_AROUND_MAX_PAGES) :
+		     fault_around_pages != 0)) {
 		ret = -EINVAL;
 		goto out_response;
 	}
@@ -4475,19 +6217,36 @@ static int deko_handle_page_fault_service(struct deko_shared_buf *buf)
 	 * Executable pages retain their separate exec-pin lifecycle.
 	 */
 	if (!ret && !(req->access & DEKO_PF_ACCESS_INSTR)) {
-		ret = deko_pin_private_data_page(mm, req->fault_va,
-						 &data_pin_token, &page_gpa);
+		if (req->flags & DEKO_PF_REQ_F_FAULT_AROUND &&
+		    req->reason == DEKO_PF_REASON_DEMAND &&
+		    !(req->access & DEKO_PF_ACCESS_PRESENT)) {
+			ret = deko_pin_private_data_fault_around(
+				mm, req->page_va, fault_around_pages,
+				&data_pin_token, &page_gpa, &resolved_pages);
+		} else {
+			ret = deko_pin_private_data_page(mm, req->fault_va,
+							 &data_pin_token,
+							 &page_gpa);
+			if (!ret)
+				resolved_pages = 1;
+		}
 		if (!ret) {
 			anon_exclusive = true;
 			resolve_flags |= DEKO_PF_RESOLVE_F_DATA_PINNED;
+			if (resolved_pages > 1)
+				resolve_flags |=
+					DEKO_PF_RESOLVE_F_FAULT_AROUND;
 		}
-	} else if (!ret &&
-		   !deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
-						&anon_exclusive)) {
-		pr_warn("Deko page fault service could not resolve executable leaf frame pid=%d seq=%llu fault=0x%llx\n",
-			current->pid, (unsigned long long)req->seq,
-			(unsigned long long)req->fault_va);
-		ret = -EFAULT;
+	} else if (!ret) {
+		if (!deko_lookup_user_page_state(mm, req->fault_va, &page_gpa,
+						 &anon_exclusive)) {
+			pr_warn("Deko page fault service could not resolve executable leaf frame pid=%d seq=%llu fault=0x%llx\n",
+				current->pid, (unsigned long long)req->seq,
+				(unsigned long long)req->fault_va);
+			ret = -EFAULT;
+		} else {
+			resolved_pages = 1;
+		}
 	}
 	if (!ret && anon_exclusive) {
 		resolve_flags |= DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE;
@@ -4503,9 +6262,12 @@ out_response:
 			 DEKO_PF_RESOLUTION_NONE);
 	resp->page_flags = ret ? 0 : resolve_flags;
 	resp->page_gpa = ret ? 0 : page_gpa;
-	resp->page_len = ret ? 0 : PAGE_SIZE;
+	resp->page_len = ret ? 0 : resolved_pages << PAGE_SHIFT;
 	resp->backing_id = ret ? 0 : data_pin_token;
 	resp->backing_offset = ret || !data_pin_token ? 0 : req->page_va;
+	trace_deko_page_fault_service(req->reason, fault_around_pages,
+				      resolved_pages, ret,
+				      ktime_get_ns() - started_ns);
 
 	if (unlikely(ret))
 		pr_warn("page fault resolve failed pid=%d fault=0x%llx access=0x%x reason=%u ret=%d\n",
@@ -4556,23 +6318,113 @@ deko_track_page_fault_progress(struct deko_shared_buf *buf,
 	return -ELOOP;
 }
 
+/*
+ * VMPL0 remains the authority for translation-window ownership, relock,
+ * completion reconciliation, and VMPL1 admission.  This VMPL2-only turn is
+ * acquired before every launch attempt and keeps sibling proxy tasks from
+ * burning their shared CPU or issuing a competing launch while an owner has a
+ * writable translation window.  The owner releases after servicing a
+ * no-window exit, or after an explicit relock before blocking or handing off.
+ * A forged or stale value can affect scheduling, but cannot authorize VMPL1
+ * execution or bypass any monitor check.
+ */
+static int deko_service_turn_acquire(struct mm_struct *mm)
+{
+	int owner, ret, seq;
+
+	if (unlikely(!mm))
+		return -EINVAL;
+	for (;;) {
+		owner = atomic_cmpxchg(&mm->deko_service_turn_owner, 0,
+				       current->pid);
+		if (owner == 0) {
+			atomic_inc(&mm->deko_service_turn_seq);
+			return 0;
+		}
+		if (owner == current->pid)
+			return 0;
+		seq = atomic_read(&mm->deko_service_turn_seq);
+		ret = wait_event_killable(mm->deko_service_turn_wait,
+			atomic_read(&mm->deko_service_turn_seq) != seq ||
+			atomic_read(&mm->deko_service_turn_owner) == 0 ||
+			atomic_read(&mm->deko_service_turn_owner) ==
+				current->pid);
+		if (ret)
+			return ret;
+	}
+}
+
+static bool deko_service_turn_released(struct mm_struct *mm)
+{
+	bool handoff_waiter;
+
+	if (!mm)
+		return false;
+	if (atomic_cmpxchg(&mm->deko_service_turn_owner,
+			   current->pid, 0) == current->pid) {
+		/*
+		 * Pair with prepare_to_wait()'s state barrier.  Under voluntary
+		 * preemption, waking a sibling is not itself a scheduling point;
+		 * report an already-enqueued waiter so the closing owner can yield
+		 * after dropping its migration pin instead of immediately taking the
+		 * next service turn.
+		 */
+		handoff_waiter = wq_has_sleeper(&mm->deko_service_turn_wait);
+		atomic_inc(&mm->deko_service_turn_seq);
+		wake_up_all(&mm->deko_service_turn_wait);
+		return handoff_waiter;
+	}
+	return false;
+}
+
+static void deko_service_turn_handoff(bool handoff_waiter)
+{
+	unsigned long flags;
+
+	if (!handoff_waiter)
+		return;
+	/* A wakeup alone is not a scheduling point under voluntary preemption. */
+	local_irq_save(flags);
+	set_need_resched_current();
+	local_irq_restore(flags);
+	cond_resched();
+}
+
 static int deko_run_launch_iteration(struct svsm_call *call,
 				     const struct pt_regs *regs,
 				     u32 launch_type,
 				     struct deko_migration_state *migration,
-				     bool *adopting, unsigned int *launch_cpu)
+				     u32 launch_flags, bool mmap_locked,
+				     bool *relock_complete,
+				     bool *monitor_busy, bool *adopting,
+				     unsigned int *launch_cpu)
 {
 	struct deko_launch_app_call_args args = {
 		.regs = regs,
 		.launch_type = launch_type,
 	};
+	bool relock_only =
+		(launch_flags & DEKO_LAUNCH_APP_F_RELOCK_ONLY) != 0;
+	bool acquired_mmap_lock = false;
 	unsigned int current_cpu;
 	int ret;
 	u64 generation = 0;
 
+	if (unlikely(launch_flags &
+		     ~(DEKO_LAUNCH_APP_F_RELOCK_ONLY |
+		       DEKO_LAUNCH_APP_F_FUTEX_WAIT_CHECK)) ||
+	    unlikely((launch_flags & DEKO_LAUNCH_APP_F_FUTEX_WAIT_CHECK) &&
+		     !relock_only) ||
+	    unlikely(mmap_locked && (!relock_only || !current->mm)))
+		return -EINVAL;
+
 	current_cpu = smp_processor_id();
 	*launch_cpu = current_cpu;
 	*adopting = false;
+	*relock_complete = false;
+	*monitor_busy = false;
+	/* Do not classify a local preparation retry using a prior SVSM result. */
+	call->rax_out = 0;
 
 	if (migration->pending && current_cpu != migration->staged_target_cpu) {
 		return -EAGAIN;
@@ -4584,7 +6436,43 @@ static int deko_run_launch_iteration(struct svsm_call *call,
 	}
 
 	args.migration_version = generation;
-	ret = deko_svsm_call_locked(call, deko_prepare_launch_app_call, &args);
+	args.flags = launch_flags;
+	/*
+	 * VMPL0 reports whether the preceding exit opened this mm's translation
+	 * tree.  Only that path takes mmap_lock and asks for a preparation-only
+	 * round.  The monitor walks, RMP-locks, and validates the complete tree,
+	 * then returns INCOMPLETE without entering VMPL1.  Releasing mmap_lock
+	 * before the following launch avoids carrying a Linux mapping lock into
+	 * arbitrary measured userspace execution.
+	 *
+	 * This lock is cooperative liveness synchronization. VMPL0 remains the
+	 * authority for every relock and forces a split after any actual relock
+	 * even if an untrusted VMPL2 omits the request bit.
+	 */
+	if (relock_only && !mmap_locked) {
+		if (unlikely(!current->mm))
+			return -EINVAL;
+		ret = mmap_write_lock_killable(current->mm);
+		if (unlikely(ret))
+			return ret;
+		acquired_mmap_lock = true;
+	}
+	if (mmap_locked)
+		ret = deko_svsm_call_locked_once_mm_prepared(
+			call, deko_prepare_launch_app_call, &args);
+	else
+		ret = deko_svsm_call_locked_once(
+			call, deko_prepare_launch_app_call, &args);
+	if (acquired_mmap_lock)
+		mmap_write_unlock(current->mm);
+	if (ret == -EAGAIN && call->rax_out == SVSM_ERR_INCOMPLETE) {
+		*relock_complete = true;
+		return 0;
+	}
+	if (ret == -EAGAIN) {
+		*monitor_busy = call->rax_out == SVSM_ERR_BUSY;
+		return ret;
+	}
 	if (unlikely(ret < 0)) {
 		pr_err("Failed to perform call launch protocol for task %d, err: %d pending=%d current_cpu=%u staged_target=%u staged_gen=%llu committed_owner=%u committed_gen=%llu\n",
 		       current->pid, ret, migration->pending, current_cpu,
@@ -4598,22 +6486,131 @@ static int deko_run_launch_iteration(struct svsm_call *call,
 	return 0;
 }
 
+static int deko_monitor_futex_wait_prepare(void *arg)
+{
+	struct deko_monitor_futex_wait_ctx *ctx = arg;
+	int ret;
+
+	if (unlikely(!ctx || !ctx->launch_call || !ctx->regs ||
+		     !ctx->migration || !ctx->mm ||
+		     !ctx->translation_window_open || current->mm != ctx->mm ||
+		     ctx->mmap_locked || ctx->migration_disabled))
+		return -EINVAL;
+
+	ret = mmap_write_lock_killable(ctx->mm);
+	if (ret)
+		return ret == -EINTR ? -ERESTARTSYS : ret;
+	ctx->mmap_locked = true;
+
+	/* Keep the prepared per-CPU VMPL1 mappings stable through the call. */
+	migrate_disable();
+	ctx->migration_disabled = true;
+	ret = svsm_prepare_vmpl1_current_mm(ctx->mm);
+	if (unlikely(ret)) {
+		ctx->migration_disabled = false;
+		migrate_enable();
+		ctx->mmap_locked = false;
+		mmap_write_unlock(ctx->mm);
+		return ret;
+	}
+
+	return 0;
+}
+
+/* Called by futex_wait_with_monitor_check() with the native bucket locked. */
+static int deko_monitor_futex_wait_check(void *arg)
+{
+	struct deko_monitor_futex_wait_ctx *ctx = arg;
+	struct svsm_call relock_call;
+	bool relock_complete = false;
+	bool monitor_busy = false;
+	bool adopting = false;
+	unsigned int launch_cpu = 0;
+	int ret;
+
+	if (unlikely(!ctx || !ctx->launch_call || !ctx->migration ||
+		     !ctx->mmap_locked || !ctx->migration_disabled ||
+		     ctx->migration->pending))
+		return -EPROTO;
+
+	relock_call = *ctx->launch_call;
+	ret = deko_run_launch_iteration(
+		&relock_call, ctx->regs, ctx->launch_type, ctx->migration,
+		DEKO_LAUNCH_APP_F_RELOCK_ONLY |
+			DEKO_LAUNCH_APP_F_FUTEX_WAIT_CHECK,
+		true, &relock_complete, &monitor_busy, &adopting, &launch_cpu);
+	if (ret)
+		return ret;
+	if (unlikely(!relock_complete)) {
+		pr_err("Futex-check launch unexpectedly entered VMPL1 pid=%d cpu=%u adopting=%d rax_out=0x%llx\n",
+		       current->pid, launch_cpu, adopting,
+		       relock_call.rax_out);
+		return -EPROTO;
+	}
+
+	/* INCOMPLETE proves this preparation round closed the service window. */
+	WRITE_ONCE(*ctx->translation_window_open, false);
+	deko_service_turn_released(ctx->mm);
+	if (unlikely(adopting))
+		return -EPROTO;
+
+	switch (relock_call.rcx_out) {
+	case DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_MATCH:
+		return 0;
+	case DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_MISMATCH:
+		return -EWOULDBLOCK;
+	case DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_FAULT:
+		return -EFAULT;
+	case DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_RETRY:
+		return -EAGAIN;
+	default:
+		pr_err("Futex-check launch returned invalid result flags pid=%d flags=0x%llx\n",
+		       current->pid, relock_call.rcx_out);
+		return -EPROTO;
+	}
+}
+
+static void deko_monitor_futex_wait_unlock(void *arg)
+{
+	struct deko_monitor_futex_wait_ctx *ctx = arg;
+
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	if (ctx->mmap_locked) {
+		ctx->mmap_locked = false;
+		mmap_write_unlock(ctx->mm);
+	} else {
+		WARN_ON_ONCE(1);
+	}
+	if (ctx->migration_disabled) {
+		ctx->migration_disabled = false;
+		migrate_enable();
+	} else {
+		WARN_ON_ONCE(1);
+	}
+}
+
 static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					 struct deko_shared_buf *buf,
 					 bool *normal_exit,
 					 int *exit_code,
+					 bool *group_exit,
 					 struct deko_ring_poller *poller,
-					 struct deko_data_pin_transition *pin_transition)
+					 struct deko_data_pin_transition *pin_transition,
+					 struct deko_monitor_futex_wait_ctx *futex_wait_ctx)
 {
 	u64 handled_syscall_nr;
 	unsigned long flags;
 	int ret;
 
 	*normal_exit = false;
+	*group_exit = false;
 
 	switch (call->rax_out) {
 	case DEKO_SERVICE_APP_ENTER_OK:
 		{
+			bool owner_blocking_service = false;
 			bool ring_handled = false;
 			bool ring_present = false;
 
@@ -4621,11 +6618,15 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 						      &ring_handled,
 						      &ring_present,
 						      exit_code,
-						      pin_transition);
+						      group_exit,
+						      poller,
+						      &owner_blocking_service,
+						      pin_transition,
+						      futex_wait_ctx);
 			if (ret != 0)
 				return ret;
 			if (ring_present && poller && poller->task)
-				wake_up_process(poller->task);
+				deko_syscall_ring_wake_poller(poller);
 			if (ring_present) {
 				/*
 				 * A present syscall ring owns ENTER_OK delivery.
@@ -4633,12 +6634,15 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 				 * legacy syscall body after the poller already
 				 * completed the ring entry.  This owner entry is
 				 * also the monitor-owned end of a bounded async
-				 * epoch.  Force a real scheduler safepoint before
-				 * relaunching VMPL1 so a continuously protected
-				 * task cannot starve watchdog/RCU service while a
-				 * different CPU completes its ring requests.
+				 * epoch. Rate-limit real scheduler safepoints by a
+				 * fixed wall-clock interval: the timer-service path
+				 * remains the primary liveness boundary, while a
+				 * fallback no longer yields once per syscall. Neither
+				 * this interval nor the poller's idle deadline depends
+				 * on labels, payload contents, or completion values.
 				 */
-				if (!*normal_exit) {
+				if (!*normal_exit && !owner_blocking_service &&
+				    deko_syscall_ring_owner_safepoint_due(poller)) {
 					migrate_disable();
 					local_irq_save(flags);
 					set_need_resched_current();
@@ -4646,6 +6650,13 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 					cond_resched();
 					migrate_enable();
 				}
+				/*
+				 * A contract-blocking service already passed through
+				 * Linux's scheduler.  Even an otherwise conditional
+				 * reschedule here can hand the freshly woken owner away
+				 * for a complete CFS slice, so do not add a second
+				 * scheduling point before relaunching VMPL1.
+				 */
 				break;
 			}
 		}
@@ -4655,12 +6666,13 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 		if (is_exit_syscall(handled_syscall_nr) && exit_code)
 			*exit_code = (int)(buf->syscall_body.di & 0xff);
 		ret = deko_app_handle_system_calls(&buf->syscall_body,
-						   pin_transition);
+						   pin_transition, NULL, 0, NULL);
 		if (ret != 0) {
 			pr_err("Error handling system calls: %d\n", ret);
 			return ret;
 		}
 		*normal_exit = is_exit_syscall(handled_syscall_nr);
+		*group_exit = handled_syscall_nr == __NR_exit_group;
 		break;
 
 	case DEKO_TIMER_SERVICE:
@@ -4706,7 +6718,7 @@ static int deko_handle_vmpl1_exit_reason(struct svsm_call *call,
 			WRITE_ONCE(poller->ring->producer_state,
 				   DEKO_RING_PRODUCER_ACTIVE);
 			smp_wmb();
-			wake_up_process(poller->task);
+			deko_syscall_ring_wake_poller(poller);
 		}
 		call->rax = SVSM_EXTEND_CALL(SVSM_EXTEND_LAUNCH_APP);
 	}
@@ -4742,6 +6754,11 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_shared_buf *buf = NULL;
 	unsigned long alias_addr = 0;
 	bool normal_exit = false;
+	bool group_exit = false;
+	bool translation_window_open = false;
+	bool relock_complete = false;
+	bool monitor_busy = false;
+	bool handoff_waiter = false;
 	bool adopting = false;
 	bool iteration_cpu_pinned = false;
 	int exit_code = 0;
@@ -4751,9 +6768,16 @@ void deko_proxy_loop(struct callback_head *work)
 	struct deko_page_fault_progress page_fault_progress = { 0 };
 	struct deko_data_pin_transition pin_transition = { 0 };
 	struct deko_ring_poller *poller = NULL;
-
 	struct deko_task_work *dw =
 		container_of(work, struct deko_task_work, work);
+	struct deko_monitor_futex_wait_ctx futex_wait_ctx = {
+		.launch_call = &call,
+		.regs = regs,
+		.migration = &migration,
+		.mm = current->mm,
+		.translation_window_open = &translation_window_open,
+		.launch_type = dw->launch_type,
+	};
 
 	if (unlikely(!current->mm || fatal_signal_pending(current))) {
 		pr_debug("Skipping Deko proxy loop for exiting task pid=%d tgid=%d comm=%s mm=%px fatal_signal=%d\n",
@@ -4773,6 +6797,10 @@ void deko_proxy_loop(struct callback_head *work)
 			current->pid, current->tgid,
 			current->thread.kernel_vmpl1_rsp);
 	}
+	WRITE_ONCE(current->deko_data_alias_canary_target_valid, false);
+	current->deko_data_alias_canary_target_va = 0;
+	current->deko_data_alias_canary_original_pte = 0;
+	current->deko_data_alias_canary_foreign_pfn_bits = 0;
 
 	current->is_monitored = true;
 	pr_info("Deko proxy loop start pid=%d tgid=%d comm=%s task=%px current_cpu=%u monitored=%d launch_type=%u\n",
@@ -4840,13 +6868,6 @@ void deko_proxy_loop(struct callback_head *work)
 	if (unlikely(errno < 0))
 		goto err_loop;
 
-	errno = deko_syscall_ring_poller_start(&poller, buf);
-	if (unlikely(errno < 0)) {
-		pr_err("Failed to start Deko syscall ring poller pid=%d err=%d\n",
-		       current->pid, errno);
-		goto err_loop;
-	}
-
 	/* Application main loop. */
 	for (;;) {
 		iteration++;
@@ -4856,6 +6877,10 @@ void deko_proxy_loop(struct callback_head *work)
 				current->pid, current->tgid, current->comm);
 			goto err_loop;
 		}
+		/* Serialize same-mm launch attempts before entering the monitor. */
+		errno = deko_service_turn_acquire(current->mm);
+		if (unlikely(errno < 0))
+			goto err_loop;
 
 		migrate_disable();
 		iteration_cpu_pinned = true;
@@ -4881,17 +6906,40 @@ void deko_proxy_loop(struct callback_head *work)
 		}
 
 		errno = deko_run_launch_iteration(
-			&call, regs, dw->launch_type, &migration, &adopting,
+			&call, regs, dw->launch_type, &migration,
+			translation_window_open ?
+				DEKO_LAUNCH_APP_F_RELOCK_ONLY : 0,
+			false, &relock_complete, &monitor_busy, &adopting,
 			&launch_cpu);
 		if (iteration <= 3)
 			pr_debug("Deko proxy launch iteration returned pid=%d tgid=%d iter=%llu err=%d rax_out=0x%llx rcx_out=0x%llx launch_cpu=%u adopting=%d\n",
 				current->pid, current->tgid, iteration,
 				errno, call.rax_out, call.rcx_out,
 				launch_cpu, adopting ? 1 : 0);
-		if (errno == -EAGAIN) {
+		if (relock_complete) {
+			translation_window_open = false;
+			handoff_waiter =
+				deko_service_turn_released(current->mm);
 			migrate_enable();
 			iteration_cpu_pinned = false;
-			cond_resched();
+			/*
+			 * This call both reconciled any protected-memory completion and
+			 * closed the physical translation window.  A sibling may now
+			 * acquire the exclusive Linux turn; the former owner cannot issue
+			 * its next launch until that sibling releases it.
+			 */
+			deko_service_turn_handoff(handoff_waiter);
+			continue;
+		}
+		if (errno == -EAGAIN) {
+			handoff_waiter = monitor_busy ?
+				deko_service_turn_released(current->mm) : false;
+			migrate_enable();
+			iteration_cpu_pinned = false;
+			if (handoff_waiter)
+				deko_service_turn_handoff(true);
+			else
+				cond_resched();
 			continue;
 		}
 		if (unlikely(errno < 0)) {
@@ -4907,11 +6955,23 @@ void deko_proxy_loop(struct callback_head *work)
 
 		errno = deko_finalize_launch_round(
 			&call, &migration, &checkpoint, adopting, launch_cpu);
-		migrate_enable();
-		iteration_cpu_pinned = false;
-
-		if (unlikely(errno < 0))
+		if (unlikely(errno < 0)) {
+			migrate_enable();
+			iteration_cpu_pinned = false;
 			goto err_loop;
+		}
+		if (unlikely(call.rcx_out &
+			     ~DEKO_LAUNCH_APP_RESULT_EXEC_TRANSLATION_OPEN)) {
+			errno = -EPROTO;
+			pr_err("Deko launch returned invalid result flags pid=%d iter=%llu flags=0x%llx\n",
+			       current->pid, iteration, call.rcx_out);
+			migrate_enable();
+			iteration_cpu_pinned = false;
+			goto err_loop;
+		}
+		translation_window_open =
+			(call.rcx_out &
+			 DEKO_LAUNCH_APP_RESULT_EXEC_TRANSLATION_OPEN) != 0;
 
 		/*
 		 * The successful launch reconciled the preceding memory completion
@@ -4923,12 +6983,37 @@ void deko_proxy_loop(struct callback_head *work)
 		if (unlikely(errno < 0)) {
 			pr_err("Deko data pin transition failed after monitor acknowledgement pid=%d iter=%llu err=%d\n",
 			       current->pid, iteration, errno);
+			migrate_enable();
+			iteration_cpu_pinned = false;
 			goto err_loop;
+		}
+		migrate_enable();
+		iteration_cpu_pinned = false;
+
+		if (!poller && call.rax_out == DEKO_SERVICE_APP_ENTER_OK &&
+		    READ_ONCE(deko_ring_poll) &&
+		    deko_syscall_ring_needs_poller(buf)) {
+			errno = deko_syscall_ring_poller_start(&poller, buf);
+			if (unlikely(errno < 0 || !poller || !poller->task)) {
+				if (!errno)
+					errno = -EIO;
+				pr_err("Failed to start Deko syscall service worker before first eligible request pid=%d err=%d\n",
+				       current->pid, errno);
+				goto err_loop;
+			}
+			/*
+			 * The request is already READY and VMPL0 ended its optimistic
+			 * spin before entering Linux. Publish a new scheduling epoch so
+			 * the new worker can claim it before the owner drains the ring.
+			 */
+			smp_store_release(&poller->ring->producer_state,
+					  DEKO_RING_PRODUCER_ACTIVE);
+			deko_syscall_ring_wake_poller(poller);
 		}
 
 		errno = deko_handle_vmpl1_exit_reason(
-			&call, buf, &normal_exit, &exit_code, poller,
-			&pin_transition);
+			&call, buf, &normal_exit, &exit_code, &group_exit, poller,
+			&pin_transition, &futex_wait_ctx);
 		if (!errno && !normal_exit && call.rax_out == DEKO_TIMER_SERVICE &&
 		    READ_ONCE(current->thread.deko_aspace_pending_op))
 			errno = deko_process_pending_aspace_op();
@@ -4943,11 +7028,24 @@ void deko_proxy_loop(struct callback_head *work)
 		} else {
 			page_fault_progress.repeats = 0;
 		}
+		/*
+		 * With no writable translation window, Linux has finished this
+		 * service response and another same-mm task may run.  A later launch
+		 * by this task must first reacquire the turn, so it cannot reconcile
+		 * a completion while a sibling owns a newly opened window.
+		 */
+		if (!translation_window_open) {
+			handoff_waiter =
+				deko_service_turn_released(current->mm);
+			deko_service_turn_handoff(handoff_waiter);
+		}
 	}
 
 err_loop:
 	if (iteration_cpu_pinned)
 		migrate_enable();
+	deko_service_turn_released(current->mm);
+	deko_cleanup_data_alias_canary();
 
 	if (normal_exit)
 		pr_debug("Deko proxy loop normal exit pid=%d tgid=%d comm=%s iter=%llu rax_out=0x%llx errno=%d\n",
@@ -4982,6 +7080,12 @@ err_pin:
 	 * the latter case, we should kill the process with the appropriate error code.
 	 *
 	 */
+	/* Preserve exit_group semantics after this owner's infrastructure is
+	 * joined and freed. do_group_exit() signals sibling tasks; each still
+	 * passes through deko_task_exit(), so VMPL0 retains authoritative
+	 * per-task reclamation and final shared-mm restoration. */
+	if (normal_exit && group_exit)
+		do_group_exit((exit_code & 0xff) << 8);
 	if (normal_exit)
 		do_exit((exit_code & 0xff) << 8);
 

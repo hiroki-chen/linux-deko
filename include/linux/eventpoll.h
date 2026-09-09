@@ -8,6 +8,7 @@
 #ifndef _LINUX_EVENTPOLL_H
 #define _LINUX_EVENTPOLL_H
 
+#include <linux/atomic.h>
 #include <uapi/linux/eventpoll.h>
 #include <uapi/linux/kcmp.h>
 
@@ -28,6 +29,18 @@ void eventpoll_release_file(struct file *file);
 /* Copy ready events to userspace */
 int epoll_sendevents(struct file *file, struct epoll_event __user *events,
 		     int maxevents);
+
+/*
+ * Wait for epoll readiness while allowing an in-kernel owner to cancel the
+ * sleep without a timeout probe.  The caller must increment @cancel_seq and
+ * wake the waiting task to request cancellation.  Comparing a sequence rather
+ * than clearing a flag prevents a cancellation racing wait setup from being
+ * lost.
+ */
+int epoll_wait_cancelable(int epfd, struct epoll_event __user *events,
+			  int maxevents, int timeout,
+			  const atomic_t *cancel_seq,
+			  int expected_cancel_seq);
 
 /*
  * This is called from inside fs/file_table.c:__fput() to unlink files

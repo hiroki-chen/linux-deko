@@ -47,8 +47,14 @@ enum deko_new_app_type {
 #define DEKO_PROTOCOL_NEGOTIATE_REQ_VERSION_V1 1
 #define DEKO_PAGE_FAULT_REQ_VERSION_V1 1
 #define DEKO_PAGE_FAULT_RESP_VERSION_V1 1
+#define DEKO_PF_REQ_F_FAULT_AROUND (1u << 0)
+#define DEKO_PF_REQ_FAULT_AROUND_PAGES_SHIFT 1
+#define DEKO_PF_REQ_FAULT_AROUND_PAGES_MASK \
+	(0x1ffu << DEKO_PF_REQ_FAULT_AROUND_PAGES_SHIFT)
+#define DEKO_PF_FAULT_AROUND_MAX_PAGES 256UL
 #define DEKO_ASPACE_OP_REQ_VERSION_V1 1
 #define DEKO_EXEC_RANGE_READY_REQ_VERSION_V1 1
+#define DEKO_IMMUTABLE_RANGE_READY_REQ_VERSION_V1 1
 #define DEKO_EXEC_RANGE_UNLIFT_REQ_VERSION_V1 1
 #define DEKO_MAX_BASE_REGIONS 96
 #define DEKO_REPORT_APP_LIFECYCLE 0
@@ -66,6 +72,14 @@ enum deko_launch_type {
 	DEKO_LAUNCH_TYPE_PROCESS_FORK = 2,
 	DEKO_LAUNCH_TYPE_THREAD = 3,
 };
+
+#define DEKO_LAUNCH_APP_F_RELOCK_ONLY BIT(0)
+#define DEKO_LAUNCH_APP_F_FUTEX_WAIT_CHECK BIT(1)
+#define DEKO_LAUNCH_APP_RESULT_EXEC_TRANSLATION_OPEN BIT_ULL(0)
+#define DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_MATCH BIT_ULL(1)
+#define DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_MISMATCH BIT_ULL(2)
+#define DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_FAULT BIT_ULL(3)
+#define DEKO_LAUNCH_APP_RESULT_FUTEX_WAIT_RETRY BIT_ULL(4)
 
 enum deko_base_region_kind {
 	DEKO_BASE_REGION_CODE = 1,
@@ -138,6 +152,7 @@ enum deko_page_fault_resolve_flags {
 	DEKO_PF_RESOLVE_F_PRIVATE_CANDIDATE = 1u << 2,
 	DEKO_PF_RESOLVE_F_FILE_BACKED = 1u << 3,
 	DEKO_PF_RESOLVE_F_DATA_PINNED = 1u << 4,
+	DEKO_PF_RESOLVE_F_FAULT_AROUND = 1u << 5,
 };
 
 enum deko_aspace_op {
@@ -298,6 +313,19 @@ struct deko_exec_range_ready_req {
 	u64 lifted_pages;
 } __attribute__((aligned(8)));
 
+struct deko_immutable_range_ready_req {
+	u16 version;
+	u16 flags;
+	u32 req_size;
+	u32 pid;
+	u32 tgid;
+	u64 start_va;
+	u64 end_va;
+	u64 first_page_gpa;
+	u64 page_count;
+	u64 admitted_pages;
+} __attribute__((aligned(8)));
+
 struct deko_exec_range_unlift_req {
 	u16 version;
 	u16 flags;
@@ -316,6 +344,39 @@ struct deko_load_policy_req {
 	u32 reserved;
 	u64 blob_gpa;
 	u64 blob_len;
+} __attribute__((aligned(8)));
+
+#define DEKO_BENCH_PROBE_WIRE_EVENTS 96
+
+struct svsm_deko_bench_probe_wire_event {
+	u32 vcpu_id;
+	u16 stage_id;
+	u16 flags;
+	u64 seq;
+	u64 tsc;
+	u64 tsc_end;
+};
+
+struct svsm_deko_bench_probe_control {
+	u16 version;
+	u16 op;
+	u32 req_size;
+	u32 vcpu_id;
+	u32 flags;
+	u64 syscall_nr;
+	u64 cursor;
+	u64 next_cursor;
+	u32 count;
+	u32 done;
+	u64 spans;
+	u64 drops;
+	u64 calibration_iterations;
+	u64 probe_pair_mean_cycles;
+	u64 probe_pair_stddev_milli_cycles;
+	u64 probe_pair_min_cycles;
+	u64 probe_pair_max_cycles;
+	struct svsm_deko_bench_probe_wire_event
+		events[DEKO_BENCH_PROBE_WIRE_EVENTS];
 } __attribute__((aligned(8)));
 
 struct es_fault_info {
@@ -400,6 +461,9 @@ extern enum es_result svsm_handle_trampoline_setup(u64 sysenter_addr);
 
 extern int svsm_prepare_vmpl1_current_mm(struct mm_struct *mm);
 extern int svsm_deko_load_policy(u32 domain_id, const void *buf, u64 len);
+extern int svsm_deko_bench_probes(void *req, u64 len);
+/* Opt-in VMPL2 diagnostic; caller holds cpus_read_lock(). */
+extern int svsm_deko_bench_hv_ipi(unsigned int cpu);
 extern int deko_domain_bind(u64 mnt_ns_id, u32 domain_id);
 extern int deko_domain_lookup(u64 mnt_ns_id, u32 *domain_id);
 extern int deko_domain_unbind(u64 mnt_ns_id, u32 domain_id);
@@ -762,6 +826,7 @@ struct deko_task_work {
 extern struct svsm_ca *svsm_get_caa(void);
 extern u64 svsm_get_caa_pa(void);
 extern int svsm_perform_call_protocol(struct svsm_call *call);
+extern int svsm_perform_call_protocol_once(struct svsm_call *call);
 extern int svsm_perform_msr_protocol(struct svsm_call *call);
 extern void deko_proxy_loop(struct callback_head *work);
 extern phys_addr_t get_anything_pa(void *vaddr);
@@ -794,6 +859,8 @@ extern phys_addr_t get_anything_pa(void *vaddr);
 #define SVSM_EXTEND_ASPACE_OP 12
 #define SVSM_EXTEND_EXEC_RANGE_READY 13
 #define SVSM_EXTEND_EXEC_RANGE_UNLIFT 14
+#define SVSM_EXTEND_BENCH_PROBES 15
+#define SVSM_EXTEND_IMMUTABLE_RANGE_READY 19
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 

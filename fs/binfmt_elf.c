@@ -1162,14 +1162,26 @@ out_free_interp:
 
 			alignment = maximum_alignment(elf_phdata,
 						      elf_ex->e_phnum);
+			total_size = ELF_PAGEALIGN(total_size);
+			alignment = max_t(unsigned long, alignment, ELF_MIN_ALIGN);
+			/* VMPL0 accepts the complete ELF in the first 1 GiB only.
+			 * Reserve its full length before randomizing the aligned
+			 * start; checking the enclosing PML4 span is insufficient. */
+			if (!total_size || total_size > DEKO_EXEC_SPAN_ASLR_SIZE ||
+			    alignment > DEKO_EXEC_SPAN_ASLR_SIZE) {
+				retval = -ENOMEM;
+				goto out_free_dentry;
+			}
 			span_base = READ_ONCE(current->mm->deko_exec_span_base);
 			load_bias = span_base;
-			if (current->flags & PF_RANDOMIZE)
-				load_bias += arch_mmap_rnd() &
-					     (DEKO_EXEC_SPAN_ASLR_SIZE - 1);
-			if (alignment)
-				load_bias &= ~(alignment - 1);
-			total_size = ELF_PAGEALIGN(total_size);
+			if (current->flags & PF_RANDOMIZE) {
+				unsigned long slots =
+					(DEKO_EXEC_SPAN_ASLR_SIZE - total_size) /
+					alignment + 1;
+
+				load_bias += ((arch_mmap_rnd() >> PAGE_SHIFT) %
+					      slots) * alignment;
+			}
 			if (!deko_range_within_exec_span(span_base, load_bias,
 							 total_size)) {
 				retval = -ENOMEM;

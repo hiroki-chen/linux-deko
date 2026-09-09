@@ -193,18 +193,24 @@ int deko_select_exec_span(struct mm_struct *mm)
 }
 
 /*
- * Prepare the present four-level user root entries before VMPL0 freezes the
- * PML4.  The selected executable slot remains executable; every other present
- * root entry is NX so writable lower-level data trees cannot create code
- * aliases.  Absent entries stay absent and consume no page-table memory.
+ * Prepare every present four-level root entry before VMPL0 freezes the PML4.
+ * Hardware may first enter a high-address VMPL1 interrupt/trampoline mapping,
+ * so upper-half root entries need their Accessed bit settled even though VMPL0
+ * traverses and commits only the user half.  The selected user executable slot
+ * remains executable; every other present user root entry is NX so writable
+ * lower-level data trees cannot create code aliases.  Absent entries stay
+ * absent and consume no page-table memory.
  */
 int deko_prepare_exec_root(struct mm_struct *mm)
 {
 	unsigned long exec_span_base;
 	unsigned long exec_index;
 	unsigned long index;
+	unsigned long diag_puds = 0;
+	unsigned long diag_pmds = 0;
+	unsigned long diag_ptes = 0;
 	pgd_t *vmpl1_pgd;
-	p4d_t *exec_p4d;
+	bool diag = !strcmp(current->comm, "malloc_basic");
 	int ret = 0;
 
 	if (!mm || !READ_ONCE(mm->deko_exec_span) || pgtable_l5_enabled() ||
@@ -222,10 +228,13 @@ int deko_prepare_exec_root(struct mm_struct *mm)
 	if (boot_cpu_has(X86_FEATURE_PTI))
 		vmpl1_pgd = kernel_to_user_pgdp(mm->pgd);
 #endif
+	if (diag)
+		pr_err("A3 diag: exec-root normalization begin mm=%px root=%px\n",
+		       mm, vmpl1_pgd);
 
 	mmap_write_lock(mm);
 	spin_lock(&mm->page_table_lock);
-	for (index = 0; index < PTRS_PER_PGD / 2; index++) {
+	for (index = 0; index < PTRS_PER_PGD; index++) {
 		unsigned long addr = index << DEKO_EXEC_SPAN_SHIFT;
 		pgd_t *pgd = vmpl1_pgd + pgd_index(addr);
 		p4d_t *p4d = p4d_offset(pgd, addr);
@@ -234,10 +243,12 @@ int deko_prepare_exec_root(struct mm_struct *mm)
 		if (!p4d_present(*p4d))
 			continue;
 		value |= _PAGE_ACCESSED;
-		if (index == exec_index)
-			value &= ~_PAGE_NX;
-		else
-			value |= _PAGE_NX;
+		if (index < PTRS_PER_PGD / 2) {
+			if (index == exec_index)
+				value &= ~_PAGE_NX;
+			else
+				value |= _PAGE_NX;
+		}
 		/*
 		 * Write Linux's PTI user root directly.  set_p4d() is intended
 		 * for the kernel root: its PTI helper copies the pre-NX value to
@@ -247,82 +258,109 @@ int deko_prepare_exec_root(struct mm_struct *mm)
 		WRITE_ONCE(*p4d, __p4d(value));
 	}
 	spin_unlock(&mm->page_table_lock);
+	if (diag)
+		pr_err("A3 diag: exec-root PML4 normalization complete\n");
 
 	/*
-	 * An RMP permission change invalidates cached translations.  The first
-	 * subsequent VMPL1 walk would therefore try to set Accessed bits
-	 * in every paging entry it consumes (and Dirty in a writable leaf).
-	 * Settle the hardware-owned A/D bits before handing the tree to VMPL0;
-	 * VMPL1 also retains write permission for any later hardware updates.
+	 * VMPL0 freezes every reachable user paging-structure page read-only at
+	 * both VMPL1 and VMPL2.  An RMP permission change also invalidates cached
+	 * translations, so a later hardware walk must not need to write an
+	 * Accessed or Dirty bit into the frozen tree.  Linux is the sole page-table
+	 * manager and settles those bits here, while the address space is still
+	 * quiesced and before handing the proposed epoch to VMPL0.
 	 */
-	exec_p4d = p4d_offset(vmpl1_pgd + pgd_index(exec_span_base),
-			       exec_span_base);
-	if (!p4d_present(*exec_p4d)) {
-		ret = -EFAULT;
-		goto out_unlock;
-	}
+	for (index = 0; index < PTRS_PER_PGD / 2; index++) {
+		unsigned long root_addr = index << DEKO_EXEC_SPAN_SHIFT;
+		pgd_t *pgd = vmpl1_pgd + pgd_index(root_addr);
+		p4d_t *p4d = p4d_offset(pgd, root_addr);
+		unsigned long pud_index;
 
-	for (index = 0; index < PTRS_PER_PUD; index++) {
-		unsigned long pud_addr = exec_span_base + index * PUD_SIZE;
-		pud_t *pud = pud_offset(exec_p4d, pud_addr);
-		unsigned long pmd_index;
-
-		if (pud_none(*pud))
+		if (!p4d_present(*p4d))
 			continue;
-		if (!pud_present(*pud) || pud_leaf(*pud)) {
+		if (p4d_bad(*p4d) || p4d_leaf(*p4d)) {
 			ret = -E2BIG;
 			goto out_unlock;
 		}
 
-		spin_lock(&mm->page_table_lock);
-		set_pud_at(mm, pud_addr, pud,
-			   __pud(pud_val(*pud) | _PAGE_ACCESSED));
-		spin_unlock(&mm->page_table_lock);
+		for (pud_index = 0; pud_index < PTRS_PER_PUD; pud_index++) {
+			unsigned long pud_addr = root_addr + pud_index * PUD_SIZE;
+			pud_t *pud = pud_offset(p4d, pud_addr);
+			unsigned long pmd_index;
 
-		for (pmd_index = 0; pmd_index < PTRS_PER_PMD; pmd_index++) {
-			unsigned long pmd_addr = pud_addr + pmd_index * PMD_SIZE;
-			pmd_t *pmd = pmd_offset(pud, pmd_addr);
-			spinlock_t *ptl;
-			pte_t *pte;
-			unsigned long pte_index;
-
-			if (pmd_none(*pmd))
+			if (pud_none(*pud))
 				continue;
-			if (!pmd_present(*pmd) || pmd_leaf(*pmd)) {
+			if (!pud_present(*pud) || pud_bad(*pud) || pud_leaf(*pud)) {
 				ret = -E2BIG;
 				goto out_unlock;
 			}
+			diag_puds++;
 
 			spin_lock(&mm->page_table_lock);
-			set_pmd_at(mm, pmd_addr, pmd,
-				   __pmd(pmd_val(*pmd) | _PAGE_ACCESSED));
+			set_pud_at(mm, pud_addr, pud,
+				   __pud(pud_val(*pud) | _PAGE_ACCESSED));
 			spin_unlock(&mm->page_table_lock);
 
-			pte = pte_offset_map_lock(mm, pmd, pmd_addr, &ptl);
-			if (!pte) {
-				ret = -EAGAIN;
-				goto out_unlock;
-			}
-			for (pte_index = 0; pte_index < PTRS_PER_PTE;
-			     pte_index++, pte++) {
-				pte_t entry = ptep_get(pte);
+			for (pmd_index = 0; pmd_index < PTRS_PER_PMD;
+			     pmd_index++) {
+				unsigned long pmd_addr = pud_addr +
+					pmd_index * PMD_SIZE;
+				pmd_t *pmd = pmd_offset(pud, pmd_addr);
+				spinlock_t *ptl;
+				pte_t *pte;
+				pte_t *pte_base;
+				unsigned long pte_index;
 
-				if (!pte_present(entry))
+				if (pmd_none(*pmd))
 					continue;
-				entry = pte_mkyoung(entry);
-				if (pte_write(entry))
-					entry = pte_mkdirty(entry);
-				set_pte_at(mm, pmd_addr + pte_index * PAGE_SIZE,
-					   pte, entry);
+				if (!pmd_present(*pmd) || pmd_bad(*pmd) ||
+				    pmd_leaf(*pmd)) {
+					ret = -E2BIG;
+					goto out_unlock;
+				}
+				diag_pmds++;
+
+				spin_lock(&mm->page_table_lock);
+				set_pmd_at(mm, pmd_addr, pmd,
+					   __pmd(pmd_val(*pmd) | _PAGE_ACCESSED));
+				spin_unlock(&mm->page_table_lock);
+
+				pte_base = pte_offset_map_lock(mm, pmd, pmd_addr,
+							       &ptl);
+				if (!pte_base) {
+					ret = -EAGAIN;
+					goto out_unlock;
+				}
+				pte = pte_base;
+				for (pte_index = 0; pte_index < PTRS_PER_PTE;
+				     pte_index++, pte++) {
+					pte_t entry = ptep_get(pte);
+
+					if (!pte_present(entry))
+						continue;
+					diag_ptes++;
+					entry = pte_mkyoung(entry);
+					if (pte_write(entry))
+						entry = pte_mkdirty(entry);
+					set_pte_at(mm,
+						   pmd_addr + pte_index * PAGE_SIZE,
+						   pte, entry);
+				}
+				pte_unmap_unlock(pte_base, ptl);
 			}
-			pte_unmap_unlock(pte - PTRS_PER_PTE, ptl);
 		}
 	}
 
+	if (diag)
+		pr_err("A3 diag: exec-root tree normalization complete puds=%lu pmds=%lu ptes=%lu\n",
+		       diag_puds, diag_pmds, diag_ptes);
 	flush_tlb_mm(mm);
+	if (diag)
+		pr_err("A3 diag: exec-root Linux TLB flush complete\n");
 
 out_unlock:
 	mmap_write_unlock(mm);
+	if (diag)
+		pr_err("A3 diag: exec-root normalization end ret=%d\n", ret);
 	return ret;
 }
 

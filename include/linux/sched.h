@@ -1634,6 +1634,11 @@ struct task_struct {
 #ifdef CONFIG_AMD_MEM_ENCRYPT
  /* Whether this application is currently running inside VMPL1. */
 	bool is_monitored;
+	/* Test-only hostile data-PTE injection state; never trusted by VMPL0. */
+	bool deko_data_alias_canary_target_valid;
+	unsigned long deko_data_alias_canary_target_va;
+	u64 deko_data_alias_canary_original_pte;
+	u64 deko_data_alias_canary_foreign_pfn_bits;
 #endif
 
 #ifdef CONFIG_UNWIND_USER

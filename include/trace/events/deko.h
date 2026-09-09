@@ -88,6 +88,68 @@ TRACE_EVENT(deko_eager_paging,
 		      __get_str(reason), __entry->start_addr, __entry->length,
 		      __entry->prot));
 
+TRACE_EVENT(deko_page_fault_service,
+	    TP_PROTO(u32 reason, unsigned long requested_pages,
+		     unsigned long resolved_pages, int status, u64 elapsed_ns),
+
+	    TP_ARGS(reason, requested_pages, resolved_pages, status, elapsed_ns),
+
+	    TP_STRUCT__entry(__field(u32, reason)
+				     __field(unsigned long, requested_pages)
+				     __field(unsigned long, resolved_pages)
+				     __field(int, status)
+				     __field(u64, elapsed_ns)),
+
+	    TP_fast_assign(__entry->reason = reason;
+			   __entry->requested_pages = requested_pages;
+			   __entry->resolved_pages = resolved_pages;
+			   __entry->status = status;
+			   __entry->elapsed_ns = elapsed_ns;),
+
+	    TP_printk("reason=%u requested_pages=%lu resolved_pages=%lu status=%d elapsed_ns=%llu",
+		      __entry->reason, __entry->requested_pages,
+		      __entry->resolved_pages, __entry->status,
+		      __entry->elapsed_ns));
+
+TRACE_EVENT(deko_ring_epoll_wait,
+	    TP_PROTO(s32 timeout, s64 result, int status, u64 elapsed_ns),
+
+	    TP_ARGS(timeout, result, status, elapsed_ns),
+
+	    TP_STRUCT__entry(__field(s32, timeout)
+				     __field(s64, result)
+				     __field(int, status)
+				     __field(u64, elapsed_ns)),
+
+	    TP_fast_assign(__entry->timeout = timeout;
+			   __entry->result = result;
+			   __entry->status = status;
+			   __entry->elapsed_ns = elapsed_ns;),
+
+	    TP_printk("timeout=%d result=%lld status=%d elapsed_ns=%llu",
+		      __entry->timeout, __entry->result, __entry->status,
+		      __entry->elapsed_ns));
+
+/* Optional aggregate timing of Linux service, including blocking waits. */
+TRACE_EVENT(deko_ring_service,
+	    TP_PROTO(u64 ax, bool from_poller, int status, u64 elapsed_ns),
+
+	    TP_ARGS(ax, from_poller, status, elapsed_ns),
+
+	    TP_STRUCT__entry(__field(u64, ax)
+				     __field(bool, from_poller)
+				     __field(int, status)
+				     __field(u64, elapsed_ns)),
+
+	    TP_fast_assign(__entry->ax = ax;
+			   __entry->from_poller = from_poller;
+			   __entry->status = status;
+			   __entry->elapsed_ns = elapsed_ns;),
+
+	    TP_printk("syscall=%llu from_poller=%d status=%d elapsed_ns=%llu",
+		      __entry->ax, __entry->from_poller,
+		      __entry->status, __entry->elapsed_ns));
+
 #endif
 
 #include <trace/define_trace.h>

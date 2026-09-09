@@ -663,6 +663,106 @@ retry_private:
 	return ret;
 }
 
+/**
+ * futex_wait_with_monitor_check() - Wait using a trusted value comparison
+ * @uaddr: private futex userspace address used to derive the native key
+ * @op: supported private FUTEX_WAIT or FUTEX_WAIT_BITSET operation
+ * @bitset: waiter bitset
+ * @prepare: acquire sleepable mapping exclusion and prepare the monitor call
+ * @check: compare the protected futex word while the hash bucket is locked
+ * @unlock: release the mapping exclusion acquired by @prepare
+ * @ctx: opaque callback context
+ *
+ * A protected Deko futex word is deliberately unreadable by Linux after its
+ * translation tree has been frozen.  This helper preserves the native futex
+ * ordering rule by incrementing the bucket's waiter count, locking the bucket,
+ * and then asking the monitor for only the equality result.  A matching waiter
+ * is queued before that same bucket lock is released.  Therefore a concurrent
+ * waker either changes the word before the trusted comparison or observes the
+ * queued waiter; it cannot fall between comparison and enqueue.
+ *
+ * @prepare may sleep, but @check must not.  A successful @prepare is paired
+ * with exactly one @unlock after the bucket has been released.  -EAGAIN from
+ * @check requests a retry after all locks have been dropped.
+ */
+long futex_wait_with_monitor_check(u32 __user *uaddr, int op, u32 bitset,
+				   futex_monitor_prepare_fn prepare,
+				   futex_monitor_check_fn check,
+				   futex_monitor_unlock_fn unlock,
+				   void *ctx)
+{
+	struct futex_q q = futex_q_init;
+	unsigned int flags;
+	bool wait_bitset;
+	int ret;
+
+	if (!prepare || !check || !unlock)
+		return -EINVAL;
+	wait_bitset = op == FUTEX_WAIT_BITSET_PRIVATE ||
+		      op == (FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME);
+	if (op != FUTEX_WAIT_PRIVATE && !wait_bitset)
+		return -EINVAL;
+	if (!bitset || (op == FUTEX_WAIT_PRIVATE &&
+			bitset != FUTEX_BITSET_MATCH_ANY))
+		return -EINVAL;
+	flags = futex_to_flags(op);
+	q.bitset = bitset;
+
+retry:
+	ret = prepare(ctx);
+	if (ret)
+		return ret;
+
+	ret = get_futex_key(uaddr, flags, &q.key, FUTEX_READ);
+	if (ret) {
+		unlock(ctx);
+		return ret;
+	}
+
+	{
+		CLASS(hb, hb)(&q.key);
+
+		futex_q_lock(&q, hb);
+		ret = check(ctx);
+		if (ret) {
+			futex_q_unlock(hb);
+		} else {
+			/*
+			 * Pair the task-state store and enqueue exactly as the native
+			 * futex_wait_setup() path does.  futex_queue() releases hb.
+			 */
+			set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+			futex_queue(&q, hb, current);
+		}
+	}
+
+	unlock(ctx);
+
+	if (ret) {
+		if (ret > 0)
+			return -EPROTO;
+		if (ret != -EAGAIN)
+			return ret;
+		if (signal_pending(current))
+			return -ERESTARTSYS;
+		cond_resched();
+		goto retry;
+	}
+
+	/* Wait for a wakeup or signal after both setup locks are released. */
+	futex_do_wait(&q, NULL);
+
+	/* A waker already removed us, so the wait completed successfully. */
+	if (!futex_unqueue(&q))
+		return 0;
+
+	if (signal_pending(current))
+		return -ERESTARTSYS;
+
+	/* Spurious wakeup: perform a fresh protected comparison and enqueue. */
+	goto retry;
+}
+
 int __futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 		 struct hrtimer_sleeper *to, u32 bitset)
 {
@@ -748,4 +848,3 @@ static long futex_wait_restart(struct restart_block *restart)
 	return (long)futex_wait(uaddr, restart->futex.flags,
 				restart->futex.val, tp, restart->futex.bitset);
 }
-

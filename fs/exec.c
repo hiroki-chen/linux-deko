@@ -92,6 +92,15 @@ int sysctl_enable_vmpl_tramp = 0;
 
 module_param_named(vmpl_tramp, sysctl_enable_vmpl_tramp, int, 0644);
 
+/*
+ * Enables the test-only malicious VMPL2 PTE-alias canary in the Deko syscall
+ * proxy.  Linux is outside the TCB; this switch only makes a reproducible
+ * adversarial page-table edit and grants no monitor privilege.
+ */
+int sysctl_deko_data_alias_canary;
+module_param_named(deko_data_alias_canary, sysctl_deko_data_alias_canary, int,
+		   0600);
+
 void __register_binfmt(struct linux_binfmt * fmt, int insert)
 {
 	write_lock(&binfmt_lock);

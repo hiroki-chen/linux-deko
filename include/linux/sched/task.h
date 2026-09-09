@@ -31,6 +31,8 @@ struct kernel_clone_args {
 	u32 io_thread:1;
 	u32 user_worker:1;
 	u32 no_files:1;
+	/* Internal Deko worker: fresh mm, inherited process service context. */
+	u32 deko_service_mm:1;
 	unsigned long stack;
 	unsigned long stack_size;
 	unsigned long tls;
@@ -99,6 +101,7 @@ extern pid_t kernel_clone(struct kernel_clone_args *kargs);
 struct task_struct *copy_process(struct pid *pid, int trace, int node,
 				 struct kernel_clone_args *args);
 struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node);
+struct task_struct *create_deko_io_thread(int (*fn)(void *), void *arg, int node);
 struct task_struct *fork_idle(int);
 extern pid_t kernel_thread(int (*fn)(void *), void *arg, const char *name,
 			    unsigned long flags);

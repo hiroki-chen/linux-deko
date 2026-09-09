@@ -17,6 +17,7 @@
 #include <linux/rcupdate.h>
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
+#include <linux/wait.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
 #include <linux/types.h>
@@ -1288,6 +1289,16 @@ struct mm_struct {
 		atomic_long_t hugetlb_usage;
 #endif
 		struct work_struct async_put_work;
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+		/*
+		 * VMPL2-only scheduling state spanning a monitor-owned service
+		 * transaction. VMPL0 independently validates every transition.
+		 */
+		atomic_t deko_service_turn_owner;
+		atomic_t deko_service_turn_seq;
+		wait_queue_head_t deko_service_turn_wait;
+#endif
 
 #ifdef CONFIG_IOMMU_MM_DATA
 		struct iommu_mm_data *iommu_mm;

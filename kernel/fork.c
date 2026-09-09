@@ -1077,6 +1077,11 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mt_set_external_lock(&mm->mm_mt, &mm->mmap_lock);
 	atomic_set(&mm->mm_users, 1);
 	atomic_set(&mm->mm_count, 1);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	atomic_set(&mm->deko_service_turn_owner, 0);
+	atomic_set(&mm->deko_service_turn_seq, 0);
+	init_waitqueue_head(&mm->deko_service_turn_wait);
+#endif
 	seqcount_init(&mm->write_protect_seq);
 	mmap_init_lock(mm);
 	INIT_LIST_HEAD(&mm->mmlist);
@@ -1554,7 +1559,7 @@ fail_nomem:
 	return NULL;
 }
 
-static int copy_mm(u64 clone_flags, struct task_struct *tsk)
+static int copy_mm(u64 clone_flags, struct task_struct *tsk, bool deko_service_mm)
 {
 	struct mm_struct *mm, *oldmm;
 
@@ -1577,7 +1582,28 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 	if (!oldmm)
 		return 0;
 
-	if (clone_flags & CLONE_VM) {
+	if (deko_service_mm) {
+		/*
+		 * This internal worker never runs application userspace. Its only
+		 * user mapping is Deko's pinned, already-shared transport buffer.
+		 * Keep the original thread group/files/credentials, but do not walk
+		 * the application's frozen page tables for kernel user accesses.
+		 */
+		if (WARN_ON_ONCE((tsk->flags & (PF_IO_WORKER | PF_USER_WORKER)) !=
+				 (PF_IO_WORKER | PF_USER_WORKER)))
+			return -EINVAL;
+		mm = mm_alloc();
+		if (!mm)
+			return -ENOMEM;
+		mm_init_owner(mm, tsk);
+		mm->task_size = oldmm->task_size;
+		mm->mmap_base = oldmm->mmap_base;
+		mm->mmap_legacy_base = oldmm->mmap_legacy_base;
+#ifdef CONFIG_HAVE_ARCH_COMPAT_MMAP_BASES
+		mm->mmap_compat_base = oldmm->mmap_compat_base;
+		mm->mmap_compat_legacy_base = oldmm->mmap_compat_legacy_base;
+#endif
+	} else if (clone_flags & CLONE_VM) {
 		mmget(oldmm);
 		mm = oldmm;
 	} else {
@@ -2221,7 +2247,7 @@ __latent_entropy struct task_struct *copy_process(
 	retval = copy_signal(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_sighand;
-	retval = copy_mm(clone_flags, p);
+	retval = copy_mm(clone_flags, p, args->deko_service_mm);
 	if (retval)
 		goto bad_fork_cleanup_signal;
 	retval = copy_namespaces(clone_flags, p);
@@ -2587,7 +2613,9 @@ struct task_struct * __init fork_idle(int cpu)
  * The returned task is inactive, and the caller must fire it up through
  * wake_up_new_task(p). All signals are blocked in the created task.
  */
-struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
+static struct task_struct *create_io_thread_internal(int (*fn)(void *),
+						    void *arg, int node,
+						    bool deko_service_mm)
 {
 	unsigned long flags = CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|
 			      CLONE_IO|CLONE_VM|CLONE_UNTRACED;
@@ -2597,9 +2625,28 @@ struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
 		.fn_arg		= arg,
 		.io_thread	= 1,
 		.user_worker	= 1,
+		.deko_service_mm = deko_service_mm,
 	};
 
 	return copy_process(NULL, 0, node, &args);
+}
+
+struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
+{
+	return create_io_thread_internal(fn, arg, node, false);
+}
+
+struct task_struct *create_deko_io_thread(int (*fn)(void *), void *arg, int node)
+{
+	struct task_struct *task = create_io_thread_internal(fn, arg, node, true);
+
+	if (!IS_ERR(task) && IS_ENABLED(CONFIG_LRU_GEN_WALKS_MMU)) {
+		/* The ordinary kernel_clone() wrapper registers newly created mm's. */
+		task_lock(task);
+		lru_gen_add_mm(task->mm);
+		task_unlock(task);
+	}
+	return task;
 }
 
 /*
